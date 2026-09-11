@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""QA_runner_K 결과 대시보드 - 로컬에서만 뜨는 조회용 웹 페이지.
+"""QA_runner_K 대시보드 - 로컬에서만 뜨는 조회/작성용 웹 페이지.
 
-프로그램(qa_runner_k_gui.py)의 "결과 보기" 버튼을 누르면 이 Flask 앱이 백그라운드 스레드로
-127.0.0.1의 임의 포트에서 뜨고, 기본 브라우저가 자동으로 열린다. 외부에 노출되는 서버가 아니라
-로컬 전용 조회 화면이라는 점에 유의 (TODO: 필요해지면 EC2 쪽에 결과 API를 붙여 원격 조회로 확장).
+두 가지 화면을 제공한다.
+  /      실행 결과 (PASS/FAIL/확인 필요 + 사유 + 전/후 스크린샷)
+  /tcs   TC 관리  - 엑셀을 만들지 않고 화면에서 TC를 작성하고, 그 TC로 프로그램을 돌린다 [NEW v0.4.0]
+
+프로그램(qa_runner_k_gui.py)이 실행되면 백그라운드 스레드로 127.0.0.1에 이 서버를 띄운다.
+외부에 노출되는 서버가 아니라 로컬 전용 화면이라는 점에 유의
+(TODO: 여러 사람이 같이 쓰려면 EC2 쪽에 같은 API를 붙여 원격 조회/작성으로 확장).
 """
 
 import os
 import socket
 import threading
 
-from flask import Flask, request, send_file, abort
+from flask import Flask, request, send_file, abort, redirect, url_for
 
 import results_store
+
+# 고정 포트를 먼저 시도한다. 매번 포트가 바뀌면 주소를 북마크할 수 없어서
+# "대시보드 링크"를 고정으로 안내하기 위함. 사용 중이면 빈 포트로 자동 대체.
+DEFAULT_PORT = 8765
 
 RESULT_STYLE = {
     "PASS": ("PASS", "#1f9d55", "#e7f8ee"),
@@ -21,17 +29,26 @@ RESULT_STYLE = {
     "확인 필요": ("확인 필요", "#b7791f", "#fff6e0"),
 }
 
+PRIORITIES = ["P1", "P2", "P3", "P4"]
+
 
 def create_app(db_path=None):
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path
+
+    def _reject_cross_site():
+        """로컬 전용 서버이지만, 다른 사이트가 브라우저를 통해 POST를 보내는 것(CSRF)은 막는다.
+        Origin 헤더가 있고 이 서버가 아니면 거부한다."""
+        origin = request.headers.get("Origin")
+        if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
+            abort(403)
 
     @app.route("/")
     def index():
         run_id = request.args.get("run_id") or None
         runs = results_store.list_runs(app.config["DB_PATH"])
         results = results_store.list_results(run_id=run_id, db_path=app.config["DB_PATH"])
-        return _render(runs, results, run_id)
+        return _render_results(runs, results, run_id)
 
     @app.route("/img")
     def img():
@@ -44,25 +61,152 @@ def create_app(db_path=None):
             abort(404)
         return send_file(real)
 
+    # ---- TC 관리 ----                                            [NEW v0.4.0]
+    @app.route("/tcs")
+    def tcs():
+        tc_list = results_store.list_custom_tcs(db_path=app.config["DB_PATH"])
+        edit_id = request.args.get("edit")
+        editing = None
+        if edit_id:
+            try:
+                editing = results_store.get_custom_tc(edit_id, db_path=app.config["DB_PATH"])
+            except Exception:
+                editing = None
+        return _render_tcs(tc_list, editing, request.args.get("msg", ""), request.args.get("err", ""))
+
+    @app.route("/tcs/save", methods=["POST"])
+    def tcs_save():
+        _reject_cross_site()
+        f = request.form
+        row_id = (f.get("id") or "").strip()
+        try:
+            if row_id:
+                results_store.update_custom_tc(
+                    row_id, f.get("title"), f.get("steps"), f.get("expected"),
+                    precondition=f.get("precondition"), priority=f.get("priority"),
+                    tc_no=f.get("tc_no"), note=f.get("note"), db_path=app.config["DB_PATH"],
+                )
+                msg = f"TC를 수정했습니다"
+            else:
+                results_store.insert_custom_tc(
+                    f.get("title"), f.get("steps"), f.get("expected"),
+                    precondition=f.get("precondition"), priority=f.get("priority"),
+                    tc_no=f.get("tc_no"), note=f.get("note"), db_path=app.config["DB_PATH"],
+                )
+                msg = "TC를 추가했습니다. 프로그램에서 [TC 불러오기]를 누르면 목록에 나옵니다"
+            return redirect(url_for("tcs", msg=msg))
+        except ValueError as e:
+            return redirect(url_for("tcs", err=str(e)))
+        except Exception as e:
+            return redirect(url_for("tcs", err=f"저장 실패: {e}"))
+
+    @app.route("/tcs/toggle/<int:row_id>", methods=["POST"])
+    def tcs_toggle(row_id):
+        _reject_cross_site()
+        cur = results_store.get_custom_tc(row_id, db_path=app.config["DB_PATH"])
+        if not cur:
+            abort(404)
+        results_store.set_custom_tc_enabled(row_id, not cur.get("enabled"),
+                                            db_path=app.config["DB_PATH"])
+        state = "제외" if cur.get("enabled") else "포함"
+        return redirect(url_for("tcs", msg=f"TC를 실행 대상에서 {state}했습니다"))
+
+    @app.route("/tcs/delete/<int:row_id>", methods=["POST"])
+    def tcs_delete(row_id):
+        _reject_cross_site()
+        results_store.delete_custom_tc(row_id, db_path=app.config["DB_PATH"])
+        return redirect(url_for("tcs", msg="TC를 삭제했습니다"))
+
     return app
+
+
+# ============================================================
+# 렌더링
+# ============================================================
+def _esc(s):
+    return (str(s if s is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
 
 
 def _badge(result):
     label, color, bg = RESULT_STYLE.get(result, (result, "#555", "#eee"))
-    return f'<span class="badge" style="color:{color};background:{bg}">{label}</span>'
+    return f'<span class="badge" style="color:{color};background:{bg}">{_esc(label)}</span>'
 
 
-def _esc(s):
-    return (str(s or "")
-            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+STYLE = """
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; margin: 0;
+         background: #fafafa; color: #222; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 20px 16px 48px; }
+  nav { background: #22262e; padding: 0 16px; }
+  nav .inner { max-width: 1120px; margin: 0 auto; display: flex; gap: 4px; align-items: center; }
+  nav a { color: #c9cdd6; text-decoration: none; padding: 14px 14px; font-size: 14px; font-weight: 600; }
+  nav a.on { color: #fff; box-shadow: inset 0 -3px 0 #4c9aff; }
+  nav .brand { color: #fff; font-weight: 700; margin-right: 12px; font-size: 14px; }
+  h2 { margin: 20px 0 4px; font-size: 20px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 16px; }
+  .summary { margin: 8px 0 16px; }
+  .summary-item { margin-right: 14px; font-size: 14px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { border: 1px solid #e4e4e4; padding: 8px 10px; font-size: 13px; text-align: left;
+           vertical-align: top; }
+  th { background: #f4f5f7; font-weight: 600; }
+  td.reason { max-width: 380px; }
+  td.pre { white-space: pre-wrap; max-width: 300px; }
+  .badge { padding: 2px 10px; border-radius: 12px; font-weight: 600; font-size: 12px;
+           display: inline-block; }
+  select, input[type=text], textarea { padding: 7px 8px; font-size: 13px; border: 1px solid #ccd0d6;
+           border-radius: 6px; font-family: inherit; background: #fff; }
+  input[type=text], textarea { width: 100%; box-sizing: border-box; }
+  textarea { min-height: 78px; resize: vertical; line-height: 1.5; }
+  label { display: block; font-size: 12px; font-weight: 600; color: #444; margin: 0 0 4px; }
+  .req::after { content: " *"; color: #c0392b; }
+  .card { background: #fff; border: 1px solid #e4e4e4; border-radius: 8px; padding: 16px;
+          margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  .grid .full { grid-column: 1 / -1; }
+  button { font-family: inherit; font-size: 13px; padding: 8px 14px; border-radius: 6px;
+           border: 1px solid #ccd0d6; background: #fff; cursor: pointer; }
+  button.primary { background: #2d6cdf; border-color: #2d6cdf; color: #fff; font-weight: 600; }
+  button.link { border: none; background: none; color: #2d6cdf; padding: 2px 4px; }
+  button.danger { border: none; background: none; color: #c0392b; padding: 2px 4px; }
+  .guide { background: #f4f7ff; border: 1px solid #d6e0f7; border-radius: 8px; padding: 12px 14px;
+           font-size: 13px; line-height: 1.7; color: #2a3444; margin-bottom: 16px; }
+  .guide code { background: #fff; border: 1px solid #d6e0f7; border-radius: 4px; padding: 1px 5px; }
+  .msg { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+  .msg.ok { background: #e7f8ee; border: 1px solid #b9e6cc; color: #1c6b41; }
+  .msg.err { background: #fdecec; border: 1px solid #f3c7c7; color: #a3271c; }
+  .off { opacity: 0.45; }
+  .actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+"""
 
 
-def _render(runs, results, current_run):
+def _page(title, active, body):
+    def cls(name):
+        return ' class="on"' if name == active else ""
+    return f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)}</title>
+<style>{STYLE}</style></head>
+<body>
+  <nav><div class="inner">
+    <span class="brand">QA_runner_K</span>
+    <a href="/"{cls('results')}>실행 결과</a>
+    <a href="/tcs"{cls('tcs')}>TC 관리</a>
+  </div></nav>
+  <div class="wrap">{body}</div>
+</body></html>"""
+
+
+def _render_results(runs, results, current_run):
     run_options = ['<option value="">전체 (최근 300건)</option>']
     for run_id, source, source_ref, started_at, count in runs:
-        label = f"{run_id} · {source} · {source_ref or ''} ({count}건)"
-        selected = "selected" if run_id == current_run else ""
-        run_options.append(f'<option value="{_esc(run_id)}" {selected}>{_esc(label)}</option>')
+        label = f"{run_id} · {source} · {os.path.basename(str(source_ref or ''))} ({count}건)"
+        selected = " selected" if run_id == current_run else ""
+        run_options.append(f'<option value="{_esc(run_id)}"{selected}>{_esc(label)}</option>')
 
     summary = {"PASS": 0, "FAIL": 0, "확인 필요": 0}
     rows_html = []
@@ -78,45 +222,155 @@ def _render(runs, results, current_run):
   <td>{_esc(r['title'])}</td>
   <td>{_esc(r['priority'])}</td>
   <td>{_badge(r['result'])}</td>
-  <td class="reason">{_esc((r['reason'] or '')[:200])}</td>
+  <td class="reason">{_esc((r['reason'] or '')[:300])}</td>
   <td>{' / '.join(shots) or '-'}</td>
 </tr>""")
 
     summary_html = "".join(
         f'<span class="summary-item">{_badge(k)} {v}건</span>' for k, v in summary.items()
     )
-
-    return f"""<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
-<title>QA_runner_K 결과</title>
-<style>
-  body {{ font-family: -apple-system, "Segoe UI", sans-serif; margin: 24px; background: #fafafa; color:#222; }}
-  h2 {{ margin-bottom: 4px; }}
-  .summary {{ margin: 8px 0 16px; }}
-  .summary-item {{ margin-right: 14px; font-size: 14px; }}
-  table {{ border-collapse: collapse; width: 100%; background: #fff; }}
-  th, td {{ border: 1px solid #e4e4e4; padding: 8px 10px; font-size: 13px; text-align: left; vertical-align: top; }}
-  th {{ background: #f4f5f7; }}
-  td.reason {{ max-width: 420px; }}
-  .badge {{ padding: 2px 10px; border-radius: 12px; font-weight: 600; font-size: 12px; }}
-  select {{ padding: 6px; font-size: 14px; }}
-</style></head>
-<body>
-  <h2>QA_runner_K 실행 결과</h2>
+    body = f"""
+  <h2>실행 결과</h2>
+  <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 스크린샷으로 확인하세요.</div>
   <div class="summary">{summary_html}</div>
   <form method="get">
-    <label>실행 배치: </label>
-    <select name="run_id" onchange="this.form.submit()">{''.join(run_options)}</select>
+    <label for="run_id">실행 배치</label>
+    <select id="run_id" name="run_id" onchange="this.form.submit()">{''.join(run_options)}</select>
   </form>
   <br>
   <table>
     <thead><tr><th>No</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>사유</th><th>스크린샷</th></tr></thead>
     <tbody>{''.join(rows_html) or '<tr><td colspan="6">아직 결과가 없습니다</td></tr>'}</tbody>
-  </table>
-</body></html>"""
+  </table>"""
+    return _page("QA_runner_K 실행 결과", "results", body)
 
 
-def _pick_free_port(host="127.0.0.1"):
+def _render_tcs(tc_list, editing, msg, err):
+    editing = editing or {}
+    is_edit = bool(editing.get("id"))
+
+    prio_options = ['<option value="">미지정</option>']
+    for p in PRIORITIES:
+        sel = " selected" if editing.get("priority") == p else ""
+        prio_options.append(f'<option value="{p}"{sel}>{p}</option>')
+
+    rows = []
+    for tc in tc_list:
+        off = "" if tc.get("enabled") else ' class="off"'
+        no = _esc(tc.get("tc_no") or f"c{tc['id']}")
+        toggle_label = "실행 제외" if tc.get("enabled") else "실행 포함"
+        rows.append(f"""<tr{off}>
+  <td>{no}</td>
+  <td>{_esc(tc.get('title'))}</td>
+  <td>{_esc(tc.get('priority'))}</td>
+  <td class="pre">{_esc(tc.get('steps'))}</td>
+  <td class="pre">{_esc(tc.get('expected'))}</td>
+  <td>{'포함' if tc.get('enabled') else '제외'}</td>
+  <td>
+    <div class="actions">
+      <a href="/tcs?edit={tc['id']}"><button type="button" class="link">수정</button></a>
+      <form method="post" action="/tcs/toggle/{tc['id']}" style="display:inline">
+        <button type="submit" class="link">{toggle_label}</button>
+      </form>
+      <form method="post" action="/tcs/delete/{tc['id']}" style="display:inline"
+            onsubmit="return confirm('이 TC를 삭제할까요?')">
+        <button type="submit" class="danger">삭제</button>
+      </form>
+    </div>
+  </td>
+</tr>""")
+
+    msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
+    err_html = f'<div class="msg err">{_esc(err)}</div>' if err else ""
+    enabled_count = sum(1 for t in tc_list if t.get("enabled"))
+
+    body = f"""
+  <h2>TC 관리</h2>
+  <div class="sub">엑셀 없이 여기서 TC를 작성하고, 프로그램에서 TC 소스를 <b>"대시보드 추가 TC"</b>로 선택해 그대로 실행할 수 있습니다.</div>
+  {msg_html}{err_html}
+
+  <div class="guide">
+    <b>작성 규칙</b> — 프로그램이 이 표기를 보고 동작을 만듭니다.<br>
+    · 클릭할 대상은 대괄호: <code>화면의 [환자 관리] 버튼 클릭</code><br>
+    · 입력할 값은 따옴표: <code>[검색] 입력창에 "강의성" 입력</code><br>
+    · 엔터는 그대로: <code>엔터 키 입력</code><br>
+    · 절차는 <b>번호를 매겨 한 줄에 한 단계씩</b> 적어주세요. 대괄호로 적지 않은 버튼은 클릭하지 않습니다.<br>
+    · 예상 결과에 "팝업이 노출된다" / "~화면으로 이동한다" 처럼 쓰면 팝업 등장·화면 이동을 직접 확인합니다.
+  </div>
+
+  <div class="card">
+    <form method="post" action="/tcs/save">
+      <input type="hidden" name="id" value="{_esc(editing.get('id', ''))}">
+      <div class="grid">
+        <div>
+          <label class="req" for="title">테스트 항목</label>
+          <input type="text" id="title" name="title" required
+                 placeholder="예) 환자 등록 버튼 클릭 시 등록 팝업 노출 확인"
+                 value="{_esc(editing.get('title', ''))}">
+        </div>
+        <div>
+          <label for="priority">우선순위</label>
+          <select id="priority" name="priority">{''.join(prio_options)}</select>
+          &nbsp;<label style="display:inline" for="tc_no">No</label>
+          <input type="text" id="tc_no" name="tc_no" style="width:90px" placeholder="자동"
+                 value="{_esc(editing.get('tc_no', ''))}">
+        </div>
+        <div class="full">
+          <label for="precondition">사전조건</label>
+          <input type="text" id="precondition" name="precondition"
+                 placeholder="예) 환자 관리 화면 진입 상태"
+                 value="{_esc(editing.get('precondition', ''))}">
+        </div>
+        <div class="full">
+          <label class="req" for="steps">테스트 절차</label>
+          <textarea id="steps" name="steps" required
+                    placeholder="1. 화면의 [환자 관리] 버튼 클릭&#10;2. [환자 등록] 버튼 클릭&#10;3. 팝업 노출 확인">{_esc(editing.get('steps', ''))}</textarea>
+        </div>
+        <div class="full">
+          <label class="req" for="expected">예상 결과</label>
+          <input type="text" id="expected" name="expected"
+                 placeholder="예) 환자 등록 팝업이 노출된다"
+                 value="{_esc(editing.get('expected', ''))}">
+        </div>
+        <div class="full">
+          <label for="note">비고</label>
+          <input type="text" id="note" name="note" value="{_esc(editing.get('note', ''))}">
+        </div>
+      </div>
+      <div class="actions" style="margin-top:14px">
+        <button type="submit" class="primary">{'TC 수정' if is_edit else 'TC 추가'}</button>
+        {'<a href="/tcs"><button type="button">취소</button></a>' if is_edit else ''}
+      </div>
+    </form>
+  </div>
+
+  <h2>추가된 TC ({len(tc_list)}건 · 실행 대상 {enabled_count}건)</h2>
+  <div class="sub">프로그램에서 <b>TC 소스 → "대시보드 추가 TC" → [TC 불러오기] → [시작]</b> 순서로 실행하세요.</div>
+  <table>
+    <thead><tr><th>No</th><th>테스트 항목</th><th>우선순위</th><th>테스트 절차</th><th>예상 결과</th><th>실행</th><th></th></tr></thead>
+    <tbody>{''.join(rows) or '<tr><td colspan="7">아직 추가된 TC가 없습니다. 위 폼에서 추가해보세요.</td></tr>'}</tbody>
+  </table>"""
+    return _page("QA_runner_K TC 관리", "tcs", body)
+
+
+# ============================================================
+# 서버 기동
+# ============================================================
+def _port_available(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _pick_port(host="127.0.0.1"):
+    """고정 포트를 우선 사용하고, 이미 쓰이는 중이면 빈 포트를 받아온다."""
+    if _port_available(host, DEFAULT_PORT):
+        return DEFAULT_PORT
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((host, 0))
     port = s.getsockname()[1]
@@ -124,12 +378,12 @@ def _pick_free_port(host="127.0.0.1"):
     return port
 
 
-def run_in_background(db_path=None, host="127.0.0.1"):
+def run_in_background(db_path=None, host="127.0.0.1", port=None):
     """대시보드를 백그라운드 스레드로 띄우고 (host, port)를 반환.
     이미 실행 중인 서버가 있으면 새로 띄우지 않고 그 (host, port)를 재사용하는 건
     호출하는 쪽(qa_runner_k_gui.py)의 책임으로 둔다."""
     app = create_app(db_path)
-    port = _pick_free_port(host)
+    port = port or _pick_port(host)
     thread = threading.Thread(
         target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False),
         daemon=True,
