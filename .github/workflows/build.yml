@@ -1,3 +1,100 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Python 설치
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: 패키지 설치
+      run: |
+        pip install pyinstaller playwright requests Pillow httpx certifi anthropic openai openpyxl flask
+
+    - name: Playwright 브라우저 설치
+      run: |
+        playwright install chromium --with-deps
+
+    - name: 버전 추출
+      id: version
+      shell: python
+      run: |
+        import re, os
+        with open('qa_runner_k_gui.py', 'r', encoding='utf-8') as f:
+            content = f.read()
+        # 원본 build.yml은 홑따옴표만 매칭했는데 QA_runner_K는 큰따옴표를 쓰므로 둘 다 허용
+        m = re.search(r"APP_VERSION\s*=\s*[\"']([^\"']+)[\"']", content)
+        version = m.group(1) if m else '0.1'
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+            f.write(f'version={version}\n')
+        print(f'Version: {version}')
+
+    - name: EXE 빌드 (Chromium 포함)
+      run: |
+        $ms_playwright = "$env:USERPROFILE\AppData\Local\ms-playwright"
+        $certifi_path = python -c "import certifi; print(certifi.where())"
+        pyinstaller --onefile --windowed --name "QA_Runner_K" `
+          --hidden-import playwright `
+          --hidden-import playwright.sync_api `
+          --hidden-import anthropic `
+          --hidden-import openai `
+          --hidden-import requests `
+          --hidden-import tkinter `
+          --hidden-import PIL `
+          --hidden-import PIL.Image `
+          --hidden-import PIL.ImageTk `
+          --hidden-import httpx `
+          --hidden-import certifi `
+          --hidden-import openpyxl `
+          --hidden-import flask `
+          --hidden-import sqlite3 `
+          --collect-all playwright `
+          --collect-all certifi `
+          --collect-all openpyxl `
+          --collect-all flask `
+          --add-data "$ms_playwright;ms-playwright" `
+          --add-data "$certifi_path;certifi" `
+          qa_runner_k_gui.py
+
+    - name: 빌드 결과 확인
+      run: |
+        dir dist
+        if (-not (Test-Path "dist/QA_Runner_K.exe")) { throw "QA_Runner_K.exe 가 생성되지 않았습니다" }
+
+    - name: GitHub Release 생성 및 EXE 업로드
+      uses: ncipollo/release-action@v1
+      with:
+        tag: v${{ steps.version.outputs.version }}
+        name: QA_Runner_K v${{ steps.version.outputs.version }}
+        body: |
+          ## QA_Runner_K v${{ steps.version.outputs.version }}
+
+          ### 설치 방법
+          1. 아래 `QA_Runner_K.exe` 다운로드
+          2. 실행 (Windows Defender 경고가 나오면 "추가 정보" → "실행")
+          3. 파이썬 설치 불필요 — Chromium 브라우저까지 exe 안에 포함되어 있습니다
+
+          ### 사용법
+          - "시작 지점 / 로그인 설정"에 STG URL / ID / PW 입력 후 저장
+          - "TC 소스"에서 로컬 엑셀 파일 선택 → TC 불러오기 → 시작
+          - "AI 없이 규칙 기반으로만 실행"이 켜져 있으면 API 키 없이 동작합니다
+          - 실행이 끝나면 결과 대시보드가 브라우저에 자동으로 열립니다
+        artifacts: dist/QA_Runner_K.exe
+        allowUpdates: true
+        makeLatest: true
+        token: ${{ secrets.GITHUB_TOKEN }}
 name: "Build Windows EXE (TODO: fill in once the new program is finalized)"
 on: {push: {branches: ["main"]}, workflow_dispatch: {}}
 jobs: {build: {runs-on: "windows-latest", steps: [{uses: "actions/checkout@v4"}, {name: "Set up Python", uses: "actions/setup-python@v5", with: {python-version: "3.11"}}, {name: "TODO: install dependencies", run: "echo TODO - replace with pip install -r requirements.txt etc."}, {name: "TODO: PyInstaller build", run: "echo TODO - replace with pyinstaller --onefile --windowed --name APP_NAME main.py"}, {name: "TODO: create GitHub Release", run: "echo TODO - replace with ncipollo/release-action step including version extraction"}]}}
