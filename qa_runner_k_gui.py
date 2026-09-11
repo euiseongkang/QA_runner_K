@@ -38,7 +38,7 @@ import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -1164,51 +1164,132 @@ class QAWorkerApp:
 
         if login_type == "idpw" and stg_id:
             self.log_msg("🔐 ID/PW 로그인 중...")
-            login_url = None
-            for login_path in ["/login", "/sign-in"]:
+
+            # [FIX v0.3.1] 로그인 페이지 탐색 기준을 "텍스트 입력란이 있는지"에서
+            # "비밀번호 입력란이 있는지"로 바꿈. 랩커넥트는 /login이 404이고 /sign-in이
+            # 로그인 페이지인데, 404 페이지나 다른 화면에도 텍스트 입력란(검색창 등)은
+            # 있을 수 있어서 엉뚱한 화면을 로그인 페이지로 오인할 수 있었음.
+            id_input = pw_input = None
+            used_url = None
+            for login_path in ["/sign-in", "/login", "/signin", ""]:
+                target = f"{start_url}{login_path}" if login_path else f"{start_url}/"
                 try:
-                    page.goto(f"{start_url}{login_path}", timeout=15000)
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                    if page.locator('input[type="text"], input[type="email"]').first.is_visible(timeout=3000):
-                        login_url = login_path
-                        break
-                except Exception:
+                    page.goto(target, timeout=20000, wait_until="domcontentloaded")
+                except Exception as e:
+                    self.log_msg(f"  ⓘ {target} 접속 실패: {str(e)[:60]}")
                     continue
-            if not login_url:
-                page.goto(start_url, timeout=20000)
-                page.wait_for_load_state("networkidle", timeout=15000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                try:
+                    # SPA는 첫 렌더가 늦으므로 비밀번호 입력란이 보일 때까지 조건 대기
+                    page.wait_for_selector('input[type="password"]', state="visible", timeout=5000)
+                except Exception:
+                    self.log_msg(f"  ⓘ {target} - 로그인 폼 없음 (건너뜀)")
+                    continue
 
-            try:
-                id_input = None
-                for sel in ['input[type="text"]', 'input[type="email"]', 'input[name*="id" i]', 'input[name*="email" i]']:
-                    cand = page.locator(sel).first
-                    if cand.is_visible(timeout=2000):
-                        id_input = cand
-                        break
-                if not id_input:
-                    raise Exception("아이디 입력란을 찾을 수 없음")
-                id_input.fill(stg_id)
                 pw_input = page.locator('input[type="password"]').first
-                pw_input.fill(stg_pw)
+                # 아이디 칸: 로그인 화면에서는 비밀번호 칸보다 앞에 오는 첫 번째 보이는 입력란
+                cands = page.locator('input[type="text"], input[type="email"], input[type="tel"], input:not([type])')
+                for i in range(min(cands.count(), 8)):
+                    c = cands.nth(i)
+                    try:
+                        if c.is_visible(timeout=500):
+                            id_input = c
+                            break
+                    except Exception:
+                        continue
+                if id_input:
+                    used_url = target
+                    break
 
-                clicked = False
-                for sel in ['button[type="submit"]', 'button:has-text("로그인")', 'button:has-text("Login")']:
-                    btn = page.locator(sel).first
-                    if btn.is_visible(timeout=1500):
+            if not (id_input and pw_input):
+                self.log_msg("❌ 로그인 폼을 찾지 못했습니다 (시작 URL이 맞는지 확인하세요)")
+                return False
+            self.log_msg(f"  ✓ 로그인 폼 발견: {used_url}")
+
+            url_before = page.url
+            try:
+                id_input.fill(stg_id)
+                pw_input.fill(stg_pw)
+            except Exception as e:
+                self.log_msg(f"❌ 로그인 정보 입력 실패: {str(e)[:100]}")
+                return False
+
+            # 로그인 버튼. "로그인 연장"/"비밀번호 찾기"/"회원가입" 같은 유사 버튼은 제외
+            clicked = False
+            for sel in ['button:has-text("로그인")', 'button:has-text("Login")',
+                        'button:has-text("Sign in")', 'button[type="submit"]']:
+                loc = page.locator(sel)
+                try:
+                    count = min(loc.count(), 5)
+                except Exception:
+                    count = 0
+                for i in range(count):
+                    btn = loc.nth(i)
+                    try:
+                        if not btn.is_visible(timeout=500):
+                            continue
+                        label = clean_text(btn.inner_text())
+                        if any(w in label for w in ["연장", "찾기", "가입", "취소"]):
+                            continue
                         btn.click()
                         clicked = True
+                        self.log_msg(f"  ✓ 로그인 버튼 클릭: {label or sel}")
                         break
-                if not clicked:
+                    except Exception:
+                        continue
+                if clicked:
+                    break
+            if not clicked:
+                try:
                     pw_input.press("Enter")
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception as e:
-                self.log_msg(f"❌ 로그인 폼 처리 실패: {e}")
+                    self.log_msg("  ⓘ 로그인 버튼을 못 찾아 Enter로 제출")
+                except Exception as e:
+                    self.log_msg(f"❌ 로그인 제출 실패: {str(e)[:100]}")
+                    return False
+
+            # [FIX v0.3.1] 성공 판정을 URL 문자열 검사에서 "로그인 폼이 사라졌는지"로 변경.
+            # 이 서비스는 SPA라서 로그인 버튼을 눌러도 문서 로드가 새로 일어나지 않는다.
+            # 그래서 wait_for_load_state("networkidle")이 즉시 끝나고, 그 시점엔 URL이
+            # 아직 /sign-in 이어서 로그인이 성공했는데도 실패로 판정됐다(v0.3.0 버그).
+            success = False
+            try:
+                page.wait_for_selector('input[type="password"]', state="hidden", timeout=15000)
+                success = True
+            except Exception:
+                try:
+                    page.wait_for_function(
+                        "prev => window.location.href !== prev", arg=url_before, timeout=3000
+                    )
+                    success = True
+                except Exception:
+                    success = False
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+            if not success:
+                # 진짜 계정 오류인지 구분할 수 있게 화면에 뜬 메시지를 같이 남긴다
+                err = ""
+                for sel in ['[role="alert"]', '[class*="error"]', '[class*="Error"]',
+                            '[class*="invalid"]', 'p:has-text("비밀번호")', 'span:has-text("비밀번호")']:
+                    try:
+                        loc = page.locator(sel).first
+                        if loc.is_visible(timeout=400):
+                            err = clean_text(loc.inner_text())[:150]
+                            if err:
+                                break
+                    except Exception:
+                        continue
+                self.log_msg(f"❌ 로그인 실패 - 로그인 폼이 그대로 남아있습니다 (현재 URL: {page.url})")
+                if err:
+                    self.log_msg(f"   화면 메시지: {err}")
                 return False
 
-            if "/login" in page.url or "/sign-in" in page.url:
-                self.log_msg("❌ 로그인 실패 - ID/PW 확인하세요")
-                return False
-            self.log_msg("✅ 로그인 성공")
+            self.log_msg(f"✅ 로그인 성공 (이동한 화면: {page.url})")
             return True
 
         elif login_type == "token":
@@ -1248,7 +1329,15 @@ class QAWorkerApp:
         page.wait_for_timeout(1500)
 
         # 세션 만료 감지 -> 재로그인 (원본과 동일 안전장치)
-        if ("/login" in page.url or "/sign-in" in page.url) and self.login_type_var.get() == "idpw":
+        # [FIX v0.3.1] URL만 보면 SPA에서 세션이 끊겨 로그인 폼이 떠 있어도(URL은 그대로)
+        # 감지하지 못한다. 비밀번호 입력란이 보이는지도 함께 확인한다.
+        session_expired = "/login" in page.url or "/sign-in" in page.url
+        if not session_expired:
+            try:
+                session_expired = page.locator('input[type="password"]').first.is_visible(timeout=800)
+            except Exception:
+                session_expired = False
+        if session_expired and self.login_type_var.get() == "idpw":
             self.log_msg("  ⚠ 세션 만료 감지 → 재로그인 시도")
             if not self._login(page):
                 raise RuntimeError("재로그인 실패")
