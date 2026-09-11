@@ -36,6 +36,24 @@ CREATE TABLE IF NOT EXISTS results (
 """
 
 
+# [NEW v0.4.0] 대시보드에서 직접 추가하는 TC. 엑셀을 만들지 않고도 화면에서 TC를 작성해
+# 바로 실행할 수 있게 하기 위한 테이블. 컬럼 구성은 TC 엑셀 포맷(8컬럼)과 일부러 맞춰둔다.
+CUSTOM_TC_SCHEMA = """
+CREATE TABLE IF NOT EXISTS custom_tcs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tc_no TEXT,                    -- 비어 있으면 화면에서 c<id>로 표시
+    title TEXT NOT NULL,           -- 테스트 항목
+    precondition TEXT,             -- 사전조건
+    steps TEXT NOT NULL,           -- 테스트 절차 (번호 매긴 줄)
+    expected TEXT NOT NULL,        -- 예상 결과
+    priority TEXT,                 -- P1~P4
+    note TEXT,                     -- 비고
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+"""
+
+
 def _base_dir():
     """exe로 빌드됐을 때도 실행 파일 옆에 DB/스크린샷을 두기 위한 기준 경로."""
     import sys
@@ -57,6 +75,7 @@ def get_screenshot_dir(run_id: str):
 def _connect(db_path=None):
     conn = sqlite3.connect(db_path or get_db_path())
     conn.execute(SCHEMA)
+    conn.execute(CUSTOM_TC_SCHEMA)
     return conn
 
 
@@ -107,5 +126,101 @@ def list_results(run_id=None, db_path=None, limit=300):
                 "SELECT * FROM results ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ============================================================
+# 대시보드에서 추가한 TC (custom_tcs)                          [NEW v0.4.0]
+# ============================================================
+MAX_FIELD_LEN = 4000
+
+
+def _clip(value, limit=MAX_FIELD_LEN):
+    """입력이 비정상적으로 길 때 DB/화면이 깨지지 않게 자른다 (로컬 전용이라 검증은 최소한만)."""
+    return (str(value or "").strip())[:limit]
+
+
+def insert_custom_tc(title, steps, expected, precondition="", priority="", tc_no="", note="",
+                     db_path=None):
+    """대시보드 입력 폼에서 TC 1건 추가. 추가된 row id 반환.
+    필수는 테스트 항목/테스트 절차/예상 결과 3개 (엑셀 로더의 필수 컬럼과 동일 기준)."""
+    title, steps, expected = _clip(title), _clip(steps), _clip(expected)
+    if not title or not steps or not expected:
+        raise ValueError("테스트 항목 / 테스트 절차 / 예상 결과는 필수입니다")
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            """INSERT INTO custom_tcs
+               (tc_no, title, precondition, steps, expected, priority, note, enabled, created_at)
+               VALUES (?,?,?,?,?,?,?,1,?)""",
+            (_clip(tc_no, 40), title, _clip(precondition), steps, expected,
+             _clip(priority, 20), _clip(note, 500), time.time()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_custom_tc(row_id, title, steps, expected, precondition="", priority="", tc_no="",
+                     note="", db_path=None):
+    """기존 TC 수정. 화면에서 문구를 고쳐 다시 돌릴 수 있게 하기 위한 것."""
+    title, steps, expected = _clip(title), _clip(steps), _clip(expected)
+    if not title or not steps or not expected:
+        raise ValueError("테스트 항목 / 테스트 절차 / 예상 결과는 필수입니다")
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """UPDATE custom_tcs SET tc_no=?, title=?, precondition=?, steps=?, expected=?,
+                                     priority=?, note=? WHERE id=?""",
+            (_clip(tc_no, 40), title, _clip(precondition), steps, expected,
+             _clip(priority, 20), _clip(note, 500), int(row_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_custom_tc_enabled(row_id, enabled, db_path=None):
+    """실행 대상 포함/제외 토글. 지우지 않고 잠시 빼둘 수 있게."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("UPDATE custom_tcs SET enabled=? WHERE id=?",
+                     (1 if enabled else 0, int(row_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_custom_tc(row_id, db_path=None):
+    conn = _connect(db_path)
+    try:
+        conn.execute("DELETE FROM custom_tcs WHERE id=?", (int(row_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_custom_tcs(only_enabled=False, db_path=None):
+    """대시보드에서 추가한 TC 목록. 프로그램 실행 시에는 only_enabled=True로 쓴다."""
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        sql = "SELECT * FROM custom_tcs"
+        if only_enabled:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY id"
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_custom_tc(row_id, db_path=None):
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM custom_tcs WHERE id=?", (int(row_id),)).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
