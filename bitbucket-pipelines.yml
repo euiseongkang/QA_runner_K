@@ -1,0 +1,2 @@
+image: alpine/git:latest
+pipelines: {branches: {main: [{step: {name: "GitHub mirror push (triggers GitHub Actions build/release)", script: ["git remote add github https://${GH_PAT}@github.com/euiseongkang/QA_runner_K.git", "git push github HEAD:main", "echo mirror push done - GitHub Actions will start the build"]}}]}}
