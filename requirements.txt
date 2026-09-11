@@ -1,0 +1,11 @@
+# QA_runner_K 실행/빌드 의존성 (뼈대 단계 - 실제 버전 고정은 빌드 전에 확정)
+playwright
+requests
+Pillow
+anthropic
+openai
+openpyxl   # 로컬 TC 엑셀 파일 직접 읽기용
+Flask      # 결과(PASS/FAIL/확인 필요 + 스크린샷) 조회용 로컬 대시보드 웹 페이지
+
+# PyInstaller 빌드용 (개발 의존성)
+pyinstaller
