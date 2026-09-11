@@ -38,7 +38,7 @@ import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -640,6 +640,8 @@ class QAWorkerApp:
 
         self._load_local_config()
         self._build_ui()
+        # [NEW v0.4.0] 대시보드에서 TC를 작성할 수 있게 되었으니 시작 시 미리 띄운다
+        self._ensure_dashboard()
         self.check_update_and_prompt()
 
     # ---- 로컬 설정 (시작 URL/로그인) ----                    [NEW][TODO: 저장 경로/암호화 방식 확정]
@@ -715,14 +717,26 @@ class QAWorkerApp:
         source_frame.pack(fill="x", padx=8, pady=4)
         ttk.Radiobutton(source_frame, text="로컬 엑셀 파일", variable=self.tc_source_var,
                         value="local", command=self._on_tc_source_change).grid(row=0, column=0, sticky="w")
+        # [NEW v0.4.0] 대시보드 화면에서 직접 추가한 TC로 실행
+        ttk.Radiobutton(source_frame, text="대시보드 추가 TC", variable=self.tc_source_var,
+                        value="custom", command=self._on_tc_source_change).grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(source_frame, text="EC2 세션", variable=self.tc_source_var,
-                        value="ec2", command=self._on_tc_source_change).grid(row=0, column=1, sticky="w")
+                        value="ec2", command=self._on_tc_source_change).grid(row=0, column=2, sticky="w")
 
         self.local_file_frame = ttk.Frame(source_frame)
         self.local_file_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Button(self.local_file_frame, text="엑셀 파일 선택...",
                    command=self._choose_local_xlsx).pack(side="left")
         ttk.Label(self.local_file_frame, textvariable=self.local_xlsx_path_var,
+                  foreground="#555").pack(side="left", padx=6)
+
+        # [NEW v0.4.0] 대시보드 TC 안내 + 바로 열기
+        self.custom_tc_frame = ttk.Frame(source_frame)
+        self.custom_tc_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Button(self.custom_tc_frame, text="대시보드에서 TC 추가/수정...",
+                   command=self.open_tc_dashboard).pack(side="left")
+        ttk.Label(self.custom_tc_frame,
+                  text="대시보드 'TC 관리'에서 추가한 TC 중 '실행 포함' 상태인 것만 불러옵니다",
                   foreground="#555").pack(side="left", padx=6)
 
         self.ec2_session_frame = ttk.Frame(source_frame)
@@ -767,14 +781,16 @@ class QAWorkerApp:
 
         self._on_tc_source_change()  # 초기 상태: local/ec2 프레임 중 하나만 보이도록 정리
 
-    # ---- TC 소스: 로컬 엑셀 파일 vs EC2 세션 ----                [NEW]
+    # ---- TC 소스: 로컬 엑셀 / 대시보드 추가 TC / EC2 세션 ----     [NEW]
     def _on_tc_source_change(self):
-        if self.tc_source_var.get() == "local":
-            self.ec2_session_frame.grid_remove()
-            self.local_file_frame.grid()
-        else:
-            self.local_file_frame.grid_remove()
-            self.ec2_session_frame.grid()
+        frames = {
+            "local": self.local_file_frame,
+            "custom": self.custom_tc_frame,
+            "ec2": self.ec2_session_frame,
+        }
+        for f in frames.values():
+            f.grid_remove()
+        frames.get(self.tc_source_var.get(), self.local_file_frame).grid()
 
     def _choose_local_xlsx(self):
         path = filedialog.askopenfilename(
@@ -857,14 +873,31 @@ class QAWorkerApp:
             self.log_msg(f"⚠ 로컬 엑셀 로드 실패: {e}")
             messagebox.showerror("TC 로드 실패", str(e))
 
-    # ---- 결과 대시보드 ----                                      [NEW]
-    def open_results_dashboard(self):
+    # ---- 대시보드 ----                                            [NEW]
+    def _ensure_dashboard(self):
+        """대시보드 서버를 (한 번만) 띄우고 주소를 돌려준다.
+        [NEW v0.4.0] TC를 대시보드에서 작성할 수 있게 되었으므로 프로그램을 켜는 시점에
+        미리 띄운다. 포트는 8765를 우선 사용해서 주소를 북마크할 수 있게 한다."""
         if not self._dashboard_addr:
-            host, port = dashboard_server.run_in_background(db_path=results_store.get_db_path())
-            self._dashboard_addr = (host, port)
-            self.log_msg(f"📊 결과 대시보드 실행: http://{host}:{port}/")
-        host, port = self._dashboard_addr
-        webbrowser.open(f"http://{host}:{port}/")
+            try:
+                host, port = dashboard_server.run_in_background(db_path=results_store.get_db_path())
+                self._dashboard_addr = (host, port)
+                self.log_msg(f"📊 대시보드: http://{host}:{port}/   (결과 조회 + TC 관리)")
+            except Exception as e:
+                self.log_msg(f"⚠ 대시보드 실행 실패: {e}")
+                return None
+        return self._dashboard_addr
+
+    def open_results_dashboard(self):
+        addr = self._ensure_dashboard()
+        if addr:
+            webbrowser.open(f"http://{addr[0]}:{addr[1]}/")
+
+    def open_tc_dashboard(self):
+        """대시보드의 'TC 관리' 화면을 바로 연다. [NEW v0.4.0]"""
+        addr = self._ensure_dashboard()
+        if addr:
+            webbrowser.open(f"http://{addr[0]}:{addr[1]}/tcs")
 
     def log_msg(self, msg, tag="info"):
         def _append():
@@ -923,15 +956,55 @@ class QAWorkerApp:
         pass
 
     def load_tc_list(self):
-        """"TC 불러오기" 버튼 핸들러. TC 소스(로컬 엑셀 / EC2)에 따라 분기. [NEW]"""
-        if self.tc_source_var.get() == "local":
+        """"TC 불러오기" 버튼 핸들러. TC 소스(로컬 엑셀 / 대시보드 / EC2)에 따라 분기. [NEW]"""
+        source = self.tc_source_var.get()
+        if source == "local":
             path = self.local_xlsx_path_var.get()
             if not path:
                 self.log_msg("⚠ 먼저 엑셀 파일을 선택하세요")
                 return
             self._load_tcs_from_local_xlsx(path)
+        elif source == "custom":
+            self._load_tcs_from_custom()
         else:
             self._load_tcs_from_ec2()
+
+    def _load_tcs_from_custom(self):
+        """대시보드 'TC 관리'에서 추가한 TC를 불러온다 ('실행 포함' 상태인 것만). [NEW v0.4.0]
+
+        엑셀 로더(_load_tcs_from_local_xlsx)와 완전히 같은 모양의 dict를 만들어서,
+        실행 루프/판정/결과 저장 쪽은 TC가 어디서 왔는지 몰라도 되게 한다."""
+        try:
+            rows = results_store.list_custom_tcs(only_enabled=True)
+        except Exception as e:
+            self.log_msg(f"⚠ 대시보드 TC 로드 실패: {e}")
+            return
+
+        tcs = []
+        for r in rows:
+            tc_id = clean_text(r.get("tc_no")) or f"c{r.get('id')}"
+            tcs.append({
+                "id": f"custom:{r.get('id')}",
+                "tc_id": tc_id,
+                "sheet_name": "대시보드",
+                "title": clean_text(r.get("title")),
+                "precondition": clean_text(r.get("precondition")),
+                "steps": r.get("steps") or "",
+                "expected": clean_text(r.get("expected")),
+                "priority": clean_text(r.get("priority")) or "미지정",
+                "note": clean_text(r.get("note")),
+                "result": "",
+            })
+
+        self.tc_data = tcs
+        self.tc_listbox.delete(0, "end")
+        for tc in self.tc_data:
+            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        if tcs:
+            self.log_msg(f"대시보드에서 TC {len(tcs)}건 로드 (실행 포함 상태만)")
+        else:
+            self.log_msg("⚠ 대시보드에 '실행 포함' 상태인 TC가 없습니다 - "
+                         "[대시보드에서 TC 추가/수정...] 버튼으로 추가하세요")
 
     def _load_tcs_from_ec2(self):
         """TC 목록 로드(EC2). 새 포맷 필드(테스트 항목/사전조건/테스트 절차/예상 결과/우선순위)로 매핑.
@@ -1055,8 +1128,12 @@ class QAWorkerApp:
         # [NEW] 실행 배치 식별자. 결과 대시보드에서 "이번에 돌린 것"끼리 묶어보기 위함.
         run_id = time.strftime("%Y%m%d_%H%M%S")
         self.current_run_id = run_id
-        source_ref = (self.local_xlsx_path_var.get() if tc_source == "local"
-                      else self.session_var.get())
+        if tc_source == "local":
+            source_ref = self.local_xlsx_path_var.get()
+        elif tc_source == "custom":
+            source_ref = "대시보드 추가 TC"   # [NEW v0.4.0]
+        else:
+            source_ref = self.session_var.get()
 
         # [NEW] 규칙 기반 전용 모드: AI를 아예 호출하지 않는다.
         # "테스트 절차"의 [대괄호]/"따옴표"/엔터 표기만으로 실행하고, 판정은 화면 텍스트 기준.
