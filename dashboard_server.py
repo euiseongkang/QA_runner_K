@@ -29,6 +29,9 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 # "대시보드 링크"를 고정으로 안내하기 위함. 사용 중이면 빈 포트로 자동 대체.
 DEFAULT_PORT = 8765
 
+# /healthz 응답에 넣는 표식. 8765 포트를 쓰는 다른 프로그램과 구분하기 위한 것.
+APP_MARKER = "qa_runner_k_dashboard"
+
 RESULT_STYLE = {
     "PASS": ("PASS", "#1f9d55", "#e7f8ee"),
     "FAIL": ("FAIL", "#c0392b", "#fdecec"),
@@ -56,6 +59,12 @@ def create_app(db_path=None):
         runs = results_store.list_runs(app.config["DB_PATH"])
         results = results_store.list_results(run_id=run_id, db_path=app.config["DB_PATH"])
         return _render_results(runs, results, run_id)
+
+    @app.route("/healthz")
+    def healthz():
+        """이미 떠 있는 대시보드가 우리 것인지 확인하는 용도. [NEW v0.6.0]
+        8765 포트를 다른 프로그램이 쓰고 있을 수도 있어서, 단순 포트 점유 여부로 판단하지 않는다."""
+        return {"app": APP_MARKER, "db": results_store.get_db_path()}
 
     @app.route("/img")
     def img():
@@ -460,6 +469,24 @@ def _pick_port(host="127.0.0.1"):
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def find_running_dashboard(host="127.0.0.1", port=DEFAULT_PORT, timeout=1.0):
+    """이미 떠 있는 QA_runner_K 대시보드가 있으면 (host, port)를, 없으면 None을 반환. [NEW v0.6.0]
+
+    대시보드를 별도 프로그램(QA_Runner_K_Dashboard.exe)으로 먼저 띄워둔 경우,
+    본 프로그램이 또 하나를 띄우지 않고 그걸 그대로 쓰도록 하기 위한 확인용.
+    """
+    import json
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("app") == APP_MARKER:
+            return host, port
+    except Exception:
+        pass
+    return None
 
 
 def run_in_background(db_path=None, host="127.0.0.1", port=None):
