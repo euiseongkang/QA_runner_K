@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -1565,9 +1565,12 @@ def main():
     # PyInstaller exe라서 Windows Defender가 다운로드 즉시 삭제해 버렸다. 반면 본 exe는
     # 이미 통과해서 잘 쓰고 있으므로, 새 파일을 받지 않아도 되게 여기에 모드를 넣었다.
     # (onefile 압축 해제 때문에 첫 실행이 20~40초 걸리는 건 감수한다)
-    if any(a.lower().lstrip("-/") == "dashboard" for a in sys.argv[1:]):
+    # --quiet(= --startup)는 부팅 시 자동 시작용. 브라우저를 열지 않고 창도 내려둔다.
+    args = [a.lower().lstrip("-/") for a in sys.argv[1:]]
+    if "dashboard" in args:
         import dashboard_app
-        dashboard_app.main()
+        quiet = "quiet" in args or "startup" in args
+        dashboard_app.main(open_browser=not quiet, minimized=quiet)
         return
 
     root = tk.Tk()
