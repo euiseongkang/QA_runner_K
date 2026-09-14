@@ -18,6 +18,7 @@ import threading
 
 from flask import Flask, request, send_file, abort, redirect, url_for
 
+import dashboard_auth
 import results_store
 import tc_excel
 
@@ -45,6 +46,10 @@ def create_app(db_path=None):
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
+    # [v0.9.0] 로그인. 내 PC에서 직접 보는 건 그대로 통과하고, 다른 컴퓨터에서 들어오거나
+    # 서버 배포 모드(QA_RUNNER_K_REQUIRE_LOGIN=1)면 로그인 화면을 띄운다.
+    dashboard_auth.install(app, db_path)
 
     def _reject_cross_site():
         """로컬 전용 서버이지만, 다른 사이트가 브라우저를 통해 POST를 보내는 것(CSRF)은 막는다.
@@ -218,6 +223,7 @@ STYLE = """
   nav a { color: #c9cdd6; text-decoration: none; padding: 14px 14px; font-size: 14px; font-weight: 600; }
   nav a.on { color: #fff; box-shadow: inset 0 -3px 0 #4c9aff; }
   nav .brand { color: #fff; font-weight: 700; margin-right: 12px; font-size: 14px; }
+  nav .who { color: #9aa1ad; font-size: 13px; margin-left: auto; }
   h2 { margin: 20px 0 4px; font-size: 20px; }
   .sub { color: #666; font-size: 13px; margin-bottom: 16px; }
   .summary { margin: 8px 0 16px; }
@@ -264,6 +270,9 @@ STYLE = """
 def _page(title, active, body):
     def cls(name):
         return ' class="on"' if name == active else ""
+    user = dashboard_auth.current_user()
+    account = (f'<span class="who">{_esc(user)}</span><a href="/logout">로그아웃</a>'
+               if user else "")
     return f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -274,6 +283,7 @@ def _page(title, active, body):
     <span class="brand">QA_runner_K</span>
     <a href="/"{cls('results')}>실행 결과</a>
     <a href="/tcs"{cls('tcs')}>TC 관리</a>
+    {account}
   </div></nav>
   <div class="wrap">{body}</div>
 </body></html>"""
@@ -489,11 +499,15 @@ def find_running_dashboard(host="127.0.0.1", port=DEFAULT_PORT, timeout=1.0):
     return None
 
 
-def run_in_background(db_path=None, host="127.0.0.1", port=None):
+def run_in_background(db_path=None, host=None, port=None):
     """대시보드를 백그라운드 스레드로 띄우고 (host, port)를 반환.
     이미 실행 중인 서버가 있으면 새로 띄우지 않고 그 (host, port)를 재사용하는 건
-    호출하는 쪽(qa_runner_k_gui.py)의 책임으로 둔다."""
+    호출하는 쪽(qa_runner_k_gui.py)의 책임으로 둔다.
+
+    기본은 127.0.0.1(내 PC에서만 보임). 같은 사무실 다른 PC에서도 보이게 하려면
+    QA_RUNNER_K_BIND=0.0.0.0 으로 띄운다. 이때 접속자는 로컬이 아니므로 로그인 화면이 뜬다."""
     app = create_app(db_path)
+    host = host or os.environ.get("QA_RUNNER_K_BIND", "").strip() or "127.0.0.1"
     port = port or _pick_port(host)
     thread = threading.Thread(
         target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False),
