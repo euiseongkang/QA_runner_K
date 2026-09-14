@@ -231,11 +231,11 @@ STYLE = """
   table { border-collapse: collapse; width: 100%; background: #fff; }
   th, td { border: 1px solid #e4e4e4; padding: 8px 10px; font-size: 13px; text-align: left;
            vertical-align: top; }
-  th { background: #f4f5f7; font-weight: 600; }
-  td.reason { max-width: 380px; }
+  th { background: #f4f5f7; font-weight: 600; white-space: nowrap; }
+  td.reason { max-width: 380px; min-width: 200px; }
   td.pre { white-space: pre-wrap; max-width: 300px; }
   .badge { padding: 2px 10px; border-radius: 12px; font-weight: 600; font-size: 12px;
-           display: inline-block; }
+           display: inline-block; white-space: nowrap; }
   select, input[type=text], textarea { padding: 7px 8px; font-size: 13px; border: 1px solid #ccd0d6;
            border-radius: 6px; font-family: inherit; background: #fff; }
   input[type=text], textarea { width: 100%; box-sizing: border-box; }
@@ -260,6 +260,15 @@ STYLE = """
   .card.upload { background: #fbfcff; border-color: #d6e0f7; }
   .card.upload label { font-size: 14px; }
   input[type=file] { font-size: 13px; }
+  td.shots { width: 1%; white-space: nowrap; }
+  a.shot { display: inline-block; text-decoration: none; margin: 0 6px 0 0; vertical-align: top; }
+  a.shot img { display: block; width: 180px; height: 130px; object-fit: cover; object-position: top;
+               border: 1px solid #d8dbe0; border-radius: 6px; background: #fff; }
+  a.shot span { display: block; text-align: center; font-size: 11px; color: #666; padding-top: 3px; }
+  a.shot:hover img { border-color: #2d6cdf; box-shadow: 0 0 0 2px rgba(45,108,223,.18); }
+  a.shot:hover span { color: #2d6cdf; }
+  .noshot { color: #999; font-size: 12px; }
+  @media (max-width: 900px) { a.shot img { width: 150px; height: 110px; } }
   .off { opacity: 0.45; }
   .actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: nowrap; }
   td .actions button { white-space: nowrap; }
@@ -300,18 +309,23 @@ def _render_results(runs, results, current_run):
     rows_html = []
     for r in results:
         summary[r["result"]] = summary.get(r["result"], 0) + 1
+        # [v0.10.0] 버튼을 눌러 새 탭으로 보던 것을 표 안에 바로 보이는 썸네일로 바꿨다.
+        # 스크린샷은 full_page라 세로로 아주 길다. 위쪽(첫 화면)만 잘라 보여주고,
+        # 눌러서 전체를 새 탭으로 여는 건 그대로 둔다. loading=lazy로 화면에 들어올 때만 받는다.
         shots = []
-        if r.get("before_screenshot"):
-            shots.append(f'<a href="/img?path={_esc(r["before_screenshot"])}" target="_blank">전</a>')
-        if r.get("after_screenshot"):
-            shots.append(f'<a href="/img?path={_esc(r["after_screenshot"])}" target="_blank">후</a>')
+        for key, label in (("before_screenshot", "실행 전"), ("after_screenshot", "실행 후")):
+            if r.get(key):
+                url = f'/img?path={_esc(r[key])}'
+                shots.append(f'<a class="shot" href="{url}" target="_blank" title="{label} - 클릭하면 전체 화면">'
+                             f'<img src="{url}" loading="lazy" alt="{label}">'
+                             f'<span>{label}</span></a>')
         rows_html.append(f"""<tr>
   <td>{_esc(r['tc_no'])}</td>
   <td>{_esc(r['title'])}</td>
   <td>{_esc(r['priority'])}</td>
   <td>{_badge(r['result'])}</td>
   <td class="reason">{_esc((r['reason'] or '')[:300])}</td>
-  <td>{' / '.join(shots) or '-'}</td>
+  <td class="shots">{''.join(shots) or '<span class="noshot">스크린샷 없음</span>'}</td>
 </tr>""")
 
     summary_html = "".join(
@@ -319,7 +333,7 @@ def _render_results(runs, results, current_run):
     )
     body = f"""
   <h2>실행 결과</h2>
-  <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 스크린샷으로 확인하세요.</div>
+  <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 눌러 전체 화면으로 확인하세요.</div>
   <div class="summary">{summary_html}</div>
   <form method="get">
     <label for="run_id">실행 배치</label>
