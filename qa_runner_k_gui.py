@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -841,6 +841,13 @@ class QAWorkerApp:
         [NEW v0.4.0] TC를 대시보드에서 작성할 수 있게 되었으므로 프로그램을 켜는 시점에
         미리 띄운다. 포트는 8765를 우선 사용해서 주소를 북마크할 수 있게 한다."""
         if not self._dashboard_addr:
+            # [NEW v0.6.0] 대시보드 단독 실행 프로그램(QA_Runner_K_Dashboard.exe)이 이미 떠 있으면
+            # 하나 더 띄우지 않고 그걸 그대로 쓴다 (같은 DB를 보므로 데이터도 동일).
+            existing = dashboard_server.find_running_dashboard()
+            if existing:
+                self._dashboard_addr = existing
+                self.log_msg(f"📊 대시보드(이미 실행 중): http://{existing[0]}:{existing[1]}/")
+                return self._dashboard_addr
             try:
                 host, port = dashboard_server.run_in_background(db_path=results_store.get_db_path())
                 self._dashboard_addr = (host, port)
