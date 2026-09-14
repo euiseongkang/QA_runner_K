@@ -73,7 +73,9 @@ def get_screenshot_dir(run_id: str):
 
 
 def _connect(db_path=None):
-    conn = sqlite3.connect(db_path or get_db_path())
+    # [v0.6.0] 대시보드를 별도 프로그램으로도 띄울 수 있게 되면서, 같은 DB 파일을 두 프로세스가
+    # 함께 열 수 있다. 잠깐 겹칠 때 "database is locked"로 죽지 않도록 대기 시간을 준다.
+    conn = sqlite3.connect(db_path or get_db_path(), timeout=10)
     conn.execute(SCHEMA)
     conn.execute(CUSTOM_TC_SCHEMA)
     return conn
