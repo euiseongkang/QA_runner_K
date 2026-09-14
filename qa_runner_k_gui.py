@@ -34,11 +34,12 @@ import requests
 
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
+import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -803,75 +804,36 @@ class QAWorkerApp:
         self._load_tcs_from_local_xlsx(path)
 
     def _load_tcs_from_local_xlsx(self, path):
-        """"테스트케이스" 시트(No/테스트 항목/사전조건/테스트 절차/예상 결과/우선순위/결과/비고)를
-        직접 읽어 TC 리스트를 구성. EC2 없이 로컬 파일만으로 바로 실행할 수 있게 하기 위한 것.
-        [NEW] - 새 TC 엑셀 포맷 전용. 원본의 "기능경로" 포맷은 지원하지 않음.
+        """TC 엑셀("테스트케이스" 시트)을 읽어 TC 리스트를 구성.
 
-        강의성님이 실제로 작성한 `LabConnect_QA_TestCases.xlsx`를 그대로 넣어보고 맞춘 규칙:
-          - 헤더는 공백을 무시하고 비교한다 ("테스트 항목"/"테스트항목"/"테스트  항목" 모두 인식)
-          - No 칸이 비어 있는 행이 실제로 많음 -> 엑셀 행 번호로 대체해서 식별자를 만든다
-            (빈 문자열을 tc_id로 쓰면 결과 대시보드/스크린샷 파일명이 전부 뭉개짐)
-          - 실행에 꼭 필요한 건 테스트 항목 / 테스트 절차 / 예상 결과. 사전조건·우선순위·비고는
-            비어 있어도 실행은 되게 해서, 작성 중인 TC 파일로도 바로 돌려볼 수 있게 한다
-        """
+        [v0.5.0] 파싱 규칙은 tc_excel.parse_tc_excel 로 옮겼다. 대시보드의 엑셀 업로드도
+        같은 함수를 쓰기 때문에, 프로그램과 대시보드가 같은 파일을 다르게 읽는 일이 없다."""
         try:
-            from openpyxl import load_workbook
-            wb = load_workbook(path, data_only=True)
-            if "테스트케이스" not in wb.sheetnames:
-                raise ValueError('시트 "테스트케이스"를 찾을 수 없습니다. 정해진 TC 엑셀 포맷인지 확인하세요.')
-            ws = wb["테스트케이스"]
-
-            def norm(name):
-                return re.sub(r"\s+", "", str(name or ""))
-
-            # 1행: 헤더. 헤더 텍스트(공백 제거)로 컬럼 인덱스를 찾아서, 컬럼 순서가 바뀌어도 안전하게 매핑.
-            header = [norm(c.value) for c in next(ws.iter_rows(min_row=1, max_row=1))]
-            col = {name: idx for idx, name in enumerate(header) if name}
-            required = ["테스트항목", "테스트절차", "예상결과"]
-            missing = [c for c in required if c not in col]
-            if missing:
-                raise ValueError(
-                    "필수 컬럼 누락: " + ", ".join(missing)
-                    + "\n(헤더 1행에 No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 형태로 있어야 합니다)"
-                )
-
-            def cell(row, key):
-                idx = col.get(norm(key))
-                if idx is None or idx >= len(row):
-                    return ""
-                return row[idx] if row[idx] is not None else ""
-
-            tcs = []
-            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-                title = clean_text(cell(row, "테스트 항목"))
-                steps = cell(row, "테스트 절차")
-                expected = clean_text(cell(row, "예상 결과"))
-                if not title and not clean_text(steps) and not expected:
-                    continue  # 완전히 빈 행 스킵 (작성용 빈 줄이 많아서 필수)
-
-                no = clean_text(cell(row, "No"))
-                tc_id = no or f"r{row_idx}"  # No가 비어 있으면 엑셀 행 번호로 대체
-                tcs.append({
-                    "id": f"local:{os.path.basename(path)}:{tc_id}",  # EC2 tc id가 없으므로 파일+식별자로 대체
-                    "tc_id": tc_id,
-                    "sheet_name": "테스트케이스",
-                    "title": title,
-                    "precondition": clean_text(cell(row, "사전조건")),
-                    "steps": steps,
-                    "expected": expected,
-                    "priority": clean_text(cell(row, "우선순위")) or "미지정",
-                    "note": clean_text(cell(row, "비고")),
-                    "result": "",  # 로컬 파일 자체의 기존 결과값은 참고만 하고, 실행 대상 필터링에는 쓰지 않음
-                })
-
-            self.tc_data = tcs
-            self.tc_listbox.delete(0, "end")
-            for tc in self.tc_data:
-                self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
-            self.log_msg(f"로컬 엑셀에서 TC {len(self.tc_data)}건 로드: {os.path.basename(path)}")
+            tcs_raw, warnings = tc_excel.parse_tc_excel(path)
         except Exception as e:
             self.log_msg(f"⚠ 로컬 엑셀 로드 실패: {e}")
             messagebox.showerror("TC 로드 실패", str(e))
+            return
+
+        self.tc_data = [{
+            "id": f"local:{os.path.basename(path)}:{t['no']}",  # EC2 tc id가 없으므로 파일+식별자로 대체
+            "tc_id": t["no"],
+            "sheet_name": tc_excel.SHEET_NAME,
+            "title": t["title"],
+            "precondition": t["precondition"],
+            "steps": t["steps"],
+            "expected": t["expected"],
+            "priority": t["priority"] or "미지정",
+            "note": t["note"],
+            "result": "",  # 엑셀에 적힌 기존 결과값은 참고만 하고 실행 대상 필터링에는 쓰지 않음
+        } for t in tcs_raw]
+
+        self.tc_listbox.delete(0, "end")
+        for tc in self.tc_data:
+            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        self.log_msg(f"로컬 엑셀에서 TC {len(self.tc_data)}건 로드: {os.path.basename(path)}")
+        for w in warnings[:5]:
+            self.log_msg(f"  ⓘ {w}")
 
     # ---- 대시보드 ----                                            [NEW]
     def _ensure_dashboard(self):
@@ -1154,6 +1116,11 @@ class QAWorkerApp:
             else:
                 import openai
                 client = openai.OpenAI(api_key=api_key)
+
+        # [NEW v0.5.0] 대시보드 소스인데 아직 목록을 안 불러왔으면 자동으로 불러온다.
+        # (대시보드에서 엑셀을 올린 직후 [시작]만 눌러도 바로 돌게 하려는 것)
+        if tc_source == "custom" and not self.tc_data:
+            self._load_tcs_from_custom()
 
         selected = list(self.tc_listbox.curselection())
         tcs = [self.tc_data[i] for i in selected] if selected else list(self.tc_data)
