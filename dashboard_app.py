@@ -33,32 +33,45 @@ def _open(url):
         pass
 
 
-def main():
+def main(open_browser=True, minimized=False):
+    """[v0.8.0] open_browser/minimized는 '부팅 시 자동 시작'(--quiet)을 위한 것.
+    부팅할 때마다 브라우저 탭이 열리고 창이 튀어나오면 성가시므로, 자동 시작에서는
+    서버만 조용히 올리고 창은 작업표시줄에 내려둔다."""
     # 이미 떠 있으면(본 프로그램이 띄웠거나, 이 프로그램이 이미 실행 중이면) 새로 띄우지 않는다
     existing = dashboard_server.find_running_dashboard()
     if existing:
         host, port = existing
         url = f"http://{host}:{port}/"
-        _open(url + "tcs")
+        if open_browser:
+            _open(url + "tcs")
+        # 이미 떠 있는데 조용한 모드면(= 부팅 자동 시작인데 본 프로그램이 먼저 떴다면)
+        # 창까지 띄울 이유가 없으니 그냥 끝낸다
+        if minimized:
+            return
         _show_window(url, already_running=True)
         return
 
     try:
         host, port = dashboard_server.run_in_background(db_path=results_store.get_db_path())
     except Exception as e:
+        if minimized:
+            return          # 자동 시작 실패는 조용히 포기 (부팅 때 오류창이 뜨면 곤란)
         _show_error(f"대시보드를 시작하지 못했습니다.\n\n{e}")
         return
 
     url = f"http://{host}:{port}/"
-    _open(url + "tcs")
-    _show_window(url, already_running=False)
+    if open_browser:
+        _open(url + "tcs")
+    _show_window(url, already_running=False, minimized=minimized)
 
 
-def _show_window(url, already_running):
+def _show_window(url, already_running, minimized=False):
     root = tk.Tk()
     root.title(APP_TITLE)
     root.geometry("470x210")
     root.resizable(False, False)
+    if minimized:
+        root.iconify()
 
     frm = ttk.Frame(root, padding=16)
     frm.pack(fill="both", expand=True)
