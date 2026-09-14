@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -632,6 +632,9 @@ class QAWorkerApp:
         self.tc_source_var = tk.StringVar(value="local")
         self.local_xlsx_path_var = tk.StringVar(value="")
         self._dashboard_addr = None  # (host, port) - "결과 보기"로 이미 띄운 서버가 있으면 재사용
+        # [NEW v0.11.0] 대시보드 주소를 화면에 띄워서 복사/북마크할 수 있게 한다.
+        # 주소를 매번 물어보시는 일이 있어서, 버튼과 함께 눈에 보이는 자리에 둔다.
+        self.dashboard_url_var = tk.StringVar(value="대시보드 준비 중...")
 
         # [NEW] 시작 URL/로그인 - TC 엑셀과 분리해서 프로그램 설정으로 관리
         self.start_url_var = tk.StringVar()
@@ -774,6 +777,19 @@ class QAWorkerApp:
         ttk.Button(ctrl_frame, text="결과 보기", command=self.open_results_dashboard).pack(side="left", padx=8)
         ttk.Button(ctrl_frame, text="업데이트 확인", command=self.manual_check_update).pack(side="right")
 
+        # [NEW v0.11.0] 대시보드 바로가기 줄. 버튼 하나로 브라우저 새 창이 열리고,
+        # 옆에 주소를 그대로 노출해서 복사하거나 북마크할 수 있게 한다.
+        dash_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        dash_frame.pack(fill="x")
+        ttk.Button(dash_frame, text="대시보드 바로가기",
+                   command=self.open_dashboard).pack(side="left")
+        ttk.Label(dash_frame, text="주소").pack(side="left", padx=(10, 4))
+        url_entry = ttk.Entry(dash_frame, textvariable=self.dashboard_url_var,
+                              state="readonly", width=32)
+        url_entry.pack(side="left")
+        ttk.Button(dash_frame, text="주소 복사",
+                   command=self.copy_dashboard_url).pack(side="left", padx=4)
+
         # 로그
         log_frame = ttk.LabelFrame(self.root, text="로그", padding=4)
         log_frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -847,26 +863,62 @@ class QAWorkerApp:
             if existing:
                 self._dashboard_addr = existing
                 self.log_msg(f"📊 대시보드(이미 실행 중): http://{existing[0]}:{existing[1]}/")
+                self._set_dashboard_url()
                 return self._dashboard_addr
             try:
                 host, port = dashboard_server.run_in_background(db_path=results_store.get_db_path())
                 self._dashboard_addr = (host, port)
                 self.log_msg(f"📊 대시보드: http://{host}:{port}/   (결과 조회 + TC 관리)")
+                self._set_dashboard_url()
             except Exception as e:
                 self.log_msg(f"⚠ 대시보드 실행 실패: {e}")
+                self.dashboard_url_var.set("대시보드를 열지 못했습니다")
                 return None
         return self._dashboard_addr
 
+    def _dashboard_url(self, path=""):
+        addr = self._dashboard_addr
+        return f"http://{addr[0]}:{addr[1]}/{path}" if addr else ""
+
+    def _set_dashboard_url(self):
+        self.dashboard_url_var.set(self._dashboard_url())
+
+    def _open_browser(self, url):
+        """브라우저 새 창(또는 새 탭)으로 연다. new=2는 '가능하면 새 탭'이라
+        이미 열려 있는 브라우저 창을 덮어쓰지 않는다."""
+        if not url:
+            messagebox.showwarning("대시보드", "대시보드가 아직 준비되지 않았습니다.\n로그 창의 메시지를 확인해 주세요.")
+            return
+        try:
+            webbrowser.open(url, new=2)
+        except Exception as e:
+            self.log_msg(f"⚠ 브라우저 열기 실패: {e}  (주소를 복사해서 직접 여세요: {url})")
+
+    def open_dashboard(self):
+        """[대시보드 바로가기] - 대시보드 첫 화면(실행 결과)을 새 창으로. [NEW v0.11.0]"""
+        self._ensure_dashboard()
+        self._open_browser(self._dashboard_url())
+
+    def copy_dashboard_url(self):
+        """주소를 클립보드로. 다른 브라우저나 메신저에 붙여넣을 때 쓴다. [NEW v0.11.0]"""
+        url = self._dashboard_url()
+        if not url:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self.log_msg(f"주소를 복사했습니다: {url}")
+        except Exception as e:
+            self.log_msg(f"⚠ 복사 실패: {e}")
+
     def open_results_dashboard(self):
-        addr = self._ensure_dashboard()
-        if addr:
-            webbrowser.open(f"http://{addr[0]}:{addr[1]}/")
+        self._ensure_dashboard()
+        self._open_browser(self._dashboard_url())
 
     def open_tc_dashboard(self):
         """대시보드의 'TC 관리' 화면을 바로 연다. [NEW v0.4.0]"""
-        addr = self._ensure_dashboard()
-        if addr:
-            webbrowser.open(f"http://{addr[0]}:{addr[1]}/tcs")
+        self._ensure_dashboard()
+        self._open_browser(self._dashboard_url("tcs"))
 
     def log_msg(self, msg, tag="info"):
         def _append():
