@@ -11,6 +11,7 @@
 (TODO: 여러 사람이 같이 쓰려면 EC2 쪽에 같은 API를 붙여 원격 조회/작성으로 확장).
 """
 
+import io
 import os
 import socket
 import threading
@@ -18,6 +19,11 @@ import threading
 from flask import Flask, request, send_file, abort, redirect, url_for
 
 import results_store
+import tc_excel
+
+# 업로드 엑셀 크기 상한. TC 엑셀은 보통 수십~수백 KB라 10MB면 충분하고,
+# 실수로 큰 파일을 올렸을 때 메모리를 물지 않게 한다.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 # 고정 포트를 먼저 시도한다. 매번 포트가 바뀌면 주소를 북마크할 수 없어서
 # "대시보드 링크"를 고정으로 안내하기 위함. 사용 중이면 빈 포트로 자동 대체.
@@ -35,6 +41,7 @@ PRIORITIES = ["P1", "P2", "P3", "P4"]
 def create_app(db_path=None):
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path
+    app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
     def _reject_cross_site():
         """로컬 전용 서버이지만, 다른 사이트가 브라우저를 통해 POST를 보내는 것(CSRF)은 막는다.
@@ -99,6 +106,64 @@ def create_app(db_path=None):
             return redirect(url_for("tcs", err=str(e)))
         except Exception as e:
             return redirect(url_for("tcs", err=f"저장 실패: {e}"))
+
+    @app.route("/tcs/import", methods=["POST"])
+    def tcs_import():
+        """TC 엑셀을 올리면 그대로 TC 목록에 추가한다. [NEW v0.5.0]
+
+        파싱은 프로그램과 같은 tc_excel.parse_tc_excel 을 쓰므로, 여기서 들어간 TC는
+        프로그램이 엑셀을 직접 읽었을 때와 완전히 동일하게 해석된다."""
+        _reject_cross_site()
+        f = request.files.get("file")
+        if not f or not f.filename:
+            return redirect(url_for("tcs", err="엑셀 파일을 선택해주세요"))
+        if not f.filename.lower().endswith((".xlsx", ".xlsm")):
+            return redirect(url_for("tcs", err="xlsx 파일만 올릴 수 있습니다 (현재: "
+                                               + os.path.basename(f.filename) + ")"))
+
+        try:
+            tcs, warnings = tc_excel.parse_tc_excel(io.BytesIO(f.read()))
+        except tc_excel.TCExcelError as e:
+            return redirect(url_for("tcs", err=str(e)))
+        except Exception as e:
+            return redirect(url_for("tcs", err=f"엑셀을 읽지 못했습니다: {str(e)[:150]}"))
+
+        # 같은 파일을 두 번 올려도 목록이 중복으로 불어나지 않게, 내용이 같은 TC는 건너뛴다
+        existing = {
+            (t.get("title"), (t.get("steps") or "").strip(), t.get("expected"))
+            for t in results_store.list_custom_tcs(db_path=app.config["DB_PATH"])
+        }
+        added = skipped = failed = 0
+        for t in tcs:
+            key = (t["title"], t["steps"].strip(), t["expected"])
+            if key in existing:
+                skipped += 1
+                continue
+            try:
+                results_store.insert_custom_tc(
+                    t["title"], t["steps"], t["expected"],
+                    precondition=t["precondition"], priority=t["priority"],
+                    tc_no=t["no"], note=t["note"] or f"[{os.path.basename(f.filename)}]",
+                    db_path=app.config["DB_PATH"],
+                )
+                existing.add(key)
+                added += 1
+            except Exception:
+                failed += 1
+
+        parts = [f"엑셀에서 TC {added}건 추가"]
+        if skipped:
+            parts.append(f"중복 {skipped}건 건너뜀")
+        if failed:
+            parts.append(f"저장 실패 {failed}건")
+        if warnings:
+            parts.append(" / ".join(warnings[:3]))
+        if added:
+            parts.append("프로그램에서 [TC 불러오기] 후 [시작]하면 실행됩니다")
+        msg = " · ".join(parts)
+        # 전부 중복이라 추가된 게 없는 건 오류가 아니므로 경고색으로 띄우지 않는다
+        ok = bool(added) or (skipped and not failed)
+        return redirect(url_for("tcs", msg=msg) if ok else url_for("tcs", err=msg))
 
     @app.route("/tcs/toggle/<int:row_id>", methods=["POST"])
     def tcs_toggle(row_id):
@@ -177,8 +242,12 @@ STYLE = """
   .msg { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
   .msg.ok { background: #e7f8ee; border: 1px solid #b9e6cc; color: #1c6b41; }
   .msg.err { background: #fdecec; border: 1px solid #f3c7c7; color: #a3271c; }
+  .card.upload { background: #fbfcff; border-color: #d6e0f7; }
+  .card.upload label { font-size: 14px; }
+  input[type=file] { font-size: 13px; }
   .off { opacity: 0.45; }
-  .actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  .actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: nowrap; }
+  td .actions button { white-space: nowrap; }
   @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
 """
 
@@ -296,6 +365,21 @@ def _render_tcs(tc_list, editing, msg, err):
     · 엔터는 그대로: <code>엔터 키 입력</code><br>
     · 절차는 <b>번호를 매겨 한 줄에 한 단계씩</b> 적어주세요. 대괄호로 적지 않은 버튼은 클릭하지 않습니다.<br>
     · 예상 결과에 "팝업이 노출된다" / "~화면으로 이동한다" 처럼 쓰면 팝업 등장·화면 이동을 직접 확인합니다.
+  </div>
+
+  <div class="card upload">
+    <form method="post" action="/tcs/import" enctype="multipart/form-data">
+      <label for="file">TC 엑셀 파일로 한 번에 추가</label>
+      <div class="sub" style="margin-bottom:10px">
+        확정된 포맷("테스트케이스" 시트 · No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
+        그대로 올리면 됩니다. 프로그램이 엑셀을 직접 읽을 때와 <b>같은 방식으로 해석</b>되고,
+        추가된 TC는 <b>실행 포함</b> 상태로 들어갑니다. 같은 내용의 TC는 중복 추가하지 않습니다.
+      </div>
+      <div class="actions">
+        <input type="file" id="file" name="file" accept=".xlsx,.xlsm" required>
+        <button type="submit" class="primary">엑셀에서 TC 가져오기</button>
+      </div>
+    </form>
   </div>
 
   <div class="card">
