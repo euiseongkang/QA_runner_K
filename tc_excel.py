@@ -28,9 +28,14 @@ def norm_header(name) -> str:
 
 
 def clean_cell(value) -> str:
-    """셀 값의 앞뒤 공백/중복 공백 정리. 줄바꿈은 살려야 하는 컬럼이 있어 여기서는 쓰지 않음."""
+    """셀 값의 앞뒤 공백/중복 공백 정리. 줄바꿈은 살려야 하는 컬럼이 있어 여기서는 쓰지 않음.
+
+    [v0.16.0] 숫자 셀이 실수로 넘어오는 경우를 정리한다. 구글 시트를 거치면 No 컬럼의 1이
+    1.0으로 와서 TC 번호가 "1.0"으로 보이는 문제가 있었다."""
     if value is None:
         return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     return re.sub(r"[ \t]+", " ", str(value)).strip()
 
 
@@ -64,16 +69,17 @@ def pick_sheets(sheetnames):
     return [n for n in (sheetnames or []) if is_tc_sheet(n)]
 
 
-def _parse_one_sheet(ws, sheet_name):
+def _parse_one_sheet(ws, sheet_name, strict=True):
     """시트 하나를 읽어 (tcs, warnings). 필수 컬럼이 없으면 그 시트만 건너뛴다.
 
     여러 시트를 읽게 되면서, 시트 하나가 잘못됐다고 파일 전체를 실패시키면
-    나머지 멀쩡한 시트까지 못 쓰게 되므로 경고만 남기고 넘어간다."""
+    나머지 멀쩡한 시트까지 못 쓰게 되므로 경고만 남기고 넘어간다.
+    strict=False면 이름으로 지목된 시트가 아니라 훑어보는 중이므로 경고도 남기지 않는다."""
     rows = ws.iter_rows(values_only=True)
     try:
         header_row = next(rows)
     except StopIteration:
-        return [], [f'"{sheet_name}" 시트가 비어 있어 건너뜀']
+        return [], ([f'"{sheet_name}" 시트가 비어 있어 건너뜀'] if strict else [])
 
     col = {}
     for idx, name in enumerate(header_row):
@@ -83,6 +89,8 @@ def _parse_one_sheet(ws, sheet_name):
 
     missing = [c for c in REQUIRED_COLUMNS if norm_header(c) not in col]
     if missing:
+        if not strict:
+            return [], []      # TC 시트가 아닌 걸로 보고 조용히 넘어간다 (예: "개요")
         return [], [f'"{sheet_name}" 시트 건너뜀 - 필수 컬럼 없음: ' + ", ".join(missing)]
 
     def cell(row, name, keep_newlines=False):
@@ -223,19 +231,24 @@ def parse_tc_excel(source):
         raise TCExcelError(f"엑셀 파일을 열 수 없습니다: {str(e)[:120]}")
 
     try:
-        targets = pick_sheets(wb.sheetnames)
-        if not targets:
-            raise TCExcelError(
-                'TC 시트를 찾을 수 없습니다. 시트 이름에 "TC" 또는 "테스트케이스"가 들어가야 합니다. '
-                f'(이 파일의 시트: {", ".join(wb.sheetnames) or "없음"})'
-            )
+        # [v0.16.0] 시트 이름은 힌트일 뿐이고, 이름에 TC가 없어도 컬럼만 맞으면 읽는다.
+        # "환자 관리"처럼 TC를 안 붙인 이름을 쓰시는 경우가 있어서, 이름으로 막지 않는다.
+        named = pick_sheets(wb.sheetnames)
+        targets = named or list(wb.sheetnames)
 
         tcs, warnings = [], []
         for sheet_name in targets:
-            sheet_tcs, sheet_warns = _parse_one_sheet(wb[sheet_name], sheet_name)
+            sheet_tcs, sheet_warns = _parse_one_sheet(
+                wb[sheet_name], sheet_name, strict=bool(named))
             tcs.extend(sheet_tcs)
             warnings.extend(sheet_warns)
 
+        if not tcs and not named:
+            raise TCExcelError(
+                "TC를 읽을 수 있는 시트가 없습니다. 시트 1행 헤더에 "
+                "'테스트 항목 · 테스트 절차 · 예상 결과'가 있어야 합니다. "
+                f'(이 파일의 시트: {", ".join(wb.sheetnames) or "없음"})'
+            )
         if not tcs:
             warnings.append("읽을 수 있는 TC가 없습니다 (데이터 행이 비어 있는지 확인해주세요)")
         return tcs, warnings
