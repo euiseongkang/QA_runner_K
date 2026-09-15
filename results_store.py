@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS custom_tcs (
     expected TEXT NOT NULL,        -- 예상 결과
     priority TEXT,                 -- P1~P4
     note TEXT,                     -- 비고
+    sheet TEXT,                    -- 출처 시트 이름 = 화면별 구분값 [v0.14.0]
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
 );
@@ -78,7 +79,22 @@ def _connect(db_path=None):
     conn = sqlite3.connect(db_path or get_db_path(), timeout=10)
     conn.execute(SCHEMA)
     conn.execute(CUSTOM_TC_SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn):
+    """예전 버전에서 만든 DB에 새 컬럼을 채워 넣는다. [NEW v0.14.0]
+
+    이미 쓰던 DB가 강의성님 PC에 있으므로, 컬럼을 추가할 때 파일을 지우게 하면 안 된다.
+    CREATE TABLE IF NOT EXISTS 는 기존 테이블을 건드리지 않으니 ALTER로 따로 채운다."""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(custom_tcs)").fetchall()}
+        if "sheet" not in cols:
+            conn.execute("ALTER TABLE custom_tcs ADD COLUMN sheet TEXT")
+            conn.commit()
+    except Exception:
+        pass          # 마이그레이션 실패로 프로그램이 안 뜨는 일은 없게 한다
 
 
 def insert_result(tc: dict, result: str, reason: str, source: str, source_ref: str,
@@ -197,9 +213,10 @@ def _clip(value, limit=MAX_FIELD_LEN):
 
 
 def insert_custom_tc(title, steps, expected, precondition="", priority="", tc_no="", note="",
-                     db_path=None):
+                     sheet="", db_path=None):
     """대시보드 입력 폼에서 TC 1건 추가. 추가된 row id 반환.
-    필수는 테스트 항목/테스트 절차/예상 결과 3개 (엑셀 로더의 필수 컬럼과 동일 기준)."""
+    필수는 테스트 항목/테스트 절차/예상 결과 3개 (엑셀 로더의 필수 컬럼과 동일 기준).
+    sheet는 엑셀/구글 시트의 시트 이름 = 화면별 구분값. [v0.14.0]"""
     title, steps, expected = _clip(title), _clip(steps), _clip(expected)
     if not title or not steps or not expected:
         raise ValueError("테스트 항목 / 테스트 절차 / 예상 결과는 필수입니다")
@@ -207,10 +224,11 @@ def insert_custom_tc(title, steps, expected, precondition="", priority="", tc_no
     try:
         cur = conn.execute(
             """INSERT INTO custom_tcs
-               (tc_no, title, precondition, steps, expected, priority, note, enabled, created_at)
-               VALUES (?,?,?,?,?,?,?,1,?)""",
+               (tc_no, title, precondition, steps, expected, priority, note, sheet,
+                enabled, created_at)
+               VALUES (?,?,?,?,?,?,?,?,1,?)""",
             (_clip(tc_no, 40), title, _clip(precondition), steps, expected,
-             _clip(priority, 20), _clip(note, 500), time.time()),
+             _clip(priority, 20), _clip(note, 500), _clip(sheet, 100), time.time()),
         )
         conn.commit()
         return cur.lastrowid
@@ -219,7 +237,7 @@ def insert_custom_tc(title, steps, expected, precondition="", priority="", tc_no
 
 
 def update_custom_tc(row_id, title, steps, expected, precondition="", priority="", tc_no="",
-                     note="", db_path=None):
+                     note="", sheet="", db_path=None):
     """기존 TC 수정. 화면에서 문구를 고쳐 다시 돌릴 수 있게 하기 위한 것."""
     title, steps, expected = _clip(title), _clip(steps), _clip(expected)
     if not title or not steps or not expected:
@@ -228,9 +246,9 @@ def update_custom_tc(row_id, title, steps, expected, precondition="", priority="
     try:
         conn.execute(
             """UPDATE custom_tcs SET tc_no=?, title=?, precondition=?, steps=?, expected=?,
-                                     priority=?, note=? WHERE id=?""",
+                                     priority=?, note=?, sheet=? WHERE id=?""",
             (_clip(tc_no, 40), title, _clip(precondition), steps, expected,
-             _clip(priority, 20), _clip(note, 500), int(row_id)),
+             _clip(priority, 20), _clip(note, 500), _clip(sheet, 100), int(row_id)),
         )
         conn.commit()
     finally:
@@ -257,16 +275,49 @@ def delete_custom_tc(row_id, db_path=None):
         conn.close()
 
 
-def list_custom_tcs(only_enabled=False, db_path=None):
-    """대시보드에서 추가한 TC 목록. 프로그램 실행 시에는 only_enabled=True로 쓴다."""
+def list_custom_tcs(only_enabled=False, sheet=None, db_path=None):
+    """대시보드에서 추가한 TC 목록. 프로그램 실행 시에는 only_enabled=True로 쓴다.
+    sheet를 주면 그 시트(화면)의 TC만. [v0.14.0]"""
     conn = _connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        sql = "SELECT * FROM custom_tcs"
+        sql, args = "SELECT * FROM custom_tcs", []
+        where = []
         if only_enabled:
-            sql += " WHERE enabled=1"
+            where.append("enabled=1")
+        if sheet is not None:
+            where.append("IFNULL(sheet,'')=?")
+            args.append(str(sheet))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY id"
-        return [dict(r) for r in conn.execute(sql).fetchall()]
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    finally:
+        conn.close()
+
+
+def list_custom_tc_sheets(db_path=None):
+    """시트(화면)별 TC 건수. 대시보드 필터를 만들기 위한 것. [NEW v0.14.0]
+    [{sheet, total, enabled}, ...] - 시트 이름이 없는 TC는 sheet=''로 묶인다."""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT IFNULL(sheet,''), COUNT(*), SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END)
+               FROM custom_tcs GROUP BY IFNULL(sheet,'') ORDER BY IFNULL(sheet,'')"""
+        ).fetchall()
+        return [{"sheet": r[0], "total": r[1], "enabled": r[2] or 0} for r in rows]
+    finally:
+        conn.close()
+
+
+def set_sheet_enabled(sheet, enabled, db_path=None):
+    """한 시트의 TC를 통째로 실행 포함/제외. 화면 단위로 돌릴 때 쓴다. [NEW v0.14.0]"""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute("UPDATE custom_tcs SET enabled=? WHERE IFNULL(sheet,'')=?",
+                           (1 if enabled else 0, str(sheet or "")))
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 
