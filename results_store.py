@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS results (
     expected TEXT,
     result TEXT NOT NULL,          -- 'PASS' | 'FAIL' | '확인 필요'
     reason TEXT,
+    sheet TEXT,                    -- TC가 나온 시트 이름 = 화면별 구분값 [v0.15.0]
     before_screenshot TEXT,        -- 로컬 파일 경로 (없으면 NULL)
     after_screenshot TEXT,
     created_at REAL NOT NULL
@@ -88,13 +89,14 @@ def _migrate(conn):
 
     이미 쓰던 DB가 강의성님 PC에 있으므로, 컬럼을 추가할 때 파일을 지우게 하면 안 된다.
     CREATE TABLE IF NOT EXISTS 는 기존 테이블을 건드리지 않으니 ALTER로 따로 채운다."""
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(custom_tcs)").fetchall()}
-        if "sheet" not in cols:
-            conn.execute("ALTER TABLE custom_tcs ADD COLUMN sheet TEXT")
-            conn.commit()
-    except Exception:
-        pass          # 마이그레이션 실패로 프로그램이 안 뜨는 일은 없게 한다
+    for table in ("custom_tcs", "results"):
+        try:
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "sheet" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN sheet TEXT")
+                conn.commit()
+        except Exception:
+            pass      # 마이그레이션 실패로 프로그램이 안 뜨는 일은 없게 한다
 
 
 def insert_result(tc: dict, result: str, reason: str, source: str, source_ref: str,
@@ -104,13 +106,14 @@ def insert_result(tc: dict, result: str, reason: str, source: str, source_ref: s
         conn.execute(
             """INSERT INTO results
                (run_id, source, source_ref, tc_no, title, priority, precondition, steps, expected,
-                result, reason, before_screenshot, after_screenshot, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                result, reason, sheet, before_screenshot, after_screenshot, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id, source, source_ref,
                 str(tc.get("tc_id", "")), tc.get("title", ""), tc.get("priority", ""),
                 tc.get("precondition", ""), tc.get("steps", ""), tc.get("expected", ""),
-                result, reason or "", before_screenshot, after_screenshot, time.time(),
+                result, reason or "", tc.get("sheet_name", ""),
+                before_screenshot, after_screenshot, time.time(),
             ),
         )
         conn.commit()
@@ -131,23 +134,43 @@ def list_runs(db_path=None):
         conn.close()
 
 
-def list_runs_summary(db_path=None):
+def list_runs_summary(sheet=None, db_path=None):
     """실행 배치 목록 + 배치별 판정 집계. 대시보드 첫 화면(목록)에서 쓴다. [NEW v0.12.0]
-    [{run_id, source, source_ref, started_at, total, passed, failed, unsure}, ...] 최신순."""
+    [{run_id, source, source_ref, started_at, total, passed, failed, unsure, sheets}, ...] 최신순.
+    sheet를 주면 그 시트의 TC가 포함된 배치만 남긴다. [v0.15.0]"""
+    conn = _connect(db_path)
+    try:
+        sql = """SELECT run_id, source, source_ref, MIN(created_at), COUNT(*),
+                        SUM(CASE WHEN result='PASS' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN result='FAIL' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN result NOT IN ('PASS','FAIL') THEN 1 ELSE 0 END),
+                        GROUP_CONCAT(DISTINCT IFNULL(sheet,''))
+                 FROM results"""
+        args = []
+        if sheet is not None:
+            sql += " WHERE run_id IN (SELECT run_id FROM results WHERE IFNULL(sheet,'')=?)"
+            args.append(str(sheet))
+        sql += " GROUP BY run_id ORDER BY MIN(created_at) DESC"
+        rows = conn.execute(sql, args).fetchall()
+        return [
+            {"run_id": r[0], "source": r[1], "source_ref": r[2], "started_at": r[3],
+             "total": r[4], "passed": r[5] or 0, "failed": r[6] or 0, "unsure": r[7] or 0,
+             "sheets": [s for s in sorted((r[8] or "").split(",")) if s]}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def list_result_sheets(db_path=None):
+    """실행 결과에 들어 있는 시트(화면)별 건수. 실행 내역 필터용. [NEW v0.15.0]"""
     conn = _connect(db_path)
     try:
         rows = conn.execute(
-            """SELECT run_id, source, source_ref, MIN(created_at), COUNT(*),
-                      SUM(CASE WHEN result='PASS' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN result='FAIL' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN result NOT IN ('PASS','FAIL') THEN 1 ELSE 0 END)
-               FROM results GROUP BY run_id ORDER BY MIN(created_at) DESC"""
+            """SELECT IFNULL(sheet,''), COUNT(*), COUNT(DISTINCT run_id)
+               FROM results GROUP BY IFNULL(sheet,'') ORDER BY IFNULL(sheet,'')"""
         ).fetchall()
-        return [
-            {"run_id": r[0], "source": r[1], "source_ref": r[2], "started_at": r[3],
-             "total": r[4], "passed": r[5] or 0, "failed": r[6] or 0, "unsure": r[7] or 0}
-            for r in rows
-        ]
+        return [{"sheet": r[0], "total": r[1], "runs": r[2]} for r in rows]
     finally:
         conn.close()
 
@@ -184,19 +207,27 @@ def delete_run(run_id, db_path=None, remove_screenshots=True):
     return deleted
 
 
-def list_results(run_id=None, db_path=None, limit=300):
+def list_results(run_id=None, db_path=None, limit=300, sheet=None):
+    """실행 결과 행. sheet를 주면 그 시트(화면)의 결과만. [sheet: v0.15.0]"""
     conn = _connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        where, args = [], []
         if run_id:
-            rows = conn.execute(
-                "SELECT * FROM results WHERE run_id=? ORDER BY id", (run_id,)
-            ).fetchall()
+            where.append("run_id=?")
+            args.append(run_id)
+        if sheet is not None:
+            where.append("IFNULL(sheet,'')=?")
+            args.append(str(sheet))
+        sql = "SELECT * FROM results"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        if run_id:
+            sql += " ORDER BY id"
         else:
-            rows = conn.execute(
-                "SELECT * FROM results ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
-        return [dict(r) for r in rows]
+            sql += " ORDER BY id DESC LIMIT ?"
+            args.append(limit)
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
     finally:
         conn.close()
 
