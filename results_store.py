@@ -98,6 +98,20 @@ def _migrate(conn):
         except Exception:
             pass      # 마이그레이션 실패로 프로그램이 안 뜨는 일은 없게 한다
 
+    # [v0.16.0] 이미 들어간 "1.0" 같은 TC 번호를 "1"로 정리한다.
+    # 구글 시트를 거치면 숫자가 실수로 와서 생긴 흔적이라, 다시 올리지 않아도 고쳐지게 한다.
+    import re as _re
+    for table in ("custom_tcs", "results"):
+        try:
+            rows = conn.execute(
+                f"SELECT id, tc_no FROM {table} WHERE tc_no LIKE '%.0'").fetchall()
+            fixed = [(r[1][:-2], r[0]) for r in rows if _re.fullmatch(r"\d+\.0", r[1] or "")]
+            if fixed:
+                conn.executemany(f"UPDATE {table} SET tc_no=? WHERE id=?", fixed)
+                conn.commit()
+        except Exception:
+            pass
+
 
 def insert_result(tc: dict, result: str, reason: str, source: str, source_ref: str,
                    run_id: str, before_screenshot=None, after_screenshot=None, db_path=None):
