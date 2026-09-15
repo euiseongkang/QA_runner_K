@@ -19,7 +19,6 @@
 
 import re
 
-SHEET_NAME = "테스트케이스"
 REQUIRED_COLUMNS = ["테스트 항목", "테스트 절차", "예상 결과"]
 
 
@@ -37,6 +36,91 @@ def clean_cell(value) -> str:
 
 class TCExcelError(ValueError):
     """포맷이 달라서 읽을 수 없을 때. 메시지를 그대로 사용자에게 보여준다."""
+
+
+# ============================================================
+# TC 시트 고르기                                                [NEW v0.14.0]
+# ============================================================
+# 처음에는 "테스트케이스" 시트 하나만 읽었는데, 실제로는 화면별로 시트를 나눠 쓰고
+# 이름도 "TC_환자관리"처럼 자유롭게 붙인다. 그래서 이름에 TC(또는 테스트케이스)가 들어간
+# 시트를 전부 읽고, 시트 이름을 TC의 구분값으로 달아둔다.
+SHEET_NAME = "테스트케이스"            # 기본/예시 이름 (하위호환)
+SHEET_KEYWORDS = ("TC", "테스트케이스")
+
+
+def is_tc_sheet(name) -> bool:
+    """시트 이름에 TC 또는 테스트케이스가 들어가면 TC 시트로 본다 (대소문자·공백 무시).
+
+    "개요"처럼 TC가 아닌 시트를 걸러내는 게 목적이라 조건을 느슨하게 둔다.
+    필수 컬럼이 없으면 어차피 읽는 단계에서 걸러진다."""
+    key = norm_header(name).upper()
+    if not key:
+        return False
+    return any(k.upper() in key for k in SHEET_KEYWORDS)
+
+
+def pick_sheets(sheetnames):
+    """워크북의 시트 이름 목록에서 TC 시트만 원래 순서대로 고른다."""
+    return [n for n in (sheetnames or []) if is_tc_sheet(n)]
+
+
+def _parse_one_sheet(ws, sheet_name):
+    """시트 하나를 읽어 (tcs, warnings). 필수 컬럼이 없으면 그 시트만 건너뛴다.
+
+    여러 시트를 읽게 되면서, 시트 하나가 잘못됐다고 파일 전체를 실패시키면
+    나머지 멀쩡한 시트까지 못 쓰게 되므로 경고만 남기고 넘어간다."""
+    rows = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows)
+    except StopIteration:
+        return [], [f'"{sheet_name}" 시트가 비어 있어 건너뜀']
+
+    col = {}
+    for idx, name in enumerate(header_row):
+        key = norm_header(name)
+        if key and key not in col:
+            col[key] = idx
+
+    missing = [c for c in REQUIRED_COLUMNS if norm_header(c) not in col]
+    if missing:
+        return [], [f'"{sheet_name}" 시트 건너뜀 - 필수 컬럼 없음: ' + ", ".join(missing)]
+
+    def cell(row, name, keep_newlines=False):
+        idx = col.get(norm_header(name))
+        if idx is None or idx >= len(row) or row[idx] is None:
+            return ""
+        return str(row[idx]) if keep_newlines else clean_cell(row[idx])
+
+    tcs, warnings = [], []
+    for row_idx, row in enumerate(rows, start=2):
+        title = cell(row, "테스트 항목")
+        steps = cell(row, "테스트 절차", keep_newlines=True)
+        expected = cell(row, "예상 결과")
+
+        if not title and not steps.strip() and not expected:
+            continue  # 완전히 빈 행
+
+        if not title or not steps.strip() or not expected:
+            missing_here = [
+                n for n, v in (("테스트 항목", title), ("테스트 절차", steps.strip()),
+                               ("예상 결과", expected)) if not v
+            ]
+            warnings.append(f'"{sheet_name}" {row_idx}행 건너뜀 - 빈 칸: ' + ", ".join(missing_here))
+            continue
+
+        no = cell(row, "No")
+        tcs.append({
+            "no": no or f"r{row_idx}",
+            "title": title,
+            "precondition": cell(row, "사전조건"),
+            "steps": steps,
+            "expected": expected,
+            "priority": cell(row, "우선순위"),
+            "note": cell(row, "비고"),
+            "sheet": sheet_name,          # [NEW v0.14.0] 시트별 관리를 위한 구분값
+            "row": row_idx,
+        })
+    return tcs, warnings
 
 
 # ============================================================
@@ -139,67 +223,18 @@ def parse_tc_excel(source):
         raise TCExcelError(f"엑셀 파일을 열 수 없습니다: {str(e)[:120]}")
 
     try:
-        if SHEET_NAME not in wb.sheetnames:
+        targets = pick_sheets(wb.sheetnames)
+        if not targets:
             raise TCExcelError(
-                f'시트 "{SHEET_NAME}"를 찾을 수 없습니다. '
+                'TC 시트를 찾을 수 없습니다. 시트 이름에 "TC" 또는 "테스트케이스"가 들어가야 합니다. '
                 f'(이 파일의 시트: {", ".join(wb.sheetnames) or "없음"})'
             )
-        ws = wb[SHEET_NAME]
-
-        rows = ws.iter_rows(values_only=True)
-        try:
-            header_row = next(rows)
-        except StopIteration:
-            raise TCExcelError(f'"{SHEET_NAME}" 시트가 비어 있습니다')
-
-        col = {}
-        for idx, name in enumerate(header_row):
-            key = norm_header(name)
-            if key and key not in col:
-                col[key] = idx
-
-        missing = [c for c in REQUIRED_COLUMNS if norm_header(c) not in col]
-        if missing:
-            raise TCExcelError(
-                "필수 컬럼이 없습니다: " + ", ".join(missing)
-                + " / 1행 헤더가 'No · 테스트 항목 · 사전조건 · 테스트 절차 · 예상 결과 · 우선순위' "
-                  "형태인지 확인해주세요"
-            )
-
-        def cell(row, name, keep_newlines=False):
-            idx = col.get(norm_header(name))
-            if idx is None or idx >= len(row) or row[idx] is None:
-                return ""
-            return str(row[idx]) if keep_newlines else clean_cell(row[idx])
 
         tcs, warnings = [], []
-        for row_idx, row in enumerate(rows, start=2):
-            title = cell(row, "테스트 항목")
-            steps = cell(row, "테스트 절차", keep_newlines=True)
-            expected = cell(row, "예상 결과")
-
-            if not title and not steps.strip() and not expected:
-                continue  # 완전히 빈 행
-
-            if not title or not steps.strip() or not expected:
-                missing_here = [
-                    n for n, v in (("테스트 항목", title), ("테스트 절차", steps.strip()),
-                                   ("예상 결과", expected)) if not v
-                ]
-                warnings.append(f"{row_idx}행 건너뜀 - 빈 칸: {', '.join(missing_here)}")
-                continue
-
-            no = cell(row, "No")
-            tcs.append({
-                "no": no or f"r{row_idx}",
-                "title": title,
-                "precondition": cell(row, "사전조건"),
-                "steps": steps,
-                "expected": expected,
-                "priority": cell(row, "우선순위"),
-                "note": cell(row, "비고"),
-                "row": row_idx,
-            })
+        for sheet_name in targets:
+            sheet_tcs, sheet_warns = _parse_one_sheet(wb[sheet_name], sheet_name)
+            tcs.extend(sheet_tcs)
+            warnings.extend(sheet_warns)
 
         if not tcs:
             warnings.append("읽을 수 있는 TC가 없습니다 (데이터 행이 비어 있는지 확인해주세요)")
