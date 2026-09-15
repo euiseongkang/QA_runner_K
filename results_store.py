@@ -115,6 +115,59 @@ def list_runs(db_path=None):
         conn.close()
 
 
+def list_runs_summary(db_path=None):
+    """실행 배치 목록 + 배치별 판정 집계. 대시보드 첫 화면(목록)에서 쓴다. [NEW v0.12.0]
+    [{run_id, source, source_ref, started_at, total, passed, failed, unsure}, ...] 최신순."""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT run_id, source, source_ref, MIN(created_at), COUNT(*),
+                      SUM(CASE WHEN result='PASS' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN result='FAIL' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN result NOT IN ('PASS','FAIL') THEN 1 ELSE 0 END)
+               FROM results GROUP BY run_id ORDER BY MIN(created_at) DESC"""
+        ).fetchall()
+        return [
+            {"run_id": r[0], "source": r[1], "source_ref": r[2], "started_at": r[3],
+             "total": r[4], "passed": r[5] or 0, "failed": r[6] or 0, "unsure": r[7] or 0}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def _remove_screenshot_dir(run_id):
+    """해당 배치의 스크린샷 폴더를 지운다.
+    run_id에 경로 조작 문자가 섞여 있어도 스크린샷 루트 밖을 건드리지 못하게 확인한다."""
+    import shutil
+    root = os.path.realpath(os.path.join(_base_dir(), SCREENSHOT_DIR_NAME))
+    target = os.path.realpath(os.path.join(root, str(run_id)))
+    if target.startswith(root + os.sep) and os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)
+        return True
+    return False
+
+
+def delete_run(run_id, db_path=None, remove_screenshots=True):
+    """실행 배치 하나를 통째로 삭제(결과 행 + 스크린샷 파일). 지운 행 수를 반환. [NEW v0.12.0]
+
+    스크린샷은 용량을 많이 차지하므로 결과와 함께 지운다. 되돌릴 수 없으니
+    화면에서 한 번 더 확인을 받은 뒤 호출한다."""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        raise ValueError("run_id가 필요합니다")
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute("DELETE FROM results WHERE run_id=?", (run_id,))
+        conn.commit()
+        deleted = cur.rowcount
+    finally:
+        conn.close()
+    if remove_screenshots:
+        _remove_screenshot_dir(run_id)
+    return deleted
+
+
 def list_results(run_id=None, db_path=None, limit=300):
     conn = _connect(db_path)
     conn.row_factory = sqlite3.Row
