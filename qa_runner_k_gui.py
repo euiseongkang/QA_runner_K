@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.14.0"
+APP_VERSION = "0.15.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -834,7 +834,7 @@ class QAWorkerApp:
         self.tc_data = [{
             "id": f"local:{os.path.basename(path)}:{t['no']}",  # EC2 tc id가 없으므로 파일+식별자로 대체
             "tc_id": t["no"],
-            "sheet_name": tc_excel.SHEET_NAME,
+            "sheet_name": t.get("sheet") or tc_excel.SHEET_NAME,   # [v0.15.0] 시트별 구분
             "title": t["title"],
             "precondition": t["precondition"],
             "steps": t["steps"],
@@ -1007,7 +1007,7 @@ class QAWorkerApp:
             tcs.append({
                 "id": f"custom:{r.get('id')}",
                 "tc_id": tc_id,
-                "sheet_name": "대시보드",
+                "sheet_name": clean_text(r.get("sheet")) or "대시보드",   # [v0.15.0]
                 "title": clean_text(r.get("title")),
                 "precondition": clean_text(r.get("precondition")),
                 "steps": r.get("steps") or "",
