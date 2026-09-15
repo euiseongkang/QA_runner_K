@@ -15,6 +15,8 @@ import io
 import os
 import socket
 import threading
+import time
+import urllib.parse
 
 from flask import Flask, request, send_file, abort, redirect, url_for
 
@@ -60,10 +62,24 @@ def create_app(db_path=None):
 
     @app.route("/")
     def index():
+        """[v0.12.0] 첫 화면은 '실행 배치 목록'. 배치를 고르면 그 배치의 결과 화면으로 간다.
+        run_id 없이 전체를 한 번에 보던 화면은 '전체 보기'로 남겨둔다."""
         run_id = request.args.get("run_id") or None
-        runs = results_store.list_runs(app.config["DB_PATH"])
+        if not run_id and request.args.get("all") != "1":
+            return _render_runs(results_store.list_runs_summary(app.config["DB_PATH"]),
+                                request.args.get("msg", ""))
         results = results_store.list_results(run_id=run_id, db_path=app.config["DB_PATH"])
-        return _render_results(runs, results, run_id)
+        return _render_results(results, run_id)
+
+    @app.route("/runs/delete/<path:run_id>", methods=["POST"])
+    def runs_delete(run_id):
+        _reject_cross_site()
+        try:
+            n = results_store.delete_run(run_id, db_path=app.config["DB_PATH"])
+            msg = f"실행 내역을 삭제했습니다 ({run_id} · 결과 {n}건 · 스크린샷 포함)"
+        except Exception as e:
+            msg = f"삭제 실패: {e}"
+        return redirect("/?msg=" + urllib.parse.quote(msg))
 
     @app.route("/healthz")
     def healthz():
@@ -268,6 +284,13 @@ STYLE = """
   a.shot:hover img { border-color: #2d6cdf; box-shadow: 0 0 0 2px rgba(45,108,223,.18); }
   a.shot:hover span { color: #2d6cdf; }
   .noshot { color: #999; font-size: 12px; }
+  a.runlink { color: #1b2330; text-decoration: none; font-weight: 600; }
+  a.runlink.sub2 { color: #555; font-weight: 400; }
+  a.runlink:hover { color: #2d6cdf; text-decoration: underline; }
+  tbody tr:hover { background: #f7f9fd; }
+  td.right, th.right { text-align: right; white-space: nowrap; }
+  a.btnlike { font-size: 13px; color: #2d6cdf; text-decoration: none; padding: 2px 6px; }
+  a.btnlike:hover { text-decoration: underline; }
   @media (max-width: 900px) { a.shot img { width: 150px; height: 110px; } }
   .off { opacity: 0.45; }
   .actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: nowrap; }
@@ -290,7 +313,7 @@ def _page(title, active, body):
 <body>
   <nav><div class="inner">
     <span class="brand">QA_runner_K</span>
-    <a href="/"{cls('results')}>실행 결과</a>
+    <a href="/"{cls('results')}>실행 내역</a>
     <a href="/tcs"{cls('tcs')}>TC 관리</a>
     {account}
   </div></nav>
@@ -298,13 +321,66 @@ def _page(title, active, body):
 </body></html>"""
 
 
-def _render_results(runs, results, current_run):
-    run_options = ['<option value="">전체 (최근 300건)</option>']
-    for run_id, source, source_ref, started_at, count in runs:
-        label = f"{run_id} · {source} · {os.path.basename(str(source_ref or ''))} ({count}건)"
-        selected = " selected" if run_id == current_run else ""
-        run_options.append(f'<option value="{_esc(run_id)}"{selected}>{_esc(label)}</option>')
+def _when(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except Exception:
+        return "-"
 
+
+def _source_label(source, source_ref):
+    """TC가 어디서 왔는지 한 줄로. 엑셀은 파일명만, 대시보드/EC2는 그대로."""
+    ref = str(source_ref or "")
+    if source == "local":
+        return os.path.basename(ref) or "로컬 엑셀"
+    if source == "custom":
+        return ref or "대시보드 추가 TC"
+    return f"EC2 · {ref}" if ref else "EC2"
+
+
+def _render_runs(runs, msg):
+    """[NEW v0.12.0] 실행 배치 목록. TC를 돌릴 때마다 한 줄씩 쌓이고,
+    줄을 누르면 그 배치의 결과 화면으로 간다. 줄마다 [삭제]가 붙는다."""
+    rows = []
+    for r in runs:
+        detail = f"/?run_id={urllib.parse.quote(str(r['run_id']))}"
+        badges = []
+        if r["passed"]:
+            badges.append(f'{_badge("PASS")} {r["passed"]}')
+        if r["failed"]:
+            badges.append(f'{_badge("FAIL")} {r["failed"]}')
+        if r["unsure"]:
+            badges.append(f'{_badge("확인 필요")} {r["unsure"]}')
+        rows.append(f"""<tr>
+  <td><a class="runlink" href="{detail}">{_esc(_when(r['started_at']))}</a></td>
+  <td><a class="runlink sub2" href="{detail}">{_esc(_source_label(r['source'], r['source_ref']))}</a></td>
+  <td>{r['total']}건</td>
+  <td>{' &nbsp; '.join(badges) or '-'}</td>
+  <td class="right">
+    <a class="btnlike" href="{detail}">결과 보기</a>
+    <form method="post" action="/runs/delete/{urllib.parse.quote(str(r['run_id']))}"
+          style="display:inline" onsubmit="return confirm('{_esc(_when(r['started_at']))} 실행 내역(결과 {r['total']}건)을 삭제할까요? 스크린샷도 함께 지워지며 되돌릴 수 없습니다.');">
+      <button type="submit" class="danger">삭제</button>
+    </form>
+  </td>
+</tr>""")
+
+    msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
+    empty = ('<tr><td colspan="5">아직 실행 내역이 없습니다. 프로그램에서 TC를 실행하면 '
+             '여기에 한 줄씩 쌓입니다.</td></tr>')
+    body = f"""
+  <h2>실행 내역</h2>
+  <div class="sub">TC를 실행할 때마다 한 줄씩 쌓입니다. 줄을 누르면 그 실행의 결과와 스크린샷을 봅니다.</div>
+  {msg_html}
+  <table>
+    <thead><tr><th>실행 시각</th><th>TC 소스</th><th>건수</th><th>판정</th><th class="right">&nbsp;</th></tr></thead>
+    <tbody>{''.join(rows) or empty}</tbody>
+  </table>
+  <p class="sub" style="margin-top:14px"><a href="/?all=1">전체 결과 한 번에 보기 (최근 300건)</a></p>"""
+    return _page("QA_runner_K 실행 내역", "results", body)
+
+
+def _render_results(results, current_run):
     summary = {"PASS": 0, "FAIL": 0, "확인 필요": 0}
     rows_html = []
     for r in results:
@@ -331,18 +407,15 @@ def _render_results(runs, results, current_run):
     summary_html = "".join(
         f'<span class="summary-item">{_badge(k)} {v}건</span>' for k, v in summary.items()
     )
+    title = f"{_when(results[0]['created_at'])} 실행" if (results and current_run) else "전체 결과 (최근 300건)"
     body = f"""
-  <h2>실행 결과</h2>
+  <p class="sub"><a href="/">← 실행 내역 목록</a></p>
+  <h2>{_esc(title)}</h2>
   <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 눌러 전체 화면으로 확인하세요.</div>
   <div class="summary">{summary_html}</div>
-  <form method="get">
-    <label for="run_id">실행 배치</label>
-    <select id="run_id" name="run_id" onchange="this.form.submit()">{''.join(run_options)}</select>
-  </form>
-  <br>
   <table>
     <thead><tr><th>No</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>사유</th><th>스크린샷</th></tr></thead>
-    <tbody>{''.join(rows_html) or '<tr><td colspan="6">아직 결과가 없습니다</td></tr>'}</tbody>
+    <tbody>{''.join(rows_html) or '<tr><td colspan="6">이 실행에는 결과가 없습니다</td></tr>'}</tbody>
   </table>"""
     return _page("QA_runner_K 실행 결과", "results", body)
 
