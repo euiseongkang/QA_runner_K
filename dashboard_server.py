@@ -158,41 +158,28 @@ def create_app(db_path=None):
         except Exception as e:
             return redirect(url_for("tcs", err=f"엑셀을 읽지 못했습니다: {str(e)[:150]}"))
 
-        # 같은 파일을 두 번 올려도 목록이 중복으로 불어나지 않게, 내용이 같은 TC는 건너뛴다
-        existing = {
-            (t.get("title"), (t.get("steps") or "").strip(), t.get("expected"))
-            for t in results_store.list_custom_tcs(db_path=app.config["DB_PATH"])
-        }
-        added = skipped = failed = 0
-        for t in tcs:
-            key = (t["title"], t["steps"].strip(), t["expected"])
-            if key in existing:
-                skipped += 1
-                continue
-            try:
-                results_store.insert_custom_tc(
-                    t["title"], t["steps"], t["expected"],
-                    precondition=t["precondition"], priority=t["priority"],
-                    tc_no=t["no"], note=t["note"] or f"[{os.path.basename(f.filename)}]",
-                    db_path=app.config["DB_PATH"],
-                )
-                existing.add(key)
-                added += 1
-            except Exception:
-                failed += 1
+        msg, ok = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings,
+                                os.path.basename(f.filename), "엑셀에서")
+        return redirect(url_for("tcs", msg=msg) if ok else url_for("tcs", err=msg))
 
-        parts = [f"엑셀에서 TC {added}건 추가"]
-        if skipped:
-            parts.append(f"중복 {skipped}건 건너뜀")
-        if failed:
-            parts.append(f"저장 실패 {failed}건")
-        if warnings:
-            parts.append(" / ".join(warnings[:3]))
-        if added:
-            parts.append("프로그램에서 [TC 불러오기] 후 [시작]하면 실행됩니다")
-        msg = " · ".join(parts)
-        # 전부 중복이라 추가된 게 없는 건 오류가 아니므로 경고색으로 띄우지 않는다
-        ok = bool(added) or (skipped and not failed)
+    @app.route("/tcs/import_url", methods=["POST"])
+    def tcs_import_url():
+        """구글 스프레드시트 주소를 붙여넣으면 TC를 가져온다. [NEW v0.13.0]
+
+        구글이 주는 xlsx 내보내기를 받아서 엑셀 업로드와 똑같은 파서를 태우므로,
+        해석 결과는 파일을 올렸을 때와 완전히 같다."""
+        _reject_cross_site()
+        url = (request.form.get("url") or "").strip()
+        if not url:
+            return redirect(url_for("tcs", err="구글 시트 주소를 입력해주세요"))
+        try:
+            tcs, warnings = tc_excel.parse_gsheet(url)
+        except tc_excel.TCExcelError as e:
+            return redirect(url_for("tcs", err=str(e)))
+        except Exception as e:
+            return redirect(url_for("tcs", err=f"시트를 읽지 못했습니다: {str(e)[:150]}"))
+
+        msg, ok = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings, "구글 시트", "구글 시트에서")
         return redirect(url_for("tcs", msg=msg) if ok else url_for("tcs", err=msg))
 
     @app.route("/tcs/toggle/<int:row_id>", methods=["POST"])
@@ -319,6 +306,47 @@ def _page(title, active, body):
   </div></nav>
   <div class="wrap">{body}</div>
 </body></html>"""
+
+
+def _bulk_add_tcs(db_path, tcs, warnings, source_name, source_phrase):
+    """파싱된 TC들을 custom_tcs에 넣고 안내 문구를 만든다. 엑셀 업로드와 구글 시트가 공유한다.
+
+    같은 내용의 TC는 건너뛴다 - 같은 파일(또는 같은 시트)을 두 번 가져와도
+    목록이 중복으로 불어나지 않게 하기 위한 것."""
+    existing = {
+        (t.get("title"), (t.get("steps") or "").strip(), t.get("expected"))
+        for t in results_store.list_custom_tcs(db_path=db_path)
+    }
+    added = skipped = failed = 0
+    for t in tcs:
+        key = (t["title"], t["steps"].strip(), t["expected"])
+        if key in existing:
+            skipped += 1
+            continue
+        try:
+            results_store.insert_custom_tc(
+                t["title"], t["steps"], t["expected"],
+                precondition=t["precondition"], priority=t["priority"],
+                tc_no=t["no"], note=t["note"] or f"[{source_name}]",
+                db_path=db_path,
+            )
+            existing.add(key)
+            added += 1
+        except Exception:
+            failed += 1
+
+    parts = [f"{source_phrase} TC {added}건 추가"]
+    if skipped:
+        parts.append(f"중복 {skipped}건 건너뜀")
+    if failed:
+        parts.append(f"저장 실패 {failed}건")
+    if warnings:
+        parts.append(" / ".join(warnings[:3]))
+    if added:
+        parts.append("프로그램에서 [TC 불러오기] 후 [시작]하면 실행됩니다")
+    # 전부 중복이라 추가된 게 없는 건 오류가 아니므로 경고색으로 띄우지 않는다
+    ok = bool(added) or (skipped and not failed)
+    return " · ".join(parts), ok
 
 
 def _when(ts):
@@ -484,6 +512,22 @@ def _render_tcs(tc_list, editing, msg, err):
       <div class="actions">
         <input type="file" id="file" name="file" accept=".xlsx,.xlsm" required>
         <button type="submit" class="primary">엑셀에서 TC 가져오기</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card upload">
+    <form method="post" action="/tcs/import_url">
+      <label for="gurl">구글 스프레드시트 주소로 추가</label>
+      <div class="sub" style="margin-bottom:10px">
+        구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름은
+        <b>테스트케이스</b>, 컬럼은 위와 동일해야 합니다.
+        시트가 <b>[공유] → '링크가 있는 모든 사용자'(뷰어)</b> 로 열려 있어야 읽을 수 있습니다.
+      </div>
+      <div class="actions">
+        <input type="text" id="gurl" name="url" style="max-width:520px"
+               placeholder="https://docs.google.com/spreadsheets/d/..../edit" required>
+        <button type="submit" class="primary">구글 시트에서 가져오기</button>
       </div>
     </form>
   </div>
