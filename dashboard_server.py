@@ -101,7 +101,10 @@ def create_app(db_path=None):
     # ---- TC 관리 ----                                            [NEW v0.4.0]
     @app.route("/tcs")
     def tcs():
-        tc_list = results_store.list_custom_tcs(db_path=app.config["DB_PATH"])
+        # [v0.14.0] sheet 파라미터가 있으면 그 시트(화면)의 TC만 보여준다.
+        sheet = request.args.get("sheet")
+        tc_list = results_store.list_custom_tcs(sheet=sheet, db_path=app.config["DB_PATH"])
+        sheets = results_store.list_custom_tc_sheets(db_path=app.config["DB_PATH"])
         edit_id = request.args.get("edit")
         editing = None
         if edit_id:
@@ -109,7 +112,19 @@ def create_app(db_path=None):
                 editing = results_store.get_custom_tc(edit_id, db_path=app.config["DB_PATH"])
             except Exception:
                 editing = None
-        return _render_tcs(tc_list, editing, request.args.get("msg", ""), request.args.get("err", ""))
+        return _render_tcs(tc_list, editing, request.args.get("msg", ""),
+                           request.args.get("err", ""), sheets, sheet)
+
+    @app.route("/tcs/sheet_enable", methods=["POST"])
+    def tcs_sheet_enable():
+        """한 시트의 TC를 통째로 실행 포함/제외. 화면 단위로 돌릴 때 쓴다. [NEW v0.14.0]"""
+        _reject_cross_site()
+        sheet = request.form.get("sheet") or ""
+        on = request.form.get("enabled") == "1"
+        n = results_store.set_sheet_enabled(sheet, on, db_path=app.config["DB_PATH"])
+        label = sheet or "(시트 없음)"
+        state = "실행 포함" if on else "실행 제외"
+        return redirect(url_for("tcs", sheet=sheet, msg=f"{label} TC {n}건을 {state}로 바꿨습니다"))
 
     @app.route("/tcs/save", methods=["POST"])
     def tcs_save():
@@ -121,14 +136,16 @@ def create_app(db_path=None):
                 results_store.update_custom_tc(
                     row_id, f.get("title"), f.get("steps"), f.get("expected"),
                     precondition=f.get("precondition"), priority=f.get("priority"),
-                    tc_no=f.get("tc_no"), note=f.get("note"), db_path=app.config["DB_PATH"],
+                    tc_no=f.get("tc_no"), note=f.get("note"), sheet=f.get("sheet"),
+                    db_path=app.config["DB_PATH"],
                 )
                 msg = f"TC를 수정했습니다"
             else:
                 results_store.insert_custom_tc(
                     f.get("title"), f.get("steps"), f.get("expected"),
                     precondition=f.get("precondition"), priority=f.get("priority"),
-                    tc_no=f.get("tc_no"), note=f.get("note"), db_path=app.config["DB_PATH"],
+                    tc_no=f.get("tc_no"), note=f.get("note"), sheet=f.get("sheet"),
+                    db_path=app.config["DB_PATH"],
                 )
                 msg = "TC를 추가했습니다. 프로그램에서 [TC 불러오기]를 누르면 목록에 나옵니다"
             return redirect(url_for("tcs", msg=msg))
@@ -271,6 +288,13 @@ STYLE = """
   a.shot:hover img { border-color: #2d6cdf; box-shadow: 0 0 0 2px rgba(45,108,223,.18); }
   a.shot:hover span { color: #2d6cdf; }
   .noshot { color: #999; font-size: 12px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 12px; }
+  .chips-label { font-size: 12px; font-weight: 600; color: #444; margin-right: 4px; }
+  a.chip { font-size: 13px; text-decoration: none; color: #3f3f4d; background: #fff;
+           border: 1px solid #ccd0d6; border-radius: 14px; padding: 4px 12px; }
+  a.chip:hover { border-color: #2d6cdf; color: #2d6cdf; }
+  a.chip.on { background: #2d6cdf; border-color: #2d6cdf; color: #fff; font-weight: 600; }
+  .bulk { margin-left: 8px; }
   a.runlink { color: #1b2330; text-decoration: none; font-weight: 600; }
   a.runlink.sub2 { color: #555; font-weight: 400; }
   a.runlink:hover { color: #2d6cdf; text-decoration: underline; }
@@ -328,7 +352,7 @@ def _bulk_add_tcs(db_path, tcs, warnings, source_name, source_phrase):
                 t["title"], t["steps"], t["expected"],
                 precondition=t["precondition"], priority=t["priority"],
                 tc_no=t["no"], note=t["note"] or f"[{source_name}]",
-                db_path=db_path,
+                sheet=t.get("sheet", ""), db_path=db_path,
             )
             existing.add(key)
             added += 1
@@ -448,7 +472,43 @@ def _render_results(results, current_run):
     return _page("QA_runner_K 실행 결과", "results", body)
 
 
-def _render_tcs(tc_list, editing, msg, err):
+def _render_sheet_filter(sheets, current):
+    """[NEW v0.14.0] 시트(화면)별 필터 줄. 시트가 하나뿐이면 굳이 보여주지 않는다."""
+    if not sheets or (len(sheets) == 1 and not sheets[0]["sheet"]):
+        return ""
+    total = sum(s["total"] for s in sheets)
+    chips = [f'<a class="chip{"" if current is not None else " on"}" href="/tcs">전체 ({total})</a>']
+    for s in sheets:
+        name = s["sheet"]
+        label = name or "(시트 없음)"
+        on = " on" if current is not None and current == name else ""
+        chips.append(f'<a class="chip{on}" href="/tcs?sheet={urllib.parse.quote(name)}">'
+                     f'{_esc(label)} ({s["enabled"]}/{s["total"]})</a>')
+
+    bulk = ""
+    if current is not None:
+        bulk = f"""
+    <span class="bulk">
+      <form method="post" action="/tcs/sheet_enable" style="display:inline">
+        <input type="hidden" name="sheet" value="{_esc(current)}">
+        <input type="hidden" name="enabled" value="1">
+        <button type="submit" class="link">이 시트 전체 실행 포함</button>
+      </form>
+      <form method="post" action="/tcs/sheet_enable" style="display:inline">
+        <input type="hidden" name="sheet" value="{_esc(current)}">
+        <input type="hidden" name="enabled" value="0">
+        <button type="submit" class="link">전체 제외</button>
+      </form>
+    </span>"""
+    return f"""
+  <div class="chips">
+    <span class="chips-label">시트</span>
+    {''.join(chips)}{bulk}
+  </div>
+  <div class="sub" style="margin:-6px 0 14px">괄호 안은 (실행 포함 / 전체) 건수입니다. 프로그램은 '실행 포함'인 TC만 돌립니다.</div>"""
+
+
+def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
     editing = editing or {}
     is_edit = bool(editing.get("id"))
 
@@ -464,6 +524,7 @@ def _render_tcs(tc_list, editing, msg, err):
         toggle_label = "실행 제외" if tc.get("enabled") else "실행 포함"
         rows.append(f"""<tr{off}>
   <td>{no}</td>
+  <td>{_esc(tc.get('sheet') or '-')}</td>
   <td>{_esc(tc.get('title'))}</td>
   <td>{_esc(tc.get('priority'))}</td>
   <td class="pre">{_esc(tc.get('steps'))}</td>
@@ -486,6 +547,7 @@ def _render_tcs(tc_list, editing, msg, err):
     msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
     err_html = f'<div class="msg err">{_esc(err)}</div>' if err else ""
     enabled_count = sum(1 for t in tc_list if t.get("enabled"))
+    title_suffix = f" - {_esc(current_sheet or '(시트 없음)')}" if current_sheet is not None else ""
 
     body = f"""
   <h2>TC 관리</h2>
@@ -505,8 +567,9 @@ def _render_tcs(tc_list, editing, msg, err):
     <form method="post" action="/tcs/import" enctype="multipart/form-data">
       <label for="file">TC 엑셀 파일로 한 번에 추가</label>
       <div class="sub" style="margin-bottom:10px">
-        확정된 포맷("테스트케이스" 시트 · No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
-        그대로 올리면 됩니다. 프로그램이 엑셀을 직접 읽을 때와 <b>같은 방식으로 해석</b>되고,
+        확정된 포맷(No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
+        그대로 올리면 됩니다. <b>시트 이름에 "TC" 또는 "테스트케이스"가 들어간 시트는 모두</b> 읽고,
+        시트 이름이 화면 구분값으로 붙어 아래에서 시트별로 걸러볼 수 있습니다.
         추가된 TC는 <b>실행 포함</b> 상태로 들어갑니다. 같은 내용의 TC는 중복 추가하지 않습니다.
       </div>
       <div class="actions">
@@ -520,8 +583,8 @@ def _render_tcs(tc_list, editing, msg, err):
     <form method="post" action="/tcs/import_url">
       <label for="gurl">구글 스프레드시트 주소로 추가</label>
       <div class="sub" style="margin-bottom:10px">
-        구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름은
-        <b>테스트케이스</b>, 컬럼은 위와 동일해야 합니다.
+        구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름에
+        <b>TC</b>(또는 테스트케이스)가 들어가면 되고, 컬럼은 위와 동일해야 합니다. 시트가 여러 개면 전부 가져옵니다.
         시트가 <b>[공유] → '링크가 있는 모든 사용자'(뷰어)</b> 로 열려 있어야 읽을 수 있습니다.
       </div>
       <div class="actions">
@@ -566,7 +629,12 @@ def _render_tcs(tc_list, editing, msg, err):
                  placeholder="예) 환자 등록 팝업이 노출된다"
                  value="{_esc(editing.get('expected', ''))}">
         </div>
-        <div class="full">
+        <div>
+          <label for="sheet">시트(화면 구분)</label>
+          <input type="text" id="sheet" name="sheet" placeholder="예) TC_환자관리"
+                 value="{_esc(editing.get('sheet', '') or current_sheet or '')}">
+        </div>
+        <div>
           <label for="note">비고</label>
           <input type="text" id="note" name="note" value="{_esc(editing.get('note', ''))}">
         </div>
@@ -578,11 +646,12 @@ def _render_tcs(tc_list, editing, msg, err):
     </form>
   </div>
 
-  <h2>추가된 TC ({len(tc_list)}건 · 실행 대상 {enabled_count}건)</h2>
+  <h2>추가된 TC{title_suffix} ({len(tc_list)}건 · 실행 대상 {enabled_count}건)</h2>
   <div class="sub">프로그램에서 <b>TC 소스 → "대시보드 추가 TC" → [TC 불러오기] → [시작]</b> 순서로 실행하세요.</div>
+  {_render_sheet_filter(sheets, current_sheet)}
   <table>
-    <thead><tr><th>No</th><th>테스트 항목</th><th>우선순위</th><th>테스트 절차</th><th>예상 결과</th><th>실행</th><th></th></tr></thead>
-    <tbody>{''.join(rows) or '<tr><td colspan="7">아직 추가된 TC가 없습니다. 위 폼에서 추가해보세요.</td></tr>'}</tbody>
+    <thead><tr><th>No</th><th>시트</th><th>테스트 항목</th><th>우선순위</th><th>테스트 절차</th><th>예상 결과</th><th>실행</th><th></th></tr></thead>
+    <tbody>{''.join(rows) or '<tr><td colspan="8">아직 추가된 TC가 없습니다. 위 폼에서 추가해보세요.</td></tr>'}</tbody>
   </table>"""
     return _page("QA_runner_K TC 관리", "tcs", body)
 
