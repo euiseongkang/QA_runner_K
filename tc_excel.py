@@ -39,6 +39,87 @@ class TCExcelError(ValueError):
     """포맷이 달라서 읽을 수 없을 때. 메시지를 그대로 사용자에게 보여준다."""
 
 
+# ============================================================
+# 구글 스프레드시트에서 바로 가져오기                          [NEW v0.13.0]
+# ============================================================
+# 구글 시트는 파일이 아니라 웹 문서라 그대로는 못 읽는다. 대신 구글이 제공하는
+# "xlsx로 내보내기" 주소로 받아서 평소와 똑같이 파싱한다. CSV가 아니라 xlsx로 받는 이유는,
+# CSV는 시트 하나만 나와서 "테스트케이스" 시트 이름이 사라지기 때문.
+GSHEET_HOSTS = ("docs.google.com",)
+GSHEET_MAX_BYTES = 10 * 1024 * 1024
+
+
+def is_gsheet_url(url) -> bool:
+    return "docs.google.com/spreadsheets" in str(url or "")
+
+
+def gsheet_export_url(url) -> str:
+    """구글 시트 주소를 xlsx 내보내기 주소로 바꾼다.
+
+    받아들이는 형태
+      .../spreadsheets/d/<ID>/edit#gid=0        (일반 공유 링크)
+      .../spreadsheets/d/<ID>                    (짧은 형태)
+      .../spreadsheets/d/e/<PUBID>/pubhtml       (웹에 게시한 링크)
+    """
+    import urllib.parse as _up
+
+    url = str(url or "").strip()
+    if not url:
+        raise TCExcelError("구글 시트 주소를 입력해주세요")
+
+    parsed = _up.urlparse(url if "://" in url else "https://" + url)
+    # 주소를 그대로 받아 서버가 대신 요청하는 구조라, 사내망 주소 같은 걸 넣어
+    # 서버를 심부름꾼으로 쓰지 못하게 호스트를 구글로 못박는다 (SSRF 방지).
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in GSHEET_HOSTS:
+        raise TCExcelError("구글 스프레드시트 주소(docs.google.com)만 가져올 수 있습니다")
+
+    m = re.search(r"/spreadsheets/d/e/([A-Za-z0-9\-_]+)", parsed.path)
+    if m:                      # 웹에 게시한 문서
+        return f"https://docs.google.com/spreadsheets/d/e/{m.group(1)}/pub?output=xlsx"
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9\-_]+)", parsed.path)
+    if m:
+        return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx"
+    raise TCExcelError("구글 시트 주소에서 문서 ID를 찾지 못했습니다. 주소창의 링크를 그대로 붙여넣어 주세요")
+
+
+def fetch_gsheet(url, timeout=20):
+    """구글 시트를 xlsx 바이트로 받아온다. 실패 사유는 사람이 바로 고칠 수 있게 풀어서 알린다."""
+    import io as _io
+    import urllib.request as _ur
+    import urllib.error as _ue
+
+    export = gsheet_export_url(url)
+    req = _ur.Request(export, headers={"User-Agent": "QA_runner_K"})
+    try:
+        with _ur.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            data = resp.read(GSHEET_MAX_BYTES + 1)
+    except _ue.HTTPError as e:
+        if e.code in (401, 403):
+            raise TCExcelError("시트를 열 권한이 없습니다. 구글 시트에서 [공유] → "
+                               "'링크가 있는 모든 사용자'(뷰어)로 바꾼 뒤 다시 시도해주세요")
+        if e.code == 404:
+            raise TCExcelError("시트를 찾을 수 없습니다. 주소가 맞는지 확인해주세요")
+        raise TCExcelError(f"구글 시트를 받지 못했습니다 (HTTP {e.code})")
+    except Exception as e:
+        raise TCExcelError(f"구글 시트에 연결하지 못했습니다: {str(e)[:120]}")
+
+    if len(data) > GSHEET_MAX_BYTES:
+        raise TCExcelError("시트가 너무 큽니다 (10MB 초과)")
+    # 비공개 시트는 오류 대신 로그인 페이지(HTML)를 200으로 돌려준다. xlsx는 'PK'로 시작한다.
+    if not data.startswith(b"PK"):
+        if "html" in ctype:
+            raise TCExcelError("시트가 공개되어 있지 않습니다. 구글 시트에서 [공유] → "
+                               "'링크가 있는 모든 사용자'(뷰어)로 바꾼 뒤 다시 시도해주세요")
+        raise TCExcelError("구글 시트에서 받은 내용이 엑셀 형식이 아닙니다")
+    return _io.BytesIO(data)
+
+
+def parse_gsheet(url, timeout=20):
+    """구글 시트 주소 -> (tcs, warnings). 파싱은 엑셀 업로드와 완전히 같은 경로를 탄다."""
+    return parse_tc_excel(fetch_gsheet(url, timeout=timeout))
+
+
 def parse_tc_excel(source):
     """TC 엑셀을 읽어 (tcs, warnings) 반환.
 
