@@ -65,11 +65,15 @@ def create_app(db_path=None):
         """[v0.12.0] 첫 화면은 '실행 배치 목록'. 배치를 고르면 그 배치의 결과 화면으로 간다.
         run_id 없이 전체를 한 번에 보던 화면은 '전체 보기'로 남겨둔다."""
         run_id = request.args.get("run_id") or None
+        sheet = request.args.get("sheet")          # [v0.15.0] 시트(화면)별 필터
         if not run_id and request.args.get("all") != "1":
-            return _render_runs(results_store.list_runs_summary(app.config["DB_PATH"]),
-                                request.args.get("msg", ""))
-        results = results_store.list_results(run_id=run_id, db_path=app.config["DB_PATH"])
-        return _render_results(results, run_id)
+            return _render_runs(
+                results_store.list_runs_summary(sheet=sheet, db_path=app.config["DB_PATH"]),
+                request.args.get("msg", ""),
+                results_store.list_result_sheets(db_path=app.config["DB_PATH"]), sheet)
+        results = results_store.list_results(run_id=run_id, sheet=sheet,
+                                             db_path=app.config["DB_PATH"])
+        return _render_results(results, run_id, sheet)
 
     @app.route("/runs/delete/<path:run_id>", methods=["POST"])
     def runs_delete(run_id):
@@ -390,7 +394,36 @@ def _source_label(source, source_ref):
     return f"EC2 · {ref}" if ref else "EC2"
 
 
-def _render_runs(runs, msg):
+def _sheets_label(sheets):
+    """한 배치에 여러 시트가 섞여 있을 수 있어 요약해서 보여준다. [NEW v0.15.0]"""
+    names = [s for s in (sheets or []) if s]
+    if not names:
+        return "-"
+    if len(names) == 1:
+        return names[0]
+    return names[0] + f" 외 {len(names) - 1}"
+
+
+def _render_result_sheet_filter(sheets, current):
+    """[NEW v0.15.0] 실행 내역의 시트(화면)별 필터. 구분 기준은 엑셀/구글 시트의 시트 이름."""
+    if not sheets or (len(sheets) == 1 and not sheets[0]["sheet"]):
+        return ""
+    chips = [f'<a class="chip{"" if current is not None else " on"}" href="/">전체</a>']
+    for s in sheets:
+        name = s["sheet"]
+        label = name or "(시트 없음)"
+        on = " on" if current is not None and current == name else ""
+        chips.append(f'<a class="chip{on}" href="/?sheet={urllib.parse.quote(name)}">'
+                     f'{_esc(label)} ({s["runs"]}회 · {s["total"]}건)</a>')
+    return f"""
+  <div class="chips">
+    <span class="chips-label">시트 구분</span>
+    {''.join(chips)}
+  </div>
+  <div class="sub" style="margin:-6px 0 14px">TC 엑셀·구글 시트의 시트 이름으로 나뉩니다. 괄호 안은 (실행 횟수 · 결과 건수)입니다.</div>"""
+
+
+def _render_runs(runs, msg, sheets=None, current_sheet=None):
     """[NEW v0.12.0] 실행 배치 목록. TC를 돌릴 때마다 한 줄씩 쌓이고,
     줄을 누르면 그 배치의 결과 화면으로 간다. 줄마다 [삭제]가 붙는다."""
     rows = []
@@ -406,6 +439,7 @@ def _render_runs(runs, msg):
         rows.append(f"""<tr>
   <td><a class="runlink" href="{detail}">{_esc(_when(r['started_at']))}</a></td>
   <td><a class="runlink sub2" href="{detail}">{_esc(_source_label(r['source'], r['source_ref']))}</a></td>
+  <td>{_esc(_sheets_label(r.get('sheets')))}</td>
   <td>{r['total']}건</td>
   <td>{' &nbsp; '.join(badges) or '-'}</td>
   <td class="right">
@@ -418,21 +452,22 @@ def _render_runs(runs, msg):
 </tr>""")
 
     msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
-    empty = ('<tr><td colspan="5">아직 실행 내역이 없습니다. 프로그램에서 TC를 실행하면 '
+    empty = ('<tr><td colspan="6">아직 실행 내역이 없습니다. 프로그램에서 TC를 실행하면 '
              '여기에 한 줄씩 쌓입니다.</td></tr>')
     body = f"""
-  <h2>실행 내역</h2>
+  <h2>실행 내역{" - " + _esc(current_sheet or "(시트 없음)") if current_sheet is not None else ""}</h2>
   <div class="sub">TC를 실행할 때마다 한 줄씩 쌓입니다. 줄을 누르면 그 실행의 결과와 스크린샷을 봅니다.</div>
   {msg_html}
+  {_render_result_sheet_filter(sheets, current_sheet)}
   <table>
-    <thead><tr><th>실행 시각</th><th>TC 소스</th><th>건수</th><th>판정</th><th class="right">&nbsp;</th></tr></thead>
+    <thead><tr><th>실행 시각</th><th>TC 소스</th><th>시트 구분</th><th>건수</th><th>판정</th><th class="right">&nbsp;</th></tr></thead>
     <tbody>{''.join(rows) or empty}</tbody>
   </table>
   <p class="sub" style="margin-top:14px"><a href="/?all=1">전체 결과 한 번에 보기 (최근 300건)</a></p>"""
     return _page("QA_runner_K 실행 내역", "results", body)
 
 
-def _render_results(results, current_run):
+def _render_results(results, current_run, current_sheet=None):
     summary = {"PASS": 0, "FAIL": 0, "확인 필요": 0}
     rows_html = []
     for r in results:
@@ -449,6 +484,7 @@ def _render_results(results, current_run):
                              f'<span>{label}</span></a>')
         rows_html.append(f"""<tr>
   <td>{_esc(r['tc_no'])}</td>
+  <td>{_esc(r.get('sheet') or '-')}</td>
   <td>{_esc(r['title'])}</td>
   <td>{_esc(r['priority'])}</td>
   <td>{_badge(r['result'])}</td>
@@ -461,13 +497,13 @@ def _render_results(results, current_run):
     )
     title = f"{_when(results[0]['created_at'])} 실행" if (results and current_run) else "전체 결과 (최근 300건)"
     body = f"""
-  <p class="sub"><a href="/">← 실행 내역 목록</a></p>
+  <p class="sub"><a href="/">← 실행 내역 목록</a>{" · 시트: " + _esc(current_sheet or "(시트 없음)") if current_sheet is not None else ""}</p>
   <h2>{_esc(title)}</h2>
   <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 눌러 전체 화면으로 확인하세요.</div>
   <div class="summary">{summary_html}</div>
   <table>
-    <thead><tr><th>No</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>사유</th><th>스크린샷</th></tr></thead>
-    <tbody>{''.join(rows_html) or '<tr><td colspan="6">이 실행에는 결과가 없습니다</td></tr>'}</tbody>
+    <thead><tr><th>No</th><th>시트 구분</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>사유</th><th>스크린샷</th></tr></thead>
+    <tbody>{''.join(rows_html) or '<tr><td colspan="7">이 실행에는 결과가 없습니다</td></tr>'}</tbody>
   </table>"""
     return _page("QA_runner_K 실행 결과", "results", body)
 
