@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS results (
 
 # [NEW v0.4.0] 대시보드에서 직접 추가하는 TC. 엑셀을 만들지 않고도 화면에서 TC를 작성해
 # 바로 실행할 수 있게 하기 위한 테이블. 컬럼 구성은 TC 엑셀 포맷(8컬럼)과 일부러 맞춰둔다.
+# [NEW v0.17.0] 실행 배치에 사람이 알아볼 이름을 붙인다. 목록에 "20260915_115050" 같은
+# 식별자만 늘어놓으면 어느 회차가 뭐였는지 알 수 없어서, 프로젝트명을 따로 둔다.
+# results 행마다 같은 값을 적지 않고 별도 테이블로 두어, 이름만 바꿀 때 결과를 건드리지 않는다.
+RUN_LABEL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_labels (
+    run_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
+
 CUSTOM_TC_SCHEMA = """
 CREATE TABLE IF NOT EXISTS custom_tcs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +92,7 @@ def _connect(db_path=None):
     conn = sqlite3.connect(db_path or get_db_path(), timeout=10)
     conn.execute(SCHEMA)
     conn.execute(CUSTOM_TC_SCHEMA)
+    conn.execute(RUN_LABEL_SCHEMA)
     _migrate(conn)
     return conn
 
@@ -166,12 +179,46 @@ def list_runs_summary(sheet=None, db_path=None):
             args.append(str(sheet))
         sql += " GROUP BY run_id ORDER BY MIN(created_at) DESC"
         rows = conn.execute(sql, args).fetchall()
+        labels = dict(conn.execute("SELECT run_id, label FROM run_labels").fetchall())
         return [
             {"run_id": r[0], "source": r[1], "source_ref": r[2], "started_at": r[3],
              "total": r[4], "passed": r[5] or 0, "failed": r[6] or 0, "unsure": r[7] or 0,
-             "sheets": [s for s in sorted((r[8] or "").split(",")) if s]}
+             "sheets": [s for s in sorted((r[8] or "").split(",")) if s],
+             "label": labels.get(r[0], "")}
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+def set_run_label(run_id, label, db_path=None):
+    """실행 배치의 프로젝트명을 지정/변경. 빈 값이면 이름을 지운다. [NEW v0.17.0]"""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        raise ValueError("run_id가 필요합니다")
+    label = _clip(label, 120)
+    conn = _connect(db_path)
+    try:
+        if label:
+            conn.execute(
+                "INSERT INTO run_labels (run_id, label, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET label=excluded.label, "
+                "updated_at=excluded.updated_at",
+                (run_id, label, time.time()))
+        else:
+            conn.execute("DELETE FROM run_labels WHERE run_id=?", (run_id,))
+        conn.commit()
+        return label
+    finally:
+        conn.close()
+
+
+def get_run_label(run_id, db_path=None):
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT label FROM run_labels WHERE run_id=?",
+                           (str(run_id or ""),)).fetchone()
+        return row[0] if row else ""
     finally:
         conn.close()
 
@@ -212,6 +259,7 @@ def delete_run(run_id, db_path=None, remove_screenshots=True):
     conn = _connect(db_path)
     try:
         cur = conn.execute("DELETE FROM results WHERE run_id=?", (run_id,))
+        conn.execute("DELETE FROM run_labels WHERE run_id=?", (run_id,))   # [v0.17.0]
         conn.commit()
         deleted = cur.rowcount
     finally:
