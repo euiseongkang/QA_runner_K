@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.21.0"
+APP_VERSION = "0.22.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -789,9 +789,38 @@ class TCExecutionEngine:
 
     def _press(self, action, actions_done):
         key = action.get("key", "Enter")
+        url_before = self.page.url
         self.page.keyboard.press(key)
+        # [NEW v0.22.0] 엔터는 대개 검색/제출이라 누른 뒤 화면이 바뀐다.
+        # v0.21.0까지는 키를 누르고 기다리는 코드가 아예 없어서(클릭에는 있는데 키 입력에만 빠져 있었다)
+        # 검색 결과가 돌아오기 전 화면이 판정 스크린샷에 찍혔다.
+        # 실제 사례: TC10에서 검색창에 "강의성"은 들어갔는데 목록은 검색 전 11명 그대로 찍혔고
+        # (표가 다시 그려지는 중이라 No 칼럼이 비어 있었다), 화면 어딘가의 "강의성" 때문에 PASS가 났다.
+        if str(key).lower() in ("enter", "numpadenter"):
+            self._wait_after_submit(url_before)
         self.log_fn(f"  ✓ 키 입력: {key}")
         actions_done.append(f"키 입력: {key}")
+
+    def _wait_after_submit(self, url_before):
+        """엔터(검색/제출) 뒤 화면이 실제로 갱신될 때까지 기다린다. [NEW v0.22.0]
+
+        SPA는 키를 누른 '직후'에는 아직 요청이 나가기 전이라 networkidle이 즉시 참이 된다.
+        그래서 ① 요청이 출발할 틈을 주고 ② URL 변경(랩커넥트는 검색어를 URL에 싣는다)을 먼저 보고
+        ③ 그다음 networkidle을 기다린다. 어느 것도 안 잡히면 짧은 고정 대기로 끝낸다
+        (엔터가 아무 동작도 일으키지 않는 TC도 있으므로 여기서 오래 붙잡지 않는다)."""
+        self.page.wait_for_timeout(300)
+        changed = False
+        try:
+            self.page.wait_for_function(
+                "prevUrl => window.location.href !== prevUrl", arg=url_before, timeout=2000)
+            changed = True
+        except Exception:
+            pass
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
+        self.page.wait_for_timeout(500 if changed else 800)
 
 
 # ============================================================
@@ -1691,8 +1720,11 @@ class QAWorkerApp:
         # 원본에서 TC14가 FAIL로 오판정된 지점이 정확히 "마지막 액션 직후 대기 없이
         # 바로 스크린샷"이었음 - 개별 액션(_click)마다 대기는 있어도 마지막 액션과
         # 판정 스크린샷 사이엔 아무 대기가 없었던 구조적 빈틈을 메운다.
+        # [v0.22.0] networkidle은 "지금 이 순간 요청이 없다"는 뜻이라 SPA에서는 요청이
+        # 출발하기 전에 즉시 참이 될 수 있다. 짧은 틈을 준 뒤에 기다린다.
         try:
-            page.wait_for_load_state("networkidle", timeout=2000)
+            page.wait_for_timeout(300)
+            page.wait_for_load_state("networkidle", timeout=3000)
         except Exception:
             pass
 
