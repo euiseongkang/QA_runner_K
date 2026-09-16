@@ -70,10 +70,13 @@ def create_app(db_path=None):
             return _render_runs(
                 results_store.list_runs_summary(sheet=sheet, db_path=app.config["DB_PATH"]),
                 request.args.get("msg", ""),
-                results_store.list_result_sheets(db_path=app.config["DB_PATH"]), sheet)
+                results_store.list_result_sheets(db_path=app.config["DB_PATH"]), sheet,
+                request.args.get("rename"))
         results = results_store.list_results(run_id=run_id, sheet=sheet,
                                              db_path=app.config["DB_PATH"])
-        return _render_results(results, run_id, sheet)
+        label = (results_store.get_run_label(run_id, db_path=app.config["DB_PATH"])
+                 if run_id else "")
+        return _render_results(results, run_id, sheet, label)
 
     @app.route("/runs/delete/<path:run_id>", methods=["POST"])
     def runs_delete(run_id):
@@ -84,6 +87,23 @@ def create_app(db_path=None):
         except Exception as e:
             msg = f"삭제 실패: {e}"
         return redirect("/?msg=" + urllib.parse.quote(msg))
+
+    @app.route("/runs/rename/<path:run_id>", methods=["POST"])
+    def runs_rename(run_id):
+        """실행 배치에 프로젝트명을 붙인다. [NEW v0.17.0]"""
+        _reject_cross_site()
+        try:
+            label = results_store.set_run_label(run_id, request.form.get("label"),
+                                                db_path=app.config["DB_PATH"])
+            msg = (f"프로젝트명을 '{label}' 로 바꿨습니다" if label
+                   else "프로젝트명을 지웠습니다 (실행 시각으로 표시됩니다)")
+        except Exception as e:
+            msg = f"이름 변경 실패: {e}"
+        keep = request.form.get("sheet")
+        url = "/?msg=" + urllib.parse.quote(msg)
+        if keep:
+            url += "&sheet=" + urllib.parse.quote(keep)
+        return redirect(url)
 
     @app.route("/healthz")
     def healthz():
@@ -241,9 +261,10 @@ STYLE = """
   :root { color-scheme: light; }
   body { font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; margin: 0;
          background: #fafafa; color: #222; }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 20px 16px 48px; }
+  .wrap { max-width: 1500px; margin: 0 auto; padding: 20px 16px 48px; }
+  .tablewrap { overflow-x: auto; }
   nav { background: #22262e; padding: 0 16px; }
-  nav .inner { max-width: 1120px; margin: 0 auto; display: flex; gap: 4px; align-items: center; }
+  nav .inner { max-width: 1500px; margin: 0 auto; display: flex; gap: 4px; align-items: center; }
   nav a { color: #c9cdd6; text-decoration: none; padding: 14px 14px; font-size: 14px; font-weight: 600; }
   nav a.on { color: #fff; box-shadow: inset 0 -3px 0 #4c9aff; }
   nav .brand { color: #fff; font-weight: 700; margin-right: 12px; font-size: 14px; }
@@ -292,6 +313,10 @@ STYLE = """
   a.shot:hover img { border-color: #2d6cdf; box-shadow: 0 0 0 2px rgba(45,108,223,.18); }
   a.shot:hover span { color: #2d6cdf; }
   .noshot { color: #999; font-size: 12px; }
+  .sub2small { color: #888; font-size: 12px; margin-top: 2px; }
+  form.rename { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  form.rename input[type=text] { width: 260px; }
+  form.rename .sub2small { flex-basis: 100%; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 12px; }
   .chips-label { font-size: 12px; font-weight: 600; color: #444; margin-right: 4px; }
   a.chip { font-size: 13px; text-decoration: none; color: #3f3f4d; background: #fff;
@@ -394,6 +419,16 @@ def _source_label(source, source_ref):
     return f"EC2 · {ref}" if ref else "EC2"
 
 
+def _runs_url(sheet=None, rename=None):
+    """실행 내역 목록 주소. 시트 필터를 보고 있었으면 그대로 유지한다. [NEW v0.17.0]"""
+    q = []
+    if sheet is not None:
+        q.append("sheet=" + urllib.parse.quote(sheet))
+    if rename is not None:
+        q.append("rename=" + urllib.parse.quote(str(rename)))
+    return "/?" + "&".join(q) if q else "/"
+
+
 def _sheets_label(sheets):
     """한 배치에 여러 시트가 섞여 있을 수 있어 요약해서 보여준다. [NEW v0.15.0]"""
     names = [s for s in (sheets or []) if s]
@@ -423,7 +458,7 @@ def _render_result_sheet_filter(sheets, current):
   <div class="sub" style="margin:-6px 0 14px">TC 엑셀·구글 시트의 시트 이름으로 나뉩니다. 괄호 안은 (실행 횟수 · 결과 건수)입니다.</div>"""
 
 
-def _render_runs(runs, msg, sheets=None, current_sheet=None):
+def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
     """[NEW v0.12.0] 실행 배치 목록. TC를 돌릴 때마다 한 줄씩 쌓이고,
     줄을 누르면 그 배치의 결과 화면으로 간다. 줄마다 [삭제]가 붙는다."""
     rows = []
@@ -436,19 +471,36 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None):
             badges.append(f'{_badge("FAIL")} {r["failed"]}')
         if r["unsure"]:
             badges.append(f'{_badge("확인 필요")} {r["unsure"]}')
+        rid = urllib.parse.quote(str(r["run_id"]))
+        keep = f'<input type="hidden" name="sheet" value="{_esc(current_sheet)}">' if current_sheet is not None else ""
+        if rename_id is not None and rename_id == r["run_id"]:
+            # 이름 바꾸는 중인 줄: 첫 칸을 입력 폼으로 바꿔 보여준다 (별도 화면 없이 그 자리에서)
+            name_cell = f"""<form method="post" action="/runs/rename/{rid}" class="rename">
+      {keep}<input type="text" name="label" value="{_esc(r.get('label'))}" maxlength="120"
+             placeholder="예) 9월 정기 회귀 - 환자관리" autofocus>
+      <button type="submit" class="primary">저장</button>
+      <a class="btnlike" href="{_runs_url(current_sheet)}">취소</a>
+      <div class="sub2small">{_esc(_when(r['started_at']))}</div>
+    </form>"""
+            actions = ""
+        else:
+            title = r.get("label") or _when(r["started_at"])
+            sub = f'<div class="sub2small">{_esc(_when(r["started_at"]))}</div>' if r.get("label") else ""
+            name_cell = f'<a class="runlink" href="{detail}">{_esc(title)}</a>{sub}'
+            actions = f"""
+    <a class="btnlike" href="{detail}">결과 보기</a>
+    <form method="post" action="/runs/delete/{rid}"
+          style="display:inline" onsubmit="return confirm('{_esc(r.get('label') or _when(r['started_at']))} 실행 내역(결과 {r['total']}건)을 삭제할까요? 스크린샷도 함께 지워지며 되돌릴 수 없습니다.');">
+      <button type="submit" class="danger">삭제</button>
+    </form>
+    <a class="btnlike" href="{_runs_url(current_sheet, rename=r['run_id'])}">프로젝트명 수정</a>"""
         rows.append(f"""<tr>
-  <td><a class="runlink" href="{detail}">{_esc(_when(r['started_at']))}</a></td>
+  <td>{name_cell}</td>
   <td><a class="runlink sub2" href="{detail}">{_esc(_source_label(r['source'], r['source_ref']))}</a></td>
   <td>{_esc(_sheets_label(r.get('sheets')))}</td>
   <td>{r['total']}건</td>
   <td>{' &nbsp; '.join(badges) or '-'}</td>
-  <td class="right">
-    <a class="btnlike" href="{detail}">결과 보기</a>
-    <form method="post" action="/runs/delete/{urllib.parse.quote(str(r['run_id']))}"
-          style="display:inline" onsubmit="return confirm('{_esc(_when(r['started_at']))} 실행 내역(결과 {r['total']}건)을 삭제할까요? 스크린샷도 함께 지워지며 되돌릴 수 없습니다.');">
-      <button type="submit" class="danger">삭제</button>
-    </form>
-  </td>
+  <td class="right">{actions}</td>
 </tr>""")
 
     msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
@@ -460,14 +512,14 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None):
   {msg_html}
   {_render_result_sheet_filter(sheets, current_sheet)}
   <table>
-    <thead><tr><th>실행 시각</th><th>TC 소스</th><th>시트 구분</th><th>건수</th><th>판정</th><th class="right">&nbsp;</th></tr></thead>
+    <thead><tr><th>프로젝트명 / 실행 시각</th><th>TC 소스</th><th>시트 구분</th><th>건수</th><th>판정</th><th class="right">&nbsp;</th></tr></thead>
     <tbody>{''.join(rows) or empty}</tbody>
   </table>
   <p class="sub" style="margin-top:14px"><a href="/?all=1">전체 결과 한 번에 보기 (최근 300건)</a></p>"""
     return _page("QA_runner_K 실행 내역", "results", body)
 
 
-def _render_results(results, current_run, current_sheet=None):
+def _render_results(results, current_run, current_sheet=None, run_label=""):
     summary = {"PASS": 0, "FAIL": 0, "확인 필요": 0}
     rows_html = []
     for r in results:
@@ -488,6 +540,8 @@ def _render_results(results, current_run, current_sheet=None):
   <td>{_esc(r['title'])}</td>
   <td>{_esc(r['priority'])}</td>
   <td>{_badge(r['result'])}</td>
+  <td class="pre">{_esc(r.get('steps'))}</td>
+  <td class="pre">{_esc(r.get('expected'))}</td>
   <td class="reason">{_esc((r['reason'] or '')[:300])}</td>
   <td class="shots">{''.join(shots) or '<span class="noshot">스크린샷 없음</span>'}</td>
 </tr>""")
@@ -495,16 +549,23 @@ def _render_results(results, current_run, current_sheet=None):
     summary_html = "".join(
         f'<span class="summary-item">{_badge(k)} {v}건</span>' for k, v in summary.items()
     )
-    title = f"{_when(results[0]['created_at'])} 실행" if (results and current_run) else "전체 결과 (최근 300건)"
+    if results and current_run:
+        # 프로젝트명을 붙여둔 실행이면 그 이름을 제목으로 쓴다 [v0.17.0]
+        when = _when(results[0]["created_at"])
+        title = f"{run_label} ({when})" if run_label else f"{when} 실행"
+    else:
+        title = "전체 결과 (최근 300건)"
     body = f"""
   <p class="sub"><a href="/">← 실행 내역 목록</a>{" · 시트: " + _esc(current_sheet or "(시트 없음)") if current_sheet is not None else ""}</p>
   <h2>{_esc(title)}</h2>
   <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 눌러 전체 화면으로 확인하세요.</div>
   <div class="summary">{summary_html}</div>
+  <div class="tablewrap">
   <table>
-    <thead><tr><th>No</th><th>시트 구분</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>사유</th><th>스크린샷</th></tr></thead>
-    <tbody>{''.join(rows_html) or '<tr><td colspan="7">이 실행에는 결과가 없습니다</td></tr>'}</tbody>
-  </table>"""
+    <thead><tr><th>No</th><th>시트 구분</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>테스트 절차</th><th>예상 결과</th><th>사유</th><th>스크린샷</th></tr></thead>
+    <tbody>{''.join(rows_html) or '<tr><td colspan="9">이 실행에는 결과가 없습니다</td></tr>'}</tbody>
+  </table>
+  </div>"""
     return _page("QA_runner_K 실행 결과", "results", body)
 
 
