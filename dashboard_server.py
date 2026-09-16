@@ -361,44 +361,109 @@ def _page(title, active, body):
 </body></html>"""
 
 
-def _bulk_add_tcs(db_path, tcs, warnings, source_name, source_phrase):
-    """파싱된 TC들을 custom_tcs에 넣고 안내 문구를 만든다. 엑셀 업로드와 구글 시트가 공유한다.
+def _tc_key(sheet, tc_no, title):
+    """다시 가져왔을 때 '같은 TC'로 볼 기준. [NEW v0.18.0]
 
-    같은 내용의 TC는 건너뛴다 - 같은 파일(또는 같은 시트)을 두 번 가져와도
-    목록이 중복으로 불어나지 않게 하기 위한 것."""
-    existing = {
-        (t.get("title"), (t.get("steps") or "").strip(), t.get("expected"))
-        for t in results_store.list_custom_tcs(db_path=db_path)
-    }
-    added = skipped = failed = 0
+    시트 이름 + No 가 1순위. No 가 비어 있는 TC는 시트 이름 + 테스트 항목으로 본다.
+    내용(절차/예상 결과)은 기준에 넣지 않는다 - 내용이 바뀌는 게 바로 '수정'이기 때문."""
+    sheet = str(sheet or "").strip()
+    no = str(tc_no or "").strip()
+    if no:
+        return ("no", sheet, no)
+    return ("title", sheet, str(title or "").strip())
+
+
+def _tc_changed(row, t):
+    """DB에 있는 줄과 새로 읽은 TC의 내용이 다른지. 화면 표시용 카운트에만 쓴다."""
+    def norm(v):
+        return str(v or "").strip()
+    return any((
+        norm(row.get("title")) != norm(t.get("title")),
+        norm(row.get("steps")) != norm(t.get("steps")),
+        norm(row.get("expected")) != norm(t.get("expected")),
+        norm(row.get("precondition")) != norm(t.get("precondition")),
+        norm(row.get("priority")) != norm(t.get("priority")),
+        norm(row.get("sheet")) != norm(t.get("sheet")),
+    ))
+
+
+def _bulk_add_tcs(db_path, tcs, warnings, source_name, source_phrase):
+    """파싱된 TC들을 custom_tcs에 반영하고 안내 문구를 만든다. 엑셀 업로드와 구글 시트가 공유한다.
+
+    [v0.18.0] 같은 시트의 같은 No 인 TC가 이미 있으면 새 줄을 만들지 않고 그 줄을 덮어쓴다.
+    v0.17.0까지는 내용이 조금이라도 다르면 새 줄로 쌓여서, 시트에서 고친 TC를 다시 가져와도
+    고치기 전 줄이 '실행 포함' 상태로 남아 같이 실행되는 문제가 있었다.
+    같은 키로 이미 여러 줄이 쌓여 있으면 첫 줄만 남기고 나머지는 지워서 예전 중복도 정리한다.
+    실행 포함/제외 상태(enabled)는 덮어써도 그대로 유지된다."""
+    index = {}
+    for row in results_store.list_custom_tcs(db_path=db_path):
+        index.setdefault(
+            _tc_key(row.get("sheet"), row.get("tc_no"), row.get("title")), []).append(row)
+
+    added = updated = same = removed = failed = 0
+    seen = set()
     for t in tcs:
-        key = (t["title"], t["steps"].strip(), t["expected"])
-        if key in existing:
-            skipped += 1
-            continue
+        key = _tc_key(t.get("sheet"), t.get("no"), t.get("title"))
+        seen.add(key)
+        note = t["note"] or f"[{source_name}]"
+        old = index.get(key) or []
         try:
-            results_store.insert_custom_tc(
-                t["title"], t["steps"], t["expected"],
-                precondition=t["precondition"], priority=t["priority"],
-                tc_no=t["no"], note=t["note"] or f"[{source_name}]",
-                sheet=t.get("sheet", ""), db_path=db_path,
-            )
-            existing.add(key)
-            added += 1
+            if old:
+                head = old[0]
+                for dup in old[1:]:          # 예전 버전에서 쌓인 중복 줄 정리
+                    try:
+                        results_store.delete_custom_tc(dup["id"], db_path=db_path)
+                        removed += 1
+                    except Exception:
+                        pass
+                changed = _tc_changed(head, t)
+                results_store.update_custom_tc(
+                    head["id"], t["title"], t["steps"], t["expected"],
+                    precondition=t["precondition"], priority=t["priority"],
+                    tc_no=t["no"], note=note, sheet=t.get("sheet", ""), db_path=db_path,
+                )
+                if changed:
+                    updated += 1
+                else:
+                    same += 1
+                index[key] = [head]
+            else:
+                new_id = results_store.insert_custom_tc(
+                    t["title"], t["steps"], t["expected"],
+                    precondition=t["precondition"], priority=t["priority"],
+                    tc_no=t["no"], note=note,
+                    sheet=t.get("sheet", ""), db_path=db_path,
+                )
+                index[key] = [{"id": new_id, "title": t["title"], "steps": t["steps"],
+                               "expected": t["expected"], "precondition": t["precondition"],
+                               "priority": t["priority"], "sheet": t.get("sheet", ""),
+                               "tc_no": t["no"]}]
+                added += 1
         except Exception:
             failed += 1
 
+    # 이번 시트에는 없는데 DB에는 남아 있는 TC - 지우지는 않고 알려만 준다
+    sheets = {str(t.get("sheet") or "").strip() for t in tcs}
+    stale = sum(len(rows) for key, rows in index.items()
+                if key not in seen and key[1] in sheets)
+
     parts = [f"{source_phrase} TC {added}건 추가"]
-    if skipped:
-        parts.append(f"중복 {skipped}건 건너뜀")
+    if updated:
+        parts.append(f"{updated}건 갱신")
+    if same:
+        parts.append(f"{same}건 변경 없음")
+    if removed:
+        parts.append(f"중복 {removed}건 정리")
     if failed:
         parts.append(f"저장 실패 {failed}건")
+    if stale:
+        parts.append(f"시트에 없는 기존 TC {stale}건은 그대로 남아 있습니다")
     if warnings:
         parts.append(" / ".join(warnings[:3]))
-    if added:
+    if added or updated:
         parts.append("프로그램에서 [TC 불러오기] 후 [시작]하면 실행됩니다")
-    # 전부 중복이라 추가된 게 없는 건 오류가 아니므로 경고색으로 띄우지 않는다
-    ok = bool(added) or (skipped and not failed)
+    # 전부 '변경 없음'이라 추가/갱신이 없는 건 오류가 아니므로 경고색으로 띄우지 않는다
+    ok = not failed and bool(added or updated or same)
     return " · ".join(parts), ok
 
 
@@ -667,7 +732,9 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
         확정된 포맷(No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
         그대로 올리면 됩니다. <b>시트 이름에 "TC" 또는 "테스트케이스"가 들어간 시트는 모두</b> 읽고,
         시트 이름이 화면 구분값으로 붙어 아래에서 시트별로 걸러볼 수 있습니다.
-        추가된 TC는 <b>실행 포함</b> 상태로 들어갑니다. 같은 내용의 TC는 중복 추가하지 않습니다.
+        추가된 TC는 <b>실행 포함</b> 상태로 들어갑니다.
+        <b>다시 가져오면 같은 시트·같은 No 의 TC는 새로 쌓이지 않고 최신 내용으로 덮어씁니다</b>
+        (실행 포함/제외 상태는 그대로 유지됩니다).
       </div>
       <div class="actions">
         <input type="file" id="file" name="file" accept=".xlsx,.xlsm" required>
@@ -683,6 +750,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
         구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름에
         <b>TC</b>(또는 테스트케이스)가 들어가면 되고, 컬럼은 위와 동일해야 합니다. 시트가 여러 개면 전부 가져옵니다.
         시트가 <b>[공유] → '링크가 있는 모든 사용자'(뷰어)</b> 로 열려 있어야 읽을 수 있습니다.
+        시트에서 TC를 고친 뒤 <b>같은 주소로 다시 가져오면 기존 TC가 최신 내용으로 갱신</b>됩니다.
       </div>
       <div class="actions">
         <input type="text" id="gurl" name="url" style="max-width:520px"
