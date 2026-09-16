@@ -71,13 +71,41 @@ jobs:
 
     - name: 대시보드 바로가기 생성
       run: |
-        $bat = "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"`" `"QA_Runner_K.exe`" --dashboard`r`n"
-        [System.IO.File]::WriteAllText("dist/QA_Runner_K_Dashboard.bat", $bat, [System.Text.Encoding]::ASCII)
+        # [v0.23.0] exe 파일명에 버전이 붙으므로(QA_Runner_K_v0.23.0.exe) 이름을 고정하지 않고
+        # 같은 폴더에서 QA_Runner_K*.exe 를 찾아 실행한다. 버전이 올라가도 이 .bat 은 그대로 쓴다.
+        # 여러 버전이 한 폴더에 있으면 dir /o-d 로 가장 최근에 받은 것을 고른다.
+        # 이 파일은 한글을 넣지 않고 ASCII로만 쓴다 - 코드페이지/BOM 문제를 아예 만들지 않기 위함.
+        $lines = @(
+          '@echo off',
+          'cd /d "%~dp0"',
+          'set "EXE="',
+          'for /f "delims=" %%F in (''dir /b /o-d "QA_Runner_K*.exe" 2^>nul'') do if not defined EXE set "EXE=%%F"',
+          'if not defined EXE goto noexe',
+          'start "" "%EXE%" --dashboard',
+          'exit /b 0',
+          ':noexe',
+          'echo.',
+          'echo [ERROR] No QA_Runner_K*.exe in this folder.',
+          'echo Put this .bat next to the program exe and run it again.',
+          'echo.',
+          'pause',
+          'exit /b 1'
+        )
+        $noBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText("dist/QA_Runner_K_Dashboard.bat", ($lines -join "`r`n") + "`r`n", $noBom)
+        Get-Content "dist/QA_Runner_K_Dashboard.bat"
+
+    - name: 버전 붙인 파일명으로 변경
+      run: |
+        # [v0.23.0] 받는 사람이 파일명만 보고 버전을 알 수 있게 한다.
+        $v = "${{ steps.version.outputs.version }}"
+        Move-Item "dist/QA_Runner_K.exe" "dist/QA_Runner_K_v$v.exe"
 
     - name: 빌드 결과 확인
       run: |
         dir dist
-        if (-not (Test-Path "dist/QA_Runner_K.exe")) { throw "QA_Runner_K.exe 가 생성되지 않았습니다" }
+        $v = "${{ steps.version.outputs.version }}"
+        if (-not (Test-Path "dist/QA_Runner_K_v$v.exe")) { throw "QA_Runner_K_v$v.exe 가 생성되지 않았습니다" }
 
     - name: GitHub Release 생성 및 EXE 업로드
       uses: ncipollo/release-action@v1
@@ -90,24 +118,28 @@ jobs:
           ### 받을 파일
           | 파일 | 용도 |
           |---|---|
-          | `QA_Runner_K.exe` | 본 프로그램. Chromium 포함이라 약 375MB |
+          | `QA_Runner_K_v${{ steps.version.outputs.version }}.exe` | 본 프로그램. Chromium 포함이라 약 380MB |
           | `QA_Runner_K_Dashboard.bat` | 대시보드만 띄우는 바로가기 (선택). exe 옆에 두고 더블클릭 |
 
-          v0.6.0의 `QA_Runner_K_Dashboard.exe`는 **없앴습니다.** 서명 없는 작은 exe라
-          Windows Defender가 다운로드 즉시 삭제하는 오탐이 있었습니다. 대신 본 exe에
-          대시보드 모드를 넣어서, 받을 파일이 하나로 줄었습니다.
+          exe 파일명에 **버전이 붙습니다.** 받아둔 파일만 봐도 어느 버전인지 알 수 있습니다.
+          `.bat`은 같은 폴더의 `QA_Runner_K*.exe`를 알아서 찾으므로 버전이 올라가도 그대로 쓰면 됩니다
+          (폴더에 여러 버전을 같이 두면 어느 것이 실행될지 헷갈리니, 쓰지 않는 버전은 지우세요).
+
+          프로그램 안의 **[업데이트 확인]으로 올리면 파일 이름은 그대로 남고 내용만 새 버전으로 바뀝니다.**
+          바탕화면 바로가기와 자동시작 등록이 깨지지 않게 일부러 그렇게 둔 것이고,
+          실제로 실행 중인 버전은 창 제목 표시줄에서 확인할 수 있습니다.
 
           ### 설치 방법
-          1. `QA_Runner_K.exe` 다운로드 후 원하는 폴더에 두기
+          1. `QA_Runner_K_v${{ steps.version.outputs.version }}.exe` 다운로드 후 원하는 폴더에 두기
           2. 실행 (Windows Defender 경고가 나오면 "추가 정보" → "실행")
           3. 파이썬 설치 불필요
 
           ### 사용법
           - 본 프로그램: "시작 지점 / 로그인 설정"에 STG URL / ID / PW 입력 후 저장 → TC 소스 선택 → 시작
-          - 대시보드만 띄우기: `QA_Runner_K.exe --dashboard` (또는 `QA_Runner_K_Dashboard.bat` 더블클릭)
+          - 대시보드만 띄우기: `QA_Runner_K_Dashboard.bat` 더블클릭 (또는 exe에 `--dashboard` 인자)
           - 대시보드: `http://127.0.0.1:8765/tcs` 에서 TC 엑셀 업로드 / TC 추가·수정, `/` 에서 실행 결과 확인
           - "AI 없이 규칙 기반으로만 실행"이 켜져 있으면 API 키 없이 동작합니다
-        artifacts: dist/QA_Runner_K.exe,dist/QA_Runner_K_Dashboard.bat
+        artifacts: dist/QA_Runner_K_v${{ steps.version.outputs.version }}.exe,dist/QA_Runner_K_Dashboard.bat
         allowUpdates: true
         makeLatest: true
         token: ${{ secrets.GITHUB_TOKEN }}
