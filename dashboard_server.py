@@ -313,6 +313,19 @@ STYLE = """
   a.shot:hover img { border-color: #2d6cdf; box-shadow: 0 0 0 2px rgba(45,108,223,.18); }
   a.shot:hover span { color: #2d6cdf; }
   .noshot { color: #999; font-size: 12px; }
+  /* [v0.23.0] 5건 단위 구간 요약 */
+  .ckwrap { border: 1px solid #e2e6ec; border-radius: 10px; background: #fbfcfe;
+            margin: 0 0 16px; padding: 10px 14px; }
+  .ckwrap > summary { cursor: pointer; font-size: 14px; font-weight: 600; color: #2a3444; }
+  .cklist { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 10px; margin-top: 12px; }
+  .ck { border: 1px solid #e2e6ec; border-radius: 8px; background: #fff; padding: 10px 12px; }
+  .ckhead { font-weight: 600; font-size: 13px; color: #1b2330; }
+  .cksub { font-weight: 400; color: #888; font-size: 12px; }
+  .ckcnt { margin: 6px 0 4px; font-size: 12px; }
+  .ckissues { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #55606f; line-height: 1.6; }
+  .ckissues li { margin-bottom: 3px; }
+  .ckok { font-size: 12px; color: #1c6b41; margin-top: 6px; }
   /* [v0.20.0] 스크린샷 팝업(라이트박스). 새 탭 대신 화면 위에 겹쳐 띄운다. */
   .lb { display: none; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 900;
         background: rgba(14,18,26,.94); }
@@ -675,6 +688,54 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
     return _page("QA_runner_K 실행 내역", "results", body)
 
 
+PROGRESS_REPORT_EVERY = 5   # [v0.23.0] 프로그램 로그의 중간 보고와 같은 단위
+
+
+def _render_checkpoints(results):
+    """[NEW v0.23.0] 저장된 결과를 실행 순서대로 5건씩 묶어 구간 요약을 만든다.
+
+    프로그램 로그의 '중간 보고'와 같은 내용을 나중에 대시보드에서도 볼 수 있게 한 것.
+    별도 테이블을 만들지 않고 결과에서 다시 계산하므로, 예전에 돌린 실행 내역에도 바로 보인다."""
+    if len(results) <= PROGRESS_REPORT_EVERY:
+        return ""
+    blocks = []
+    for start in range(0, len(results), PROGRESS_REPORT_EVERY):
+        group = results[start:start + PROGRESS_REPORT_EVERY]
+        counts = {"PASS": 0, "FAIL": 0, "확인 필요": 0}
+        for r in group:
+            counts[r["result"]] = counts.get(r["result"], 0) + 1
+        nums = [str(r["tc_no"]) for r in group]
+        span = f"{nums[0]}~{nums[-1]}번" if len(nums) > 1 else f"{nums[0]}번"
+        chips = " ".join(f'{_badge(k)} {v}' for k, v in counts.items() if v)
+        issues = [r for r in group if r["result"] != "PASS"]
+        if issues:
+            items = "".join(
+                f'<li><b>{_esc(r["tc_no"])}번</b> {_esc(r["title"])} — '
+                f'{_esc(_short_reason(r["reason"]))}</li>' for r in issues)
+            issue_html = f'<ul class="ckissues">{items}</ul>'
+        else:
+            issue_html = '<div class="ckok">이슈 없음</div>'
+        blocks.append(f'<div class="ck"><div class="ckhead">{_esc(span)} '
+                      f'<span class="cksub">({len(group)}건)</span></div>'
+                      f'<div class="ckcnt">{chips}</div>{issue_html}</div>')
+    return f"""
+  <details class="ckwrap" open>
+    <summary>구간 요약 — {PROGRESS_REPORT_EVERY}건 단위</summary>
+    <div class="cklist">{''.join(blocks)}</div>
+  </details>"""
+
+
+def _short_reason(reason):
+    """구간 요약에 들어갈 길이로 사유를 줄인다. 말머리([코드 판정] 등)는 뗀다. [v0.23.0]
+
+    이 파일은 백슬래시를 넣지 않는 규칙이 있어 정규식 대신 문자열 처리로 쓴다(파일 전송 절차)."""
+    text = str(reason or "").strip()
+    if text.startswith("[") and "]" in text[:22]:
+        text = text[text.index("]") + 1:].strip()
+    text = " ".join(text.split())
+    return (text[:110] + "…") if len(text) > 110 else (text or "사유 없음")
+
+
 def _render_results(results, current_run, current_sheet=None, run_label=""):
     summary = {"PASS": 0, "FAIL": 0, "확인 필요": 0}
     rows_html = []
@@ -720,6 +781,7 @@ def _render_results(results, current_run, current_sheet=None, run_label=""):
   <h2>{_esc(title)}</h2>
   <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 누르면 팝업으로 크게 볼 수 있습니다 (화살표 키로 이동, Esc로 닫기).</div>
   <div class="summary">{summary_html}</div>
+{_render_checkpoints(results)}
   <div class="tablewrap">
   <table>
     <thead><tr><th>No</th><th>시트 구분</th><th>테스트 항목</th><th>우선순위</th><th>결과</th><th>테스트 절차</th><th>예상 결과</th><th>사유</th><th>스크린샷</th></tr></thead>
