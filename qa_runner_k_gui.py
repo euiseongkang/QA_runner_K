@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.22.0"
+APP_VERSION = "0.23.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -48,6 +48,9 @@ DEFAULT_EC2_API = "https://qa.healthkoob.com"
 
 GITHUB_RELEASE_API = "https://api.github.com/repos/euiseongkang/QA_runner_K/releases/latest"
 APP_EXE_NAME = "QA_Runner_K.exe"
+
+# [NEW v0.23.0] TC 몇 건마다 중간 보고를 찍을지. 프로그램 로그와 대시보드가 같은 값을 쓴다.
+PROGRESS_REPORT_EVERY = 5
 
 CONFIG_FILENAME = "qa_runner_k_config.json"  # 시작 URL/로그인 정보 등 로컬 설정 저장 [NEW]
 
@@ -290,6 +293,17 @@ _JUDGE_STOPWORD_STEMS = (
 
 # 조사 때문에 매칭이 깨지는 걸 막는다 ("테이블이"는 화면에 "테이블"로 적혀 있음)
 _PARTICLES = ("으로", "에서", "이나", "이가", "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도")
+
+
+def _summarize_reason(reason: str) -> str:
+    """판정 사유를 중간 보고 한 줄에 들어갈 길이로 줄인다. [NEW v0.23.0]
+
+    "[코드 판정] 일부만 확인됨 (확인: A / 미확인: B)" 처럼 앞에 붙는 말머리는 떼고,
+    사람이 볼 때 의미 있는 부분(무엇이 확인 안 됐는지)만 남긴다."""
+    text = str(reason or "").strip()
+    text = re.sub(r"^\[[^\]]{1,20}\]\s*", "", text)     # [코드 판정] / [AI 판정] 말머리 제거
+    text = re.sub(r"\s+", " ", text)
+    return text[:90] if text else "사유 없음"
 
 
 def _strip_step_number(line: str) -> str:
@@ -1172,11 +1186,21 @@ class QAWorkerApp:
             self.log_msg("최신 버전입니다.")
 
     def prompt_update_ui(self, info):
+        # [v0.23.0] 릴리즈 파일명에 버전이 붙으면서(QA_Runner_K_v0.23.0.exe) 헷갈릴 수 있는 지점.
+        # 자동 업데이트는 "지금 실행 중인 exe를 그 자리에서" 바꾸므로 파일 이름은 그대로 남는다.
+        # 바탕화면 바로가기/자동시작 등록이 깨지지 않게 일부러 이렇게 둔 것이니 그 점을 알려준다.
         if messagebox.askyesno(
-            "업데이트", f"새 버전 {info['version']}이 있습니다. 지금 업데이트할까요?\n\n{info.get('notes','')[:300]}"
+            "업데이트",
+            f"새 버전 {info['version']}이 있습니다. 지금 업데이트할까요?\n\n"
+            f"※ 지금 쓰는 파일을 그 자리에서 바꿉니다. 파일 이름은 그대로지만 내용은 "
+            f"v{info['version']}이 되고, 실제 버전은 프로그램 제목 표시줄에서 확인할 수 있습니다.\n"
+            f"파일 이름까지 새 버전으로 받고 싶으면 Releases에서 직접 내려받으세요.\n\n"
+            f"{info.get('notes','')[:300]}"
         ):
             if info.get("download_url"):
-                do_update(info["download_url"], log_fn=self.log_msg)
+                if do_update(info["download_url"], log_fn=self.log_msg):
+                    self.log_msg(f"업데이트 파일을 받았습니다. 프로그램을 닫으면 v{info['version']}으로 교체됩니다 "
+                                 f"(파일 이름은 그대로 유지됩니다).")
             else:
                 self.log_msg("⚠ 다운로드 URL을 찾지 못했습니다.")
 
@@ -1442,6 +1466,7 @@ class QAWorkerApp:
 
             results = {RESULT_PASS: 0, RESULT_FAIL: 0, RESULT_NEEDS_REVIEW: 0}
             engine = TCExecutionEngine(page, log_fn=self.log_msg)
+            chunk = []     # [v0.23.0] 5건 단위 중간 보고용 버퍼
 
             for i, tc in enumerate(tcs):
                 if not self.running:
@@ -1468,12 +1493,53 @@ class QAWorkerApp:
                 self._save_result(tc, judgment, reason, after_b64, before_b64,
                                    run_id=run_id, source=tc_source, source_ref=source_ref, ec2=ec2)
 
+                # [NEW v0.23.0] TC 5건마다 중간 보고. 멈추지 않고 그대로 이어서 실행한다.
+                # 24건짜리를 돌릴 때 끝날 때까지 상황을 모르는 게 불편해서 넣은 규칙.
+                chunk.append((tc, judgment, reason))
+                if len(chunk) >= PROGRESS_REPORT_EVERY:
+                    self._log_progress_summary(chunk, i + 1, len(tcs))
+                    chunk = []
+
+            if chunk:      # 5로 나누어떨어지지 않고 남은 마지막 몇 건
+                self._log_progress_summary(chunk, min(i + 1, len(tcs)), len(tcs), tail=True)
+
             self.log_msg(
                 f"\n완료: PASS {results[RESULT_PASS]} / FAIL {results[RESULT_FAIL]} / "
                 f"확인 필요 {results[RESULT_NEEDS_REVIEW]}"
             )
             self.open_results_dashboard()
             browser.close()
+
+    def _log_progress_summary(self, chunk, done, total, tail=False):
+        """[NEW v0.23.0] TC {PROGRESS_REPORT_EVERY}건마다 중간 요약을 로그에 찍는다.
+
+        번호 / 결과 / 이슈 사항 세 가지만 짧게. 여기서 실행을 멈추지 않는다.
+        대시보드 결과 화면에도 같은 구간 요약이 뜬다(거기는 저장된 결과로 다시 계산한다)."""
+        start = done - len(chunk) + 1
+        counts = {RESULT_PASS: 0, RESULT_FAIL: 0, RESULT_NEEDS_REVIEW: 0}
+        for _, judgment, _ in chunk:
+            counts[judgment] = counts.get(judgment, 0) + 1
+
+        head = f"중간 보고 ({start}~{done}번 / 총 {total}건)"
+        if tail:
+            head = f"마지막 구간 ({start}~{done}번 / 총 {total}건)"
+        self.log_msg("\n" + "─" * 52)
+        self.log_msg(f"  {head}   "
+                     f"PASS {counts[RESULT_PASS]} · FAIL {counts[RESULT_FAIL]} · "
+                     f"확인 필요 {counts[RESULT_NEEDS_REVIEW]}")
+        issues = []
+        for tc, judgment, reason in chunk:
+            icon = {RESULT_PASS: "✅", RESULT_FAIL: "❌"}.get(judgment, "⚠")
+            self.log_msg(f"    {icon} {tc['tc_id']:>4}. {clean_text(tc['title'])[:34]:<34} {judgment}")
+            if judgment != RESULT_PASS:
+                issues.append((tc["tc_id"], _summarize_reason(reason)))
+        if issues:
+            self.log_msg("  이슈:")
+            for no, why in issues:
+                self.log_msg(f"    - {no}번: {why}")
+        else:
+            self.log_msg("  이슈: 없음")
+        self.log_msg("─" * 52 + "\n  계속 진행합니다...")
 
     def _login(self, page) -> bool:
         """시작 URL/로그인 - TC 엑셀과 분리된 프로그램 설정 기반. [REUSED 원본 3분기 로직]"""
