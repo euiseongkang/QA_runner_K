@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.20.0"
+APP_VERSION = "0.21.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -360,7 +360,11 @@ def build_rule_actions(tc: dict) -> list:
                 selector = ('input[placeholder*="검색"], input[type="search"], '
                             'input[type="text"]:not([readonly])')
             # description은 대상 이름만 담는다 (엔진이 "입력: {desc} = {value}" 형태로 로그를 찍으므로)
+            # [v0.21.0] label을 따로 실어 보낸다. 위 CSS는 글자가 완전히 같아야 맞기 때문에
+            # ("환자명,환자등록번호,휴대전화번호" vs 화면의 "환자명, 환자등록번호, 휴대전화번호")
+            # 엔진이 공백 무시 비교/조각 비교로 다시 찾을 수 있게 원본 이름을 남긴다.
             actions.append({"type": "fill", "selector": selector, "value": value,
+                            "label": brackets[0] if brackets else "",
                             "description": brackets[0] if brackets else "검색 입력창"})
 
         # 2) 클릭: [대괄호]로 명시된 대상만 클릭한다. 대괄호가 없으면 클릭 액션을 만들지 않음
@@ -558,9 +562,14 @@ class TCExecutionEngine:
     DANGEROUS_SELECTOR_PATTERNS = ["rgba(", "rgb(", "style=", "!important"]
     DANGER_WORDS_BASE = ["탈퇴", "삭제확인", "계정삭제"]
 
+    # [v0.21.0] 값을 넣을 수 있는 입력 요소만. 체크박스/라디오/버튼은 제외.
+    INPUT_TAGS = ('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+                  ':not([type="submit"]):not([type="button"]):not([type="file"]), textarea')
+
     def __init__(self, page, log_fn=print):
         self.page = page
         self.log_fn = log_fn
+        self.failed_actions = []   # [v0.21.0] 실패한 액션 기록 - 판정에서 PASS를 막는 근거
 
     def _is_dangerous(self, action: dict, tc_steps_text: str) -> bool:
         sel = (action.get("selector") or "").lower()
@@ -581,6 +590,7 @@ class TCExecutionEngine:
     def execute(self, actions: list, tc: dict) -> list:
         """액션 리스트를 순서대로 실행하고, 실제 실행된 액션 설명 리스트를 반환."""
         actions_done = []
+        self.failed_actions = []
         tc_steps_text = tc.get("steps", "")
 
         for action in actions:
@@ -607,6 +617,9 @@ class TCExecutionEngine:
                 else:
                     self.log_fn(f"  ⚠ 알 수 없는 액션 타입: {atype}")
             except Exception as e:
+                # [v0.21.0] 실패를 기록해 둔다. 예전에는 로그만 찍고 넘어가서,
+                # 검색어 입력이 실패했는데도 화면 어딘가에 그 글자가 있으면 PASS가 났었다.
+                self.failed_actions.append(f"{desc}: {str(e)[:80]}")
                 self.log_fn(f"  ⚠ 액션 실행 실패 ({desc}): {str(e)[:80]}")
 
         return actions_done
@@ -676,13 +689,87 @@ class TCExecutionEngine:
                 except Exception:
                     self.page.wait_for_timeout(400)
 
+    @staticmethod
+    def _norm_label(text):
+        """공백을 모두 없애고 소문자로. TC에 적은 이름과 화면 글자를 견주기 위한 정규화. [v0.21.0]"""
+        return re.sub(r"\s+", "", str(text or "")).lower()
+
+    def _input_candidates(self):
+        """화면에서 값을 넣을 수 있는 입력창과, 그 입력창을 가리키는 글자들을 모은다. [v0.21.0]
+
+        placeholder / aria-label / name / id / title / 연결된 label 텍스트를 한 줄로 묶는다.
+        속성 경계를 넘어 엉뚱하게 이어붙지 않도록 구분자(|)를 넣고 정규화한다."""
+        out = []
+        try:
+            handles = self.page.query_selector_all(self.INPUT_TAGS)
+        except Exception:
+            return out
+        for h in handles:
+            try:
+                if not h.is_visible() or h.is_disabled():
+                    continue
+                if h.get_attribute("readonly") is not None:
+                    continue
+                texts = [h.get_attribute(a) or ""
+                         for a in ("placeholder", "aria-label", "name", "id", "title", "type")]
+                try:
+                    texts.append(h.evaluate(
+                        "e => (e.labels && e.labels[0]) ? e.labels[0].textContent : ''") or "")
+                except Exception:
+                    pass
+                out.append((h, self._norm_label("|".join(texts))))
+            except Exception:
+                continue
+        return out
+
+    def _find_input(self, label, selector=""):
+        """입력창을 찾는다. (요소, 어떻게 찾았는지) 반환. 못 찾으면 (None, ""). [NEW v0.21.0]
+
+        TC에 적은 이름과 화면의 placeholder가 글자 하나까지 같지 않아도 찾도록 단계적으로 넓힌다.
+          1) TC에 적힌 그대로 CSS 부분 일치 (가장 정확)
+          2) 공백 무시 비교 - "환자명,환자등록번호,휴대전화번호" 와
+             화면의 "환자명, 환자등록번호, 휴대전화번호" 를 같은 것으로 본다
+          3) 쉼표/슬래시로 끊은 조각 중 하나라도 들어 있으면 그 입력창
+          4) 그래도 없으면 화면의 검색 입력창, 마지막으로 첫 번째 입력창
+        4)까지 가면 엉뚱한 칸에 넣을 수도 있으므로 로그에 "대체"라고 남긴다."""
+        if selector:
+            try:
+                el = get_scoped_locator(self.page, selector)
+                if el.count() > 0 and el.is_visible(timeout=1200):
+                    return el, ""
+            except Exception:
+                pass
+
+        cands = self._input_candidates()
+        want = self._norm_label(label)
+        if want:
+            for h, hay in cands:
+                if want in hay:
+                    return h, "공백 무시하고 찾음"
+            for part in re.split(r"[,/·]", str(label)):
+                pn = self._norm_label(part)
+                if len(pn) < 2:
+                    continue
+                for h, hay in cands:
+                    if pn in hay:
+                        return h, f"'{part.strip()}' 조각으로 찾음"
+
+        for h, hay in cands:
+            if "search" in hay or "검색" in hay:
+                return h, "검색 입력창으로 대체"
+        if cands:
+            return cands[0][0], "화면의 첫 입력창으로 대체"
+        return None, ""
+
     def _fill(self, action, actions_done):
         sel = action.get("selector", "")
         value = action.get("value", "")
         desc = action.get("description", "입력")
-        el = get_scoped_locator(self.page, sel)
+        el, how = self._find_input(action.get("label") or desc, sel)
+        if el is None:
+            raise RuntimeError(f"입력창을 찾지 못했습니다 ({desc})")
         el.fill(value)
-        self.log_fn(f"  ✓ 입력: {desc} = {value}")
+        self.log_fn(f"  ✓ 입력: {desc} = {value}" + (f"  [{how}]" if how else ""))
         actions_done.append(f"입력: {desc}")
 
     def _drag(self, action, actions_done):
@@ -1646,6 +1733,15 @@ class QAWorkerApp:
                 except Exception:
                     if attempt < 2:
                         page.wait_for_timeout(1000)
+
+        # [NEW v0.21.0] 절차 중 실패한 동작이 있으면 PASS를 주지 않는다.
+        # 실제 사례: 검색어 입력이 실패했는데(입력창을 못 찾음) 화면 오른쪽 위 로그인 사용자
+        # 이름이 마침 "강의성"이라 예상 결과 키워드가 맞아떨어져 PASS로 기록됐다.
+        # 동작을 못 했으면 그 결과가 맞는지 코드가 알 수 없으므로 사람이 봐야 한다.
+        if getattr(engine, "failed_actions", None) and judgment == RESULT_PASS:
+            judgment = RESULT_NEEDS_REVIEW
+            reason = ("절차 중 실패한 동작이 있어 판정을 보류합니다 - "
+                      + " / ".join(engine.failed_actions[:2]) + f" (원래 근거: {reason[:60]})")
 
         icon = {"PASS": "✅", "FAIL": "❌"}.get(judgment, "⚠")
         self.log_msg(f"  {icon} {judgment} - {reason[:80]}")
