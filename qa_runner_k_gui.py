@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.18.0"
+APP_VERSION = "0.19.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -268,7 +268,25 @@ _JUDGE_STOPWORDS = {
     # 팝업/모달은 화면에 그 단어가 글자로 쓰여 있지 않으므로(팝업이 스스로 "팝업"이라 적지 않음)
     # 텍스트 판정에서 제외하고, 대신 모달 요소 존재 여부로 판정한다.
     "팝업", "모달", "레이어", "다이얼로그",
+    # [v0.19.0] "어디를 보라"는 구조/위치 어휘. 화면에는 그 단어가 글자로 적혀 있지 않다
+    # (목록에 컬럼명이 떠 있어도 "목록"이나 "항목"이라는 글자는 없다).
+    # "목록에 A, B, C 항목이 노출된다"에서 확인해야 할 것은 A·B·C뿐이다.
+    "목록", "항목", "리스트", "테이블", "컬럼", "칼럼", "영역", "패널", "필드", "입력란",
+    "상단", "하단", "좌측", "우측", "왼쪽", "오른쪽", "기본", "다시", "상태", "값",
+    "문구", "메시지", "안내", "텍스트", "중에서", "가운데", "이상", "이하", "각", "등",
 }
+
+# 쉼표 나열의 끝을 알리는 말. 이게 있으면 쉼표가 하나뿐이어도 "항목 나열"로 본다
+# ("환자명, 성별 항목이 노출된다"). [v0.19.0]
+_LIST_TERMINATORS = ("항목", "컬럼", "칼럼", "필드", "열이", "값이", "정보가")
+
+# [v0.19.0] 서술 어휘의 활용형까지 걸러내기 위한 어간. 토큰이 이 어간으로 시작하면 제외한다.
+# ("노출되는", "선택되어", "해제되고" 처럼 형태가 계속 달라져서 낱말을 일일이 넣을 수 없다)
+_JUDGE_STOPWORD_STEMS = (
+    "노출", "표시", "선택", "해제", "확인", "이동", "진입", "변경", "조회", "클릭",
+    "활성", "비활성", "체크", "돌아", "유지", "반영", "적용", "발생", "동작",
+    "보인", "보이", "나타", "열리", "열린", "닫히", "닫힌", "뜬다", "뜨고",
+)
 
 # 조사 때문에 매칭이 깨지는 걸 막는다 ("테이블이"는 화면에 "테이블"로 적혀 있음)
 _PARTICLES = ("으로", "에서", "이나", "이가", "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도")
@@ -363,27 +381,114 @@ def build_rule_actions(tc: dict) -> list:
 
 
 def _strip_particle(token: str) -> str:
-    """3자 이상 토큰의 뒤에 붙은 조사를 떼어낸다 ("테이블이" -> "테이블")."""
-    for p in _PARTICLES:
-        if len(token) > len(p) + 1 and token.endswith(p):
-            return token[: -len(p)]
+    """토큰 뒤에 붙은 조사를 떼어낸다 ("테이블이" -> "테이블").
+
+    [v0.19.0] 조사가 겹쳐 붙는 경우가 있어 더 떨어지지 않을 때까지 반복한다
+    ("목록에는" -> "목록에" -> "목록"). 2자 미만으로는 깎지 않는다."""
+    for _ in range(3):
+        for p in _PARTICLES:
+            if len(token) > len(p) + 1 and token.endswith(p):
+                token = token[: -len(p)]
+                break
+        else:
+            break
     return token
 
 
+def _is_stopword(token: str) -> bool:
+    """판정 키워드에서 뺄 어휘인지. 낱말 목록 + 서술 어간 앞자리 일치. [v0.19.0]"""
+    if not token or len(token) < 2:
+        return True
+    if token in _JUDGE_STOPWORDS:
+        return True
+    return token.startswith(_JUDGE_STOPWORD_STEMS)
+
+
+def _trim_edges(segment: str) -> str:
+    """쉼표로 끊은 조각의 앞뒤에 붙은 구조어/서술어를 떼어내고 항목명만 남긴다. [v0.19.0]
+
+    "목록에 No"        -> "No"
+    "병실 항목이 노출된다" -> "병실"
+    "환자 구분"          -> "환자 구분"  (가운데는 건드리지 않아 두 어절 항목명이 살아남는다)"""
+    words = [w for w in re.split(r"\s+", segment.strip()) if w]
+    words = [re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", w) for w in words]
+    words = [w for w in words if w]
+    while words and _is_stopword(_strip_particle(words[0])):
+        words.pop(0)
+    while words and _is_stopword(_strip_particle(words[-1])):
+        words.pop()
+    # 조각 가운데에 서술어가 남아 있으면 그 앞은 앞절이다 - 마지막 서술어 뒤부터가 항목명
+    # ("환자 정보 패널이 열리고 환자등록번호" -> "환자등록번호")
+    cut = -1
+    for i, w in enumerate(words[:-1]):
+        if _is_stopword(_strip_particle(w)):
+            cut = i
+    if cut >= 0:
+        words = words[cut + 1:]
+    if words:
+        words[-1] = _strip_particle(words[-1])
+    return " ".join(words).strip()
+
+
+def _extract_comma_items(text: str) -> list:
+    """쉼표로 나열된 '확인할 항목'들을 뽑는다. [NEW v0.19.0]
+
+    TC 표기 규칙: 예상 결과에서 확인할 항목이 여러 개면 쉼표로 나열한다.
+    ("목록에 No, 환자등록번호, 환자명, 성별 항목이 노출된다" -> 4개 항목)
+    나열이 아니라 그냥 쉼표가 들어간 서술 문장이면 조각들이 길거나 서술어만 남으므로,
+    살아남은 조각이 2개 미만이면 나열이 아닌 것으로 보고 포기한다.
+    쉼표가 1개뿐이면 "A하고, B한다" 같은 접속 문장일 가능성이 높아,
+    "...항목이/컬럼이" 처럼 나열의 끝을 알리는 말이 있을 때만 나열로 본다."""
+    if text.count(",") < 1:
+        return []
+    if text.count(",") < 2 and not any(t in text for t in _LIST_TERMINATORS):
+        return []
+    items = []
+    for seg in text.split(","):
+        trimmed = _trim_edges(seg)
+        # 너무 길면 항목명이 아니라 서술 문장이다
+        if trimmed and len(trimmed) <= 20 and trimmed not in items:
+            items.append(trimmed)
+    return items if len(items) >= 2 else []
+
+
 def extract_expected_keywords(expected: str) -> list:
-    """예상 결과 문장에서 "화면에 실제로 있는지 확인할 단어"를 뽑는다.
-    따옴표/대괄호로 명시된 값이 있으면 그것만 쓰고, 없으면 서술 어휘를 걸러낸 명사들을 쓴다."""
-    explicit = re.findall(r"[\"'“”‘’\[]([^\"'“”‘’\]]{2,40})[\"'“”‘’\]]", expected)
-    if explicit:
-        return [k.strip() for k in explicit if k.strip()]
-    keywords = []
+    """예상 결과 문장에서 "화면에 실제로 있는지 확인할 대상"을 뽑는다.
+
+    [v0.19.0] TC 표기 규칙을 그대로 읽는다:
+      "따옴표"  = 화면에 있어야 할 문구
+      [대괄호]  = 버튼명
+      쉼표 나열 = 확인할 항목(컬럼/필드)명
+    표기가 하나도 없는 예전 TC는 종전처럼 서술 어휘를 걸러낸 명사들로 판정한다."""
+    targets = []
+
+    def add(value):
+        value = str(value or "").strip()
+        if value and value not in targets:
+            targets.append(value)
+
+    for m in re.findall(r"[\"'“”‘’]([^\"'“”‘’]{2,40})[\"'“”‘’]", expected):
+        add(m)
+    for m in re.findall(r"\[([^\[\]]{1,40})\]", expected):
+        add(m)
+
+    # 표기로 잡은 부분은 빼고 남은 문장에서 쉼표 나열을 본다 (문구 안의 쉼표에 안 걸리게)
+    rest = re.sub(r"[\"'“”‘’][^\"'“”‘’]{2,40}[\"'“”‘’]", " ", expected)
+    rest = re.sub(r"\[[^\[\]]{1,40}\]", " ", rest)
+    for item in _extract_comma_items(rest):
+        add(item)
+
+    if targets:
+        return targets
+
+    # --- 표기가 없는 예전 TC 호환: 서술 어휘를 걸러낸 명사들 ---
     for token in re.findall(r"[가-힣A-Za-z0-9]{2,}", expected):
         if token in _JUDGE_STOPWORDS:
             continue
         stripped = _strip_particle(token)
-        if stripped and stripped not in _JUDGE_STOPWORDS and stripped not in keywords:
-            keywords.append(stripped)
-    return keywords
+        if stripped and not _is_stopword(stripped):
+            add(stripped)
+    return targets
 
 
 def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None):
