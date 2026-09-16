@@ -313,6 +313,22 @@ STYLE = """
   a.shot:hover img { border-color: #2d6cdf; box-shadow: 0 0 0 2px rgba(45,108,223,.18); }
   a.shot:hover span { color: #2d6cdf; }
   .noshot { color: #999; font-size: 12px; }
+  /* [v0.20.0] 스크린샷 팝업(라이트박스). 새 탭 대신 화면 위에 겹쳐 띄운다. */
+  .lb { display: none; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 900;
+        background: rgba(14,18,26,.94); }
+  .lb.on { display: flex; flex-direction: column; }
+  .lb-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+            padding: 10px 14px; color: #fff; font-size: 13px; background: #11151d;
+            border-bottom: 1px solid rgba(255,255,255,.12); }
+  .lb-cap { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lb-tools { display: flex; gap: 6px; align-items: center; flex: none; }
+  .lb-btn { background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.3); color: #fff;
+            border-radius: 6px; padding: 4px 10px; font-size: 13px; line-height: 1.5;
+            cursor: pointer; text-decoration: none; font-family: inherit; }
+  .lb-btn:hover { background: rgba(255,255,255,.3); }
+  .lb-scroll { flex: 1; overflow: auto; padding: 14px; text-align: center; }
+  .lb-scroll img { max-width: 100%; border-radius: 6px; background: #fff;
+                   box-shadow: 0 8px 30px rgba(0,0,0,.45); }
   .sub2small { color: #888; font-size: 12px; margin-top: 2px; }
   form.rename { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   form.rename input[type=text] { width: 260px; }
@@ -338,6 +354,80 @@ STYLE = """
   @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
 """
 
+# [NEW v0.20.0] 스크린샷을 새 탭이 아니라 팝업으로 연다.
+# 외부 라이브러리 없이 이 페이지 안에서만 동작한다(대시보드는 사내 PC/서버에서 돌고
+# 외부 CDN을 못 부르는 환경도 있어서 의존성을 만들지 않는다).
+# 주의: 이 파일은 백틱/역슬래시/달러중괄호를 쓰지 않는 규칙을 지킨다(파일 전송 절차 때문).
+LIGHTBOX = """
+<div id="lb" class="lb" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="lb-bar">
+    <span id="lb-cap" class="lb-cap"></span>
+    <span class="lb-tools">
+      <a id="lb-open" class="lb-btn" href="#" target="_blank" rel="noopener">새 탭으로</a>
+      <button id="lb-prev" class="lb-btn" type="button" title="이전 (왼쪽 화살표)">&#8249;</button>
+      <button id="lb-next" class="lb-btn" type="button" title="다음 (오른쪽 화살표)">&#8250;</button>
+      <button id="lb-close" class="lb-btn" type="button" title="닫기 (Esc)">&#10005;</button>
+    </span>
+  </div>
+  <div id="lb-scroll" class="lb-scroll"><img id="lb-img" alt=""></div>
+</div>
+<script>
+(function () {
+  var links = [].slice.call(document.querySelectorAll('a.shot'));
+  if (!links.length) { return; }
+  var box = document.getElementById('lb');
+  var img = document.getElementById('lb-img');
+  var cap = document.getElementById('lb-cap');
+  var openLink = document.getElementById('lb-open');
+  var scroll = document.getElementById('lb-scroll');
+  var idx = -1;
+
+  function show(i) {
+    if (i < 0 || i >= links.length) { return; }
+    idx = i;
+    var a = links[i];
+    var href = a.getAttribute('href');
+    img.setAttribute('src', href);
+    openLink.setAttribute('href', href);
+    cap.textContent = a.getAttribute('data-cap') || '';
+    scroll.scrollTop = 0;
+    box.classList.add('on');
+    box.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+  }
+  function hide() {
+    box.classList.remove('on');
+    box.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+    img.removeAttribute('src');
+    idx = -1;
+  }
+
+  links.forEach(function (a, i) {
+    a.addEventListener('click', function (e) {
+      // 사용자가 일부러 새 탭으로 열려는 조작(Ctrl/Cmd/Shift 클릭)은 그대로 둔다
+      if (e.metaKey || e.ctrlKey || e.shiftKey) { return; }
+      e.preventDefault();
+      show(i);
+    });
+  });
+  document.getElementById('lb-close').addEventListener('click', hide);
+  document.getElementById('lb-prev').addEventListener('click', function () { show(idx - 1); });
+  document.getElementById('lb-next').addEventListener('click', function () { show(idx + 1); });
+  // 배경(이미지 바깥)을 누르면 닫는다
+  box.addEventListener('click', function (e) {
+    if (e.target === box || e.target === scroll) { hide(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (!box.classList.contains('on')) { return; }
+    if (e.key === 'Escape') { hide(); }
+    else if (e.key === 'ArrowLeft') { show(idx - 1); }
+    else if (e.key === 'ArrowRight') { show(idx + 1); }
+  });
+})();
+</script>
+"""
+
 
 def _page(title, active, body):
     def cls(name):
@@ -358,6 +448,7 @@ def _page(title, active, body):
     {account}
   </div></nav>
   <div class="wrap">{body}</div>
+{LIGHTBOX}
 </body></html>"""
 
 
@@ -591,12 +682,16 @@ def _render_results(results, current_run, current_sheet=None, run_label=""):
         summary[r["result"]] = summary.get(r["result"], 0) + 1
         # [v0.10.0] 버튼을 눌러 새 탭으로 보던 것을 표 안에 바로 보이는 썸네일로 바꿨다.
         # 스크린샷은 full_page라 세로로 아주 길다. 위쪽(첫 화면)만 잘라 보여주고,
-        # 눌러서 전체를 새 탭으로 여는 건 그대로 둔다. loading=lazy로 화면에 들어올 때만 받는다.
+        # 누르면 [v0.20.0] 새 탭이 아니라 화면 위 팝업으로 전체를 띄운다.
+        # href는 그대로 남겨둬서 Ctrl+클릭으로 새 탭을 여는 것도 계속 된다.
+        # loading=lazy로 화면에 들어올 때만 받는다.
         shots = []
         for key, label in (("before_screenshot", "실행 전"), ("after_screenshot", "실행 후")):
             if r.get(key):
                 url = f'/img?path={_esc(r[key])}'
-                shots.append(f'<a class="shot" href="{url}" target="_blank" title="{label} - 클릭하면 전체 화면">'
+                caption = _esc(f"{r['tc_no']}. {r['title']} - {label}")
+                shots.append(f'<a class="shot" href="{url}" target="_blank" data-cap="{caption}" '
+                             f'title="{label} - 클릭하면 크게 보기">'
                              f'<img src="{url}" loading="lazy" alt="{label}">'
                              f'<span>{label}</span></a>')
         rows_html.append(f"""<tr>
@@ -623,7 +718,7 @@ def _render_results(results, current_run, current_sheet=None, run_label=""):
     body = f"""
   <p class="sub"><a href="/">← 실행 내역 목록</a>{" · 시트: " + _esc(current_sheet or "(시트 없음)") if current_sheet is not None else ""}</p>
   <h2>{_esc(title)}</h2>
-  <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 눌러 전체 화면으로 확인하세요.</div>
+  <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 누르면 팝업으로 크게 볼 수 있습니다 (화살표 키로 이동, Esc로 닫기).</div>
   <div class="summary">{summary_html}</div>
   <div class="tablewrap">
   <table>
