@@ -1,0 +1,18 @@
+        # ── QA_runner_K 대시보드 ────────────────────────────────
+        # location 은 "가장 긴 접두어"가 이기므로 아래 location / 보다 우선한다.
+        location /qa-k/ {
+            proxy_pass http://qa-runner-k:8765/;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host  $host;
+            proxy_set_header X-Forwarded-Prefix /qa-k;
+            proxy_read_timeout 120s;
+            client_max_body_size 20M;
+        }
+        # /qa-k 로 들어오면 슬래시를 붙여준다 (안 그러면 404)
+        location = /qa-k {
+            return 301 https://$host/qa-k/;
+        }
+        # ────────────────────────────────────────────────────────

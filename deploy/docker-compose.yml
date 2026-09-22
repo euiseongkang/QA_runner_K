@@ -1,0 +1,35 @@
+# QA_runner_K 대시보드 - 기존 qa-runner 스택과 분리해서 띄운다.
+# 원본 /opt/qa-runner/docker-compose.yml 은 건드리지 않는다.
+# 기존 external 네트워크에 참여만 해서 qa-nginx 가 컨테이너 이름으로 찾아갈 수 있게 한다.
+services:
+  qa-runner-k:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: qa-runner-k
+    restart: unless-stopped
+    expose:
+      - "8765"
+    volumes:
+      - ../data:/data
+    environment:
+      QA_RUNNER_K_REQUIRE_LOGIN: "1"            # 서버에서는 반드시 로그인
+      QA_RUNNER_K_URL_PREFIX: "/qa-k"           # nginx 가 접두어를 떼고 넘기므로 앱에 알려준다
+      QA_RUNNER_K_BASE_URL: "https://qa.healthkoob.com/qa-k"
+      QA_RUNNER_K_DB_PATH: "/data/qa_runner_k.db"
+      QA_RUNNER_K_SCREENSHOT_DIR: "/data/qa_runner_k_screenshots"
+      QA_RUNNER_K_SECRET_KEY: ${QA_RUNNER_K_SECRET_KEY:?서버에서 .env 에 넣어주세요}
+      QA_RUNNER_K_API_TOKEN: ${QA_RUNNER_K_API_TOKEN:-}
+      # [v0.26.0] 실행 내역/스크린샷 보관 기간(일). 0 이면 정리하지 않는다.
+      QA_RUNNER_K_RETAIN_DAYS: ${QA_RUNNER_K_RETAIN_DAYS:-30}
+    # 이 서버는 메모리 2GB에 스왑이 없다. 우리 쪽이 부풀어도 원본 서비스가 죽지 않게 상한을 건다.
+    mem_limit: 320m
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - external
+
+networks:
+  external:
+    external: true          # 기존 스택이 만든 네트워크에 참여만 (새로 만들지 않음)
+    name: qa-runner_external
