@@ -39,7 +39,7 @@ import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.23.0"
+APP_VERSION = "0.26.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -53,6 +53,15 @@ APP_EXE_NAME = "QA_Runner_K.exe"
 PROGRESS_REPORT_EVERY = 5
 
 CONFIG_FILENAME = "qa_runner_k_config.json"  # 시작 URL/로그인 정보 등 로컬 설정 저장 [NEW]
+
+# [NEW v0.25.0] 팀 공용 대시보드(EC2) 주소.
+# [대시보드 바로가기]와 [주소 복사]는 이 주소를 쓴다 - 링크를 팀에 공유하기 위한 버튼이기 때문.
+# 반면 [결과 보기]와 TC 관리는 그대로 로컬 대시보드(127.0.0.1:8765)를 쓴다.
+#   이유: 실행 결과와 스크린샷은 아직 이 PC의 SQLite에만 쌓인다. PC->서버 업로드 API가
+#   없는 상태에서 [결과 보기]까지 서버로 보내면 방금 돌린 결과가 안 보인다.
+#   업로드 API가 생기면 두 경로를 하나로 합칠 것.
+# 값을 비워두면 [대시보드 바로가기]도 로컬 대시보드로 되돌아간다(서버를 안 쓰는 PC 대비).
+TEAM_DASHBOARD_URL = "https://qa.healthkoob.com/qa-k/"
 
 # [NEW] 결과값 3단계. 원본은 PASS/FAIL 2단계였고 판정이 애매하면 그냥 FAIL로 밀어넣었는데,
 # 그러면 "진짜 실패"와 "AI가 판단을 못 내린 것/실행 중 오류"가 섞여버려 사람이 다시 걸러야 했음.
@@ -869,7 +878,15 @@ class QAWorkerApp:
         self._dashboard_addr = None  # (host, port) - "결과 보기"로 이미 띄운 서버가 있으면 재사용
         # [NEW v0.11.0] 대시보드 주소를 화면에 띄워서 복사/북마크할 수 있게 한다.
         # 주소를 매번 물어보시는 일이 있어서, 버튼과 함께 눈에 보이는 자리에 둔다.
+        # [v0.25.0] 화면에 노출하는 주소는 팀 주소(team_url_var)로 바뀌었고, 이 값은
+        # 로컬 대시보드 주소를 담아 로그와 내부 이동(결과 보기 / TC 관리)에 쓴다.
         self.dashboard_url_var = tk.StringVar(value="대시보드 준비 중...")
+        # [NEW v0.25.0] 팀 공용 대시보드 주소. 화면에서 직접 고칠 수 있고 [저장]으로 보존된다.
+        self.team_url_var = tk.StringVar(value=TEAM_DASHBOARD_URL)
+        # [NEW v0.26.0] 결과를 서버로도 보낼 때 쓰는 토큰. 비어 있으면 전송하지 않는다.
+        # TODO: login_pw와 마찬가지로 설정 파일에 평문으로 남는다. OS 자격 증명 저장소로 옮기는 것 검토.
+        self.api_token_var = tk.StringVar(value="")
+        self._upload_queue = []      # 아직 서버로 못 보낸 결과. 실패해도 여기 남아 다음에 재시도된다.
 
         # [NEW] 시작 URL/로그인 - TC 엑셀과 분리해서 프로그램 설정으로 관리
         self.start_url_var = tk.StringVar()
@@ -898,6 +915,9 @@ class QAWorkerApp:
             self.login_id_var.set(cfg.get("login_id", ""))
             # TODO: 비밀번호 평문 저장은 임시 조치. 배포 전 OS 자격 증명 저장소 등으로 교체 검토.
             self.login_pw_var.set(cfg.get("login_pw", ""))
+            # [NEW v0.25.0] 키가 없는 예전 설정 파일이면 기본값(팀 서버)을 그대로 쓴다.
+            self.team_url_var.set(cfg.get("team_dashboard_url", TEAM_DASHBOARD_URL))
+            self.api_token_var.set(cfg.get("api_token", ""))          # [NEW v0.26.0]
         except Exception:
             pass
 
@@ -908,6 +928,8 @@ class QAWorkerApp:
             "login_type": self.login_type_var.get(),
             "login_id": self.login_id_var.get(),
             "login_pw": self.login_pw_var.get(),
+            "team_dashboard_url": self.team_url_var.get(),  # [NEW v0.25.0]
+            "api_token": self.api_token_var.get(),          # [NEW v0.26.0]
         }
         try:
             with open(self._config_path(), "w", encoding="utf-8") as f:
@@ -1014,16 +1036,34 @@ class QAWorkerApp:
 
         # [NEW v0.11.0] 대시보드 바로가기 줄. 버튼 하나로 브라우저 새 창이 열리고,
         # 옆에 주소를 그대로 노출해서 복사하거나 북마크할 수 있게 한다.
+        # [v0.25.0] 노출/복사하는 주소를 팀 공용 서버 주소로 바꿨다. 예전에는 읽기 전용으로
+        # 로컬 주소를 보여줬는데, 팀에 링크를 넘길 때 쓸 수 없는 주소였다.
+        # 입력 가능하게 둬서 서버 주소가 바뀌어도 빌드 없이 고칠 수 있다.
         dash_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
         dash_frame.pack(fill="x")
         ttk.Button(dash_frame, text="대시보드 바로가기",
                    command=self.open_dashboard).pack(side="left")
-        ttk.Label(dash_frame, text="주소").pack(side="left", padx=(10, 4))
-        url_entry = ttk.Entry(dash_frame, textvariable=self.dashboard_url_var,
-                              state="readonly", width=32)
+        ttk.Label(dash_frame, text="팀 주소").pack(side="left", padx=(10, 4))
+        url_entry = ttk.Entry(dash_frame, textvariable=self.team_url_var, width=34)
         url_entry.pack(side="left")
         ttk.Button(dash_frame, text="주소 복사",
                    command=self.copy_dashboard_url).pack(side="left", padx=4)
+        # 두 대시보드가 보는 데이터가 다르다는 것을 화면에서 바로 알 수 있게 한 줄 적어둔다.
+        ttk.Label(dash_frame, text="※ 방금 돌린 결과는 [결과 보기]",
+                  foreground="#777").pack(side="left", padx=(8, 0))
+
+        # [NEW v0.26.0] 결과를 서버로도 보내기 위한 토큰 줄.
+        # 토큰은 서버에서 만들어 서버 .env 에 넣고, 같은 값을 여기에 붙여넣는다.
+        # 비워두면 전송을 아예 하지 않으므로, 서버를 안 쓰는 PC도 지금까지처럼 동작한다.
+        up_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        up_frame.pack(fill="x")
+        ttk.Label(up_frame, text="서버 전송 토큰").pack(side="left")
+        ttk.Entry(up_frame, textvariable=self.api_token_var, width=30,
+                  show="*").pack(side="left", padx=(6, 4))
+        ttk.Button(up_frame, text="연결 확인",
+                   command=self.check_upload_connection).pack(side="left")
+        ttk.Label(up_frame, text="※ 비우면 결과가 이 PC에만 쌓입니다",
+                  foreground="#777").pack(side="left", padx=(8, 0))
 
         # 로그
         log_frame = ttk.LabelFrame(self.root, text="로그", padding=4)
@@ -1129,14 +1169,34 @@ class QAWorkerApp:
         except Exception as e:
             self.log_msg(f"⚠ 브라우저 열기 실패: {e}  (주소를 복사해서 직접 여세요: {url})")
 
+    def _team_url(self, path=""):
+        """[NEW v0.25.0] 팀 공용 대시보드 주소를 만든다.
+
+        칸이 비어 있으면 서버를 안 쓰겠다는 뜻으로 보고 로컬 대시보드 주소를 돌려준다.
+        끝의 '/'를 맞춰줘야 'https://host/qa-k/' + 'tcs' 가 제대로 이어진다."""
+        base = (self.team_url_var.get() or "").strip()
+        if not base:
+            return self._dashboard_url(path)
+        if not base.endswith("/"):
+            base += "/"
+        return base + path
+
     def open_dashboard(self):
-        """[대시보드 바로가기] - 대시보드 첫 화면(실행 결과)을 새 창으로. [NEW v0.11.0]"""
-        self._ensure_dashboard()
-        self._open_browser(self._dashboard_url())
+        """[대시보드 바로가기] - 팀 공용 대시보드를 새 창으로.
+        [NEW v0.11.0] / [v0.25.0] 로컬 주소 -> 팀 서버 주소로 변경.
+
+        주의: 실행 결과는 아직 이 PC에만 쌓이므로 방금 돌린 결과는 여기서 안 보인다.
+        그건 [결과 보기](로컬)에서 본다. PC->서버 업로드 API가 생기면 하나로 합칠 것."""
+        if not (self.team_url_var.get() or "").strip():
+            self._ensure_dashboard()  # 로컬로 되돌아가는 경우에만 서버를 띄운다
+        self._open_browser(self._team_url())
 
     def copy_dashboard_url(self):
-        """주소를 클립보드로. 다른 브라우저나 메신저에 붙여넣을 때 쓴다. [NEW v0.11.0]"""
-        url = self._dashboard_url()
+        """주소를 클립보드로. 다른 브라우저나 메신저에 붙여넣을 때 쓴다.
+        [NEW v0.11.0] / [v0.25.0] 팀 서버 주소를 복사한다 - 남에게 보낼 수 있는 주소여야 하므로."""
+        if not (self.team_url_var.get() or "").strip():
+            self._ensure_dashboard()
+        url = self._team_url()
         if not url:
             return
         try:
@@ -1145,6 +1205,111 @@ class QAWorkerApp:
             self.log_msg(f"주소를 복사했습니다: {url}")
         except Exception as e:
             self.log_msg(f"⚠ 복사 실패: {e}")
+
+    # ---- 결과를 서버로도 보내기 ----                                 [NEW v0.26.0]
+    # 설계 원칙: 로컬 저장이 먼저고, 서버는 사본이다.
+    # 서버가 죽었든 재택이라 망이 다르든, 전송이 실패해도 실행은 멈추지 않고
+    # 로컬 결과도 멀쩡해야 한다. 그래서 이 아래 함수들은 예외를 밖으로 던지지 않는다.
+
+    def _upload_enabled(self):
+        return bool((self.team_url_var.get() or "").strip()
+                    and (self.api_token_var.get() or "").strip())
+
+    def _api_url(self, name):
+        return self._team_url("api/" + name)
+
+    def _queue_upload(self, tc, judgment, reason, source, source_ref, run_id,
+                      before_path, after_path):
+        """전송 대기열에 한 건 넣는다. 실제 전송은 5건마다, 그리고 실행이 끝날 때 한 번에 한다.
+        건건이 보내면 TC 사이마다 네트워크를 기다리게 되어 실행이 느려진다."""
+        if not self._upload_enabled():
+            return
+        self._upload_queue.append({
+            "run_id": run_id,
+            "before_path": before_path,
+            "after_path": after_path,
+            "row": {
+                "run_id": run_id, "source": source, "source_ref": source_ref,
+                "tc_no": str(tc.get("tc_id", "")), "title": tc.get("title", ""),
+                "priority": tc.get("priority", ""), "precondition": tc.get("precondition", ""),
+                "steps": tc.get("steps", ""), "expected": tc.get("expected", ""),
+                "result": judgment, "reason": reason or "",
+                "sheet": tc.get("sheet_name", ""), "created_at": time.time(),
+            },
+        })
+
+    def _upload_screenshot(self, sess, run_id, path):
+        """PNG 한 장을 올리고 서버가 저장한 상대 경로를 돌려준다. 실패하면 None.
+
+        스크린샷이 안 올라가도 결과 줄은 올라가야 하므로 여기서는 조용히 None을 준다."""
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            r = sess.post(self._api_url("screenshot"),
+                          params={"run_id": run_id, "name": os.path.basename(path)},
+                          data=data, headers={"Content-Type": "image/png"}, timeout=60)
+            if r.status_code == 200:
+                return (r.json() or {}).get("path")
+        except Exception:
+            pass
+        return None
+
+    def _flush_uploads(self, quiet=False):
+        """대기열을 서버로 보낸다. 실패한 건은 대기열에 그대로 남겨 다음 기회에 다시 보낸다."""
+        if not self._upload_queue or not self._upload_enabled():
+            return
+        pending, self._upload_queue = self._upload_queue, []
+        try:
+            sess = requests.Session()
+            sess.headers["Authorization"] = "Bearer " + self.api_token_var.get().strip()
+            rows = []
+            for item in pending:
+                row = dict(item["row"])
+                row["before_screenshot"] = self._upload_screenshot(
+                    sess, item["run_id"], item.get("before_path"))
+                row["after_screenshot"] = self._upload_screenshot(
+                    sess, item["run_id"], item.get("after_path"))
+                rows.append(row)
+            r = sess.post(self._api_url("results"), json={"rows": rows}, timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
+            d = r.json() or {}
+            if not quiet:
+                self.log_msg(f"  ☁ 서버 전송 {len(rows)}건 "
+                             f"(신규 {d.get('inserted', 0)} / 갱신 {d.get('updated', 0)})")
+            for err in (d.get("errors") or [])[:3]:
+                self.log_msg(f"  ⚠ 서버가 거부한 건: {err}")
+        except Exception as e:
+            # 되돌려 놓는다. 5건 뒤 체크포인트나 실행 종료 시 다시 시도된다.
+            self._upload_queue = pending + self._upload_queue
+            if not quiet:
+                self.log_msg(f"  ⚠ 서버 전송 실패 - {len(pending)}건 보류 ({str(e)[:100]})")
+
+    def check_upload_connection(self):
+        """[연결 확인] - 결과를 보내기 전에 주소와 토큰이 맞는지만 확인한다.
+        실제로 돌려보고 나서 '안 올라갔네'를 알게 되는 상황을 막기 위한 버튼."""
+        url = self._api_url("ping")
+        token = (self.api_token_var.get() or "").strip()
+        if not token:
+            messagebox.showinfo("서버 전송", "토큰이 비어 있어 결과를 서버로 보내지 않습니다.\n"
+                                           "이 PC에만 결과가 쌓입니다.")
+            return
+        try:
+            r = requests.get(url, headers={"Authorization": "Bearer " + token}, timeout=15)
+        except Exception as e:
+            messagebox.showerror("서버 전송", f"서버에 닿지 못했습니다.\n\n{url}\n\n{str(e)[:200]}")
+            return
+        if r.status_code == 200:
+            messagebox.showinfo("서버 전송", f"연결 정상입니다.\n\n{url}")
+        elif r.status_code == 401:
+            messagebox.showerror("서버 전송", "토큰이 맞지 않습니다. 서버의 값과 같은지 확인해 주세요.")
+        elif r.status_code == 503:
+            messagebox.showerror("서버 전송", "서버에 토큰이 설정되어 있지 않습니다.\n"
+                                            "서버 .env 의 QA_RUNNER_K_API_TOKEN 을 채우고 다시 띄워야 합니다.")
+        else:
+            messagebox.showerror("서버 전송", f"예상치 못한 응답입니다: HTTP {r.status_code}\n{r.text[:200]}")
 
     def open_results_dashboard(self):
         self._ensure_dashboard()
@@ -1499,9 +1664,17 @@ class QAWorkerApp:
                 if len(chunk) >= PROGRESS_REPORT_EVERY:
                     self._log_progress_summary(chunk, i + 1, len(tcs))
                     chunk = []
+                    self._flush_uploads()     # [v0.26.0] 중간 보고와 같은 주기로 서버에 올린다
 
             if chunk:      # 5로 나누어떨어지지 않고 남은 마지막 몇 건
                 self._log_progress_summary(chunk, min(i + 1, len(tcs)), len(tcs), tail=True)
+
+            # [NEW v0.26.0] 남은 건과, 그동안 실패해서 보류된 건을 마지막으로 한 번 더 보낸다.
+            self._flush_uploads()
+            if self._upload_queue:
+                self.log_msg(f"⚠ 서버로 못 보낸 결과 {len(self._upload_queue)}건이 남았습니다. "
+                             f"결과는 이 PC에 모두 저장돼 있습니다. "
+                             f"[연결 확인]으로 주소·토큰을 확인해 주세요.")
 
             self.log_msg(
                 f"\n완료: PASS {results[RESULT_PASS]} / FAIL {results[RESULT_FAIL]} / "
@@ -1883,6 +2056,11 @@ class QAWorkerApp:
             )
         except Exception as e:
             self.log_msg(f"  ⚠ 로컬 결과 저장 실패: {e}")
+
+        # [NEW v0.26.0] 로컬에 저장한 뒤에 서버 전송 대기열에 넣는다. 순서가 중요하다 -
+        # 전송이 어떻게 되든 로컬 결과는 이미 남아 있어야 한다.
+        self._queue_upload(tc, judgment, reason, source, source_ref, run_id,
+                           before_path, after_path)
 
         if source == "ec2":
             self._submit_result_ec2(ec2, tc, judgment, reason, after_b64, before_b64)

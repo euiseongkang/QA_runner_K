@@ -80,8 +80,19 @@ def get_db_path():
     return os.environ.get("QA_RUNNER_K_DB_PATH") or os.path.join(_base_dir(), DB_FILENAME)
 
 
+def get_screenshot_root():
+    """스크린샷 보관 기준 폴더. [NEW v0.24.0]
+
+    내 PC에서는 예전처럼 exe(또는 소스) 옆의 qa_runner_k_screenshots 폴더를 쓴다.
+    서버(도커)에서는 데이터 볼륨을 가리켜야 하므로 환경변수로 바꿀 수 있게 했다.
+    /img 서빙과 삭제도 전부 이 함수 하나를 기준으로 삼는다 - 기준이 갈리면
+    '화면에는 보이는데 파일은 못 찾는' 상태가 생긴다."""
+    return (os.environ.get("QA_RUNNER_K_SCREENSHOT_DIR")
+            or os.path.join(_base_dir(), SCREENSHOT_DIR_NAME))
+
+
 def get_screenshot_dir(run_id: str):
-    d = os.path.join(_base_dir(), SCREENSHOT_DIR_NAME, run_id)
+    d = os.path.join(get_screenshot_root(), run_id)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -146,6 +157,121 @@ def insert_result(tc: dict, result: str, reason: str, source: str, source_ref: s
         conn.commit()
     finally:
         conn.close()
+
+
+_SAFE_NAME_MAX = 80
+
+
+def _safe_segment(name, fallback):
+    """경로 한 조각만 남긴다 - '../', 절대경로, 드라이브 문자를 전부 떨어낸다. [NEW v0.26.0]
+
+    서버가 PC에서 올라온 이름을 그대로 파일 경로에 쓰면 스크린샷 폴더 밖에 파일을 쓸 수 있다.
+    받은 값은 믿지 않고 여기서 한 번 깎아낸 뒤에만 쓴다."""
+    name = os.path.basename(str(name or "").replace("\\", "/").strip())
+    out = "".join(c for c in name if c.isalnum() or c in "-_.").lstrip(".")[:_SAFE_NAME_MAX]
+    return out or fallback
+
+
+def upsert_result_row(row: dict, db_path=None):
+    """[NEW v0.26.0] 프로그램(PC)이 보낸 결과 한 건을 기록한다. 이미 있으면 덮어쓴다.
+
+    PC는 로컬에 먼저 저장한 뒤 서버로 보내고, 실패하면 나중에 다시 보낸다.
+    그래서 같은 건이 두 번 올 수 있고, 두 번 와도 줄이 겹치면 안 된다.
+    기준은 run_id + tc_no + title - tc_no가 비어 있는 대시보드 TC까지 구분하기 위해
+    title을 같이 본다 (v0.18.0에서 TC 가져오기를 '추가'에서 '갱신'으로 바꿀 때와 같은 기준).
+
+    반환: "insert" 또는 "update"
+    """
+    fields = ("run_id", "source", "source_ref", "tc_no", "title", "priority",
+              "precondition", "steps", "expected", "result", "reason", "sheet",
+              "before_screenshot", "after_screenshot")
+    v = {k: _clip(str(row.get(k) or "")) for k in fields}
+    if not v["run_id"] or not v["result"]:
+        raise ValueError("run_id 와 result 는 필수입니다")
+    for k in ("before_screenshot", "after_screenshot"):
+        v[k] = v[k] or None
+    try:
+        created = float(row.get("created_at"))
+    except (TypeError, ValueError):
+        created = time.time()
+
+    conn = _connect(db_path)
+    try:
+        found = conn.execute(
+            "SELECT id FROM results WHERE run_id=? AND IFNULL(tc_no,'')=? AND IFNULL(title,'')=?",
+            (v["run_id"], v["tc_no"], v["title"]),
+        ).fetchone()
+        if found:
+            conn.execute(
+                """UPDATE results SET source=?, source_ref=?, priority=?, precondition=?,
+                       steps=?, expected=?, result=?, reason=?, sheet=?,
+                       before_screenshot=?, after_screenshot=?, created_at=?
+                   WHERE id=?""",
+                (v["source"], v["source_ref"], v["priority"], v["precondition"], v["steps"],
+                 v["expected"], v["result"], v["reason"], v["sheet"],
+                 v["before_screenshot"], v["after_screenshot"], created, found[0]),
+            )
+            action = "update"
+        else:
+            conn.execute(
+                """INSERT INTO results
+                   (run_id, source, source_ref, tc_no, title, priority, precondition, steps,
+                    expected, result, reason, sheet, before_screenshot, after_screenshot, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (v["run_id"], v["source"], v["source_ref"], v["tc_no"], v["title"], v["priority"],
+                 v["precondition"], v["steps"], v["expected"], v["result"], v["reason"], v["sheet"],
+                 v["before_screenshot"], v["after_screenshot"], created),
+            )
+            action = "insert"
+        conn.commit()
+        return action
+    finally:
+        conn.close()
+
+
+def save_uploaded_screenshot(run_id, filename, data):
+    """[NEW v0.26.0] PC가 올린 스크린샷을 저장하고, DB에 넣을 상대 경로를 돌려준다.
+
+    DB에는 '<run_id>/<파일명>'만 넣는다. v0.24.0에서 겪은 그대로, 절대 경로를 넣으면
+    다른 컴퓨터로 옮기는 순간 전부 깨진다. 이름은 받은 값을 믿지 않고 깎아서 쓴다."""
+    rid = _safe_segment(run_id, "unknown_run")
+    fn = _safe_segment(filename, "shot.png")
+    if not fn.lower().endswith(".png"):
+        fn += ".png"
+    path = os.path.join(get_screenshot_dir(rid), fn)
+    real = os.path.realpath(path)
+    root = os.path.realpath(get_screenshot_root())
+    if not real.startswith(root + os.sep):
+        raise ValueError("스크린샷 경로가 기준 폴더를 벗어납니다")
+    with open(real, "wb") as f:
+        f.write(data)
+    return rid + "/" + fn
+
+
+def purge_old_runs(days=30, db_path=None):
+    """[NEW v0.26.0] 오래된 실행 내역과 스크린샷을 지운다. 반환: (지운 배치 수, 지운 줄 수)
+
+    스크린샷이 계속 쌓이면 서버 디스크가 언젠가 찬다(현재 20G 중 11G 여유).
+    days가 0 이하이면 아무 것도 지우지 않는다 - 정리를 끄는 방법."""
+    if not days or days <= 0:
+        return (0, 0)
+    cutoff = time.time() - days * 86400
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT run_id FROM results GROUP BY run_id HAVING MAX(created_at) < ?",
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+    runs = lines = 0
+    for (run_id,) in rows:
+        try:
+            lines += delete_run(run_id, db_path=db_path, remove_screenshots=True)
+            runs += 1
+        except Exception:
+            pass          # 한 배치가 안 지워져도 나머지 정리는 계속한다
+    return (runs, lines)
 
 
 def list_runs(db_path=None):
@@ -240,7 +366,7 @@ def _remove_screenshot_dir(run_id):
     """해당 배치의 스크린샷 폴더를 지운다.
     run_id에 경로 조작 문자가 섞여 있어도 스크린샷 루트 밖을 건드리지 못하게 확인한다."""
     import shutil
-    root = os.path.realpath(os.path.join(_base_dir(), SCREENSHOT_DIR_NAME))
+    root = os.path.realpath(get_screenshot_root())
     target = os.path.realpath(os.path.join(root, str(run_id)))
     if target.startswith(root + os.sep) and os.path.isdir(target):
         shutil.rmtree(target, ignore_errors=True)

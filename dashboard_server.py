@@ -53,6 +53,11 @@ def create_app(db_path=None):
     # 서버 배포 모드(QA_RUNNER_K_REQUIRE_LOGIN=1)면 로그인 화면을 띄운다.
     dashboard_auth.install(app, db_path)
 
+    # [NEW v0.24.0] nginx 하위 경로(/qa-k) 배포 대응. 환경변수가 없으면 아무 것도 안 바뀌므로
+    # 내 PC에서 127.0.0.1:8765 로 쓰던 방식은 그대로다.
+    app.wsgi_app = PrefixMiddleware(app.wsgi_app,
+                                    os.environ.get("QA_RUNNER_K_URL_PREFIX", ""))
+
     def _reject_cross_site():
         """로컬 전용 서버이지만, 다른 사이트가 브라우저를 통해 POST를 보내는 것(CSRF)은 막는다.
         Origin 헤더가 있고 이 서버가 아니면 거부한다."""
@@ -86,7 +91,7 @@ def create_app(db_path=None):
             msg = f"실행 내역을 삭제했습니다 ({run_id} · 결과 {n}건 · 스크린샷 포함)"
         except Exception as e:
             msg = f"삭제 실패: {e}"
-        return redirect("/?msg=" + urllib.parse.quote(msg))
+        return redirect(_u("/?msg=") + urllib.parse.quote(msg))
 
     @app.route("/runs/rename/<path:run_id>", methods=["POST"])
     def runs_rename(run_id):
@@ -100,7 +105,7 @@ def create_app(db_path=None):
         except Exception as e:
             msg = f"이름 변경 실패: {e}"
         keep = request.form.get("sheet")
-        url = "/?msg=" + urllib.parse.quote(msg)
+        url = _u("/?msg=") + urllib.parse.quote(msg)
         if keep:
             url += "&sheet=" + urllib.parse.quote(keep)
         return redirect(url)
@@ -113,14 +118,108 @@ def create_app(db_path=None):
 
     @app.route("/img")
     def img():
-        # 스크린샷 저장 기준 디렉터리(qa_runner_k_screenshots) 하위 파일만 서빙.
+        # 스크린샷 저장 기준 디렉터리 하위 파일만 서빙.
         # 이게 없으면 ?path=/etc/passwd 같은 임의 경로를 그대로 읽어줄 수 있어서 필수 체크.
-        path = request.args.get("path", "")
-        base = os.path.realpath(os.path.join(results_store._base_dir(), results_store.SCREENSHOT_DIR_NAME))
-        real = os.path.realpath(path) if path else ""
-        if not path or not real.startswith(base + os.sep) or not os.path.isfile(real):
+        real = _screenshot_file(request.args.get("path", ""))
+        if not real:
             abort(404)
         return send_file(real)
+
+    # [NEW v0.26.0] 오래된 실행 내역 자동 정리.
+    # 스크린샷이 계속 쌓이면 서버 디스크가 언젠가 찬다. 크론을 따로 걸면 관리 지점이 하나 늘고
+    # 잊히기 쉬워서, 앱이 뜰 때와 하루에 한 번 결과를 받을 때 스스로 정리하게 했다.
+    # QA_RUNNER_K_RETAIN_DAYS=0 이면 정리하지 않는다(보관 기간 제한 없음).
+    def _retain_days():
+        try:
+            return int(os.environ.get("QA_RUNNER_K_RETAIN_DAYS", "30"))
+        except ValueError:
+            return 30
+
+    def _purge_if_due(force=False):
+        now = time.time()
+        if not force and now - app.config.get("LAST_PURGE", 0) < 86400:
+            return
+        app.config["LAST_PURGE"] = now
+        try:
+            runs, lines = results_store.purge_old_runs(_retain_days(),
+                                                       db_path=app.config.get("DB_PATH"))
+            if runs:
+                print(f"[정리] {_retain_days()}일 지난 실행 {runs}건({lines}줄) 삭제", flush=True)
+        except Exception as e:
+            print(f"[정리] 실패(무시하고 계속): {e}", flush=True)
+
+    app.config["LAST_PURGE"] = 0
+    _purge_if_due(force=True)
+
+    # ---- 결과 업로드 API ----                                      [NEW v0.26.0]
+    # PC의 프로그램이 실행 결과를 서버로도 보내기 위한 통로.
+    # 인증은 쿠키가 아니라 Authorization: Bearer <토큰> 이다 (dashboard_auth.require_api_token).
+    # 토큰이 설정돼 있지 않으면 503으로 막힌다 - 설정을 빠뜨린 채 열려 있는 상태를 만들지 않기 위함.
+    # 로그인 미들웨어는 /api/ 로 시작하는 경로를 통과시키므로 여기서 토큰만 확인하면 된다.
+
+    @app.route("/api/ping")
+    @dashboard_auth.api_token_required
+    def api_ping():
+        """프로그램이 '주소와 토큰이 맞는지'만 확인할 때 쓴다. 결과를 보내기 전에 부른다."""
+        return {"ok": True, "app": APP_MARKER}
+
+    @app.route("/api/results", methods=["POST"])
+    @dashboard_auth.api_token_required
+    def api_results():
+        """결과를 1건 또는 여러 건 받는다.
+
+        본문은 JSON. 한 건이면 그대로, 여러 건이면 {"rows": [ ... ]}.
+        같은 건을 다시 받아도 줄이 겹치지 않는다(run_id + tc_no + title 기준으로 덮어씀).
+        네트워크가 끊겼다 재전송하는 경우가 정상 동작이라 중복 방어가 꼭 필요하다."""
+        body = request.get_json(silent=True)
+        if body is None:
+            return {"ok": False, "error": "JSON 본문이 필요합니다"}, 400
+        rows = body.get("rows") if isinstance(body, dict) else None
+        if rows is None:
+            rows = [body] if isinstance(body, dict) else body
+        if not isinstance(rows, list):
+            return {"ok": False, "error": "rows 는 목록이어야 합니다"}, 400
+        if len(rows) > 200:
+            return {"ok": False, "error": "한 번에 200건까지만 보낼 수 있습니다"}, 413
+
+        dbp = app.config.get("DB_PATH")
+        inserted = updated = 0
+        errors = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                errors.append({"index": i, "error": "각 항목은 객체여야 합니다"})
+                continue
+            try:
+                if results_store.upsert_result_row(row, db_path=dbp) == "insert":
+                    inserted += 1
+                else:
+                    updated += 1
+            except Exception as e:
+                # 한 건이 잘못돼도 나머지는 받는다. 어느 건이 왜 실패했는지는 돌려준다.
+                errors.append({"index": i, "error": str(e)[:200]})
+        _purge_if_due()      # 하루에 한 번만 실제로 돈다
+        return {"ok": not errors, "inserted": inserted, "updated": updated, "errors": errors}
+
+    @app.route("/api/screenshot", methods=["POST"])
+    @dashboard_auth.api_token_required
+    def api_screenshot():
+        """스크린샷 PNG 1장을 받는다. 본문은 파일 내용 그대로(Content-Type: image/png).
+
+        multipart 대신 원시 본문을 쓰는 이유는 프로그램 쪽에 추가 라이브러리가 필요 없어서다.
+        run_id 와 name 은 쿼리로 받되, 경로 조작은 results_store 쪽에서 깎아낸다."""
+        data = request.get_data(cache=False)
+        if not data:
+            return {"ok": False, "error": "본문이 비어 있습니다"}, 400
+        # PNG 시그니처 8바이트. 이 파일은 옮길 때 깨지지 않도록 이스케이프 문자를 피하는
+        # 규칙이라, 문자열 리터럴 대신 바이트 값을 그대로 적는다.
+        if data[:8] != bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]):
+            return {"ok": False, "error": "PNG 파일이 아닙니다"}, 415
+        try:
+            rel = results_store.save_uploaded_screenshot(
+                request.args.get("run_id", ""), request.args.get("name", ""), data)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}, 400
+        return {"ok": True, "path": rel}
 
     # ---- TC 관리 ----                                            [NEW v0.4.0]
     @app.route("/tcs")
@@ -446,7 +545,7 @@ def _page(title, active, body):
     def cls(name):
         return ' class="on"' if name == active else ""
     user = dashboard_auth.current_user()
-    account = (f'<span class="who">{_esc(user)}</span><a href="/logout">로그아웃</a>'
+    account = (f'<span class="who">{_esc(user)}</span><a href="{_u("/logout")}">로그아웃</a>'
                if user else "")
     return f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -456,13 +555,89 @@ def _page(title, active, body):
 <body>
   <nav><div class="inner">
     <span class="brand">QA_runner_K</span>
-    <a href="/"{cls('results')}>실행 내역</a>
-    <a href="/tcs"{cls('tcs')}>TC 관리</a>
+    <a href="{_u('/')}"{cls('results')}>실행 내역</a>
+    <a href="{_u('/tcs')}"{cls('tcs')}>TC 관리</a>
     {account}
   </div></nav>
   <div class="wrap">{body}</div>
 {LIGHTBOX}
 </body></html>"""
+
+
+class PrefixMiddleware:
+    """[NEW v0.24.0] nginx가 하위 경로(/qa-k)에 얹어 넘겨줄 때 앱이 자기 주소를 바르게 알게 한다.
+
+    nginx의 proxy_pass 가 /qa-k 를 떼고 넘기므로 앱이 보는 경로는 /tcs 지만,
+    브라우저에게 돌려줄 링크는 /qa-k/tcs 여야 한다. WSGI의 SCRIPT_NAME 을 세워두면
+    Flask의 url_for/redirect 와 request.script_root 가 전부 알아서 맞춰진다.
+
+    X-Forwarded-Proto/Host 도 함께 반영한다. 이게 없으면
+    - 세션 쿠키의 Secure 판단이 틀어지고
+    - CSRF 검사(request.host_url 비교)가 nginx 뒤에서 항상 불일치가 된다."""
+
+    def __init__(self, wsgi_app, prefix=""):
+        self.wsgi_app = wsgi_app
+        self.prefix = "/" + str(prefix or "").strip("/") if str(prefix or "").strip("/") else ""
+
+    def __call__(self, environ, start_response):
+        prefix = environ.get("HTTP_X_FORWARDED_PREFIX") or self.prefix
+        prefix = "/" + str(prefix).strip("/") if str(prefix).strip("/") else ""
+        if prefix:
+            environ["SCRIPT_NAME"] = prefix
+            path = environ.get("PATH_INFO", "")
+            # nginx가 접두어를 떼지 않고 넘기는 설정이어도 중복되지 않게 맞춘다
+            if path.startswith(prefix):
+                environ["PATH_INFO"] = path[len(prefix):] or "/"
+        proto = environ.get("HTTP_X_FORWARDED_PROTO")
+        if proto:
+            environ["wsgi.url_scheme"] = proto.split(",")[0].strip()
+        host = environ.get("HTTP_X_FORWARDED_HOST")
+        if host:
+            environ["HTTP_HOST"] = host.split(",")[0].strip()
+        return self.wsgi_app(environ, start_response)
+
+
+def _u(path=""):
+    """[NEW v0.24.0] 하위 경로 배포(/qa-k) 대응. 화면에 박아 넣는 절대 주소 앞에 접두어를 붙인다.
+
+    Flask의 url_for 는 알아서 붙지만, 이 파일은 HTML을 f-string으로 직접 만들기 때문에
+    href="/tcs" 같이 손으로 적은 주소가 많다. 그 자리를 이 함수로 감싼다.
+    로컬(접두어 없음)에서는 받은 값을 그대로 돌려주므로 동작이 달라지지 않는다."""
+    try:
+        root = request.script_root or ""
+    except Exception:
+        root = ""
+    return root + path
+
+
+def _screenshot_file(stored):
+    """저장된 경로로 실제 스크린샷 파일을 찾는다. [NEW v0.24.0]
+
+    DB에는 그 파일을 만든 PC 기준의 절대 경로가 들어간다(윈도우면 C:\\클로드\\... 형태).
+    이 DB를 서버로 옮기면 그 경로는 존재하지 않으므로, 경로를 그대로 믿지 않고
+    **마지막 두 조각(<실행ID>/<파일명>)** 만 떼어 지금 환경의 스크린샷 루트 아래에서 찾는다.
+    덕분에 PC에서 만든 DB를 서버에 그대로 올려도 스크린샷이 그대로 보인다.
+
+    보안은 그대로다 - 어느 후보를 쓰든 realpath 가 스크린샷 루트 안에 있을 때만 돌려준다."""
+    root = os.path.realpath(results_store.get_screenshot_root())
+    raw = str(stored or "")
+    if not raw:
+        return None
+    parts = [x for x in raw.replace("\\", "/").split("/") if x not in ("", ".", "..")]
+    candidates = []
+    if len(parts) >= 2:
+        candidates.append(os.path.join(root, parts[-2], parts[-1]))   # <실행ID>/<파일명>
+    if parts:
+        candidates.append(os.path.join(root, parts[-1]))              # <파일명>
+    candidates.append(raw)                                            # 만든 PC에서 그대로 볼 때
+    for c in candidates:
+        try:
+            real = os.path.realpath(c)
+        except Exception:
+            continue
+        if real.startswith(root + os.sep) and os.path.isfile(real):
+            return real
+    return None
 
 
 def _tc_key(sheet, tc_no, title):
@@ -595,7 +770,7 @@ def _runs_url(sheet=None, rename=None):
         q.append("sheet=" + urllib.parse.quote(sheet))
     if rename is not None:
         q.append("rename=" + urllib.parse.quote(str(rename)))
-    return "/?" + "&".join(q) if q else "/"
+    return _u("/?" + "&".join(q)) if q else _u("/")
 
 
 def _sheets_label(sheets):
@@ -612,12 +787,12 @@ def _render_result_sheet_filter(sheets, current):
     """[NEW v0.15.0] 실행 내역의 시트(화면)별 필터. 구분 기준은 엑셀/구글 시트의 시트 이름."""
     if not sheets or (len(sheets) == 1 and not sheets[0]["sheet"]):
         return ""
-    chips = [f'<a class="chip{"" if current is not None else " on"}" href="/">전체</a>']
+    chips = [f'<a class="chip{"" if current is not None else " on"}" href="{_u("/")}">전체</a>']
     for s in sheets:
         name = s["sheet"]
         label = name or "(시트 없음)"
         on = " on" if current is not None and current == name else ""
-        chips.append(f'<a class="chip{on}" href="/?sheet={urllib.parse.quote(name)}">'
+        chips.append(f'<a class="chip{on}" href="{_u("/?sheet=")}{urllib.parse.quote(name)}">'
                      f'{_esc(label)} ({s["runs"]}회 · {s["total"]}건)</a>')
     return f"""
   <div class="chips">
@@ -632,7 +807,7 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
     줄을 누르면 그 배치의 결과 화면으로 간다. 줄마다 [삭제]가 붙는다."""
     rows = []
     for r in runs:
-        detail = f"/?run_id={urllib.parse.quote(str(r['run_id']))}"
+        detail = _u("/?run_id=") + urllib.parse.quote(str(r["run_id"]))
         badges = []
         if r["passed"]:
             badges.append(f'{_badge("PASS")} {r["passed"]}')
@@ -644,7 +819,7 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
         keep = f'<input type="hidden" name="sheet" value="{_esc(current_sheet)}">' if current_sheet is not None else ""
         if rename_id is not None and rename_id == r["run_id"]:
             # 이름 바꾸는 중인 줄: 첫 칸을 입력 폼으로 바꿔 보여준다 (별도 화면 없이 그 자리에서)
-            name_cell = f"""<form method="post" action="/runs/rename/{rid}" class="rename">
+            name_cell = f"""<form method="post" action="{_u('/runs/rename/')}{rid}" class="rename">
       {keep}<input type="text" name="label" value="{_esc(r.get('label'))}" maxlength="120"
              placeholder="예) 9월 정기 회귀 - 환자관리" autofocus>
       <button type="submit" class="primary">저장</button>
@@ -658,7 +833,7 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
             name_cell = f'<a class="runlink" href="{detail}">{_esc(title)}</a>{sub}'
             actions = f"""
     <a class="btnlike" href="{detail}">결과 보기</a>
-    <form method="post" action="/runs/delete/{rid}"
+    <form method="post" action="{_u('/runs/delete/')}{rid}"
           style="display:inline" onsubmit="return confirm('{_esc(r.get('label') or _when(r['started_at']))} 실행 내역(결과 {r['total']}건)을 삭제할까요? 스크린샷도 함께 지워지며 되돌릴 수 없습니다.');">
       <button type="submit" class="danger">삭제</button>
     </form>
@@ -684,7 +859,7 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
     <thead><tr><th>프로젝트명 / 실행 시각</th><th>TC 소스</th><th>시트 구분</th><th>건수</th><th>판정</th><th class="right">&nbsp;</th></tr></thead>
     <tbody>{''.join(rows) or empty}</tbody>
   </table>
-  <p class="sub" style="margin-top:14px"><a href="/?all=1">전체 결과 한 번에 보기 (최근 300건)</a></p>"""
+  <p class="sub" style="margin-top:14px"><a href="{_u('/?all=1')}">전체 결과 한 번에 보기 (최근 300건)</a></p>"""
     return _page("QA_runner_K 실행 내역", "results", body)
 
 
@@ -749,7 +924,7 @@ def _render_results(results, current_run, current_sheet=None, run_label=""):
         shots = []
         for key, label in (("before_screenshot", "실행 전"), ("after_screenshot", "실행 후")):
             if r.get(key):
-                url = f'/img?path={_esc(r[key])}'
+                url = _u('/img?path=') + _esc(r[key])
                 caption = _esc(f"{r['tc_no']}. {r['title']} - {label}")
                 shots.append(f'<a class="shot" href="{url}" target="_blank" data-cap="{caption}" '
                              f'title="{label} - 클릭하면 크게 보기">'
@@ -777,7 +952,7 @@ def _render_results(results, current_run, current_sheet=None, run_label=""):
     else:
         title = "전체 결과 (최근 300건)"
     body = f"""
-  <p class="sub"><a href="/">← 실행 내역 목록</a>{" · 시트: " + _esc(current_sheet or "(시트 없음)") if current_sheet is not None else ""}</p>
+  <p class="sub"><a href="{_u('/')}">← 실행 내역 목록</a>{" · 시트: " + _esc(current_sheet or "(시트 없음)") if current_sheet is not None else ""}</p>
   <h2>{_esc(title)}</h2>
   <div class="sub">"확인 필요"는 실패가 아니라 <b>근거가 부족해 사람이 확인해야 하는 항목</b>입니다. 오른쪽 스크린샷을 누르면 팝업으로 크게 볼 수 있습니다 (화살표 키로 이동, Esc로 닫기).</div>
   <div class="summary">{summary_html}</div>
@@ -796,24 +971,24 @@ def _render_sheet_filter(sheets, current):
     if not sheets or (len(sheets) == 1 and not sheets[0]["sheet"]):
         return ""
     total = sum(s["total"] for s in sheets)
-    chips = [f'<a class="chip{"" if current is not None else " on"}" href="/tcs">전체 ({total})</a>']
+    chips = [f'<a class="chip{"" if current is not None else " on"}" href="{_u("/tcs")}">전체 ({total})</a>']
     for s in sheets:
         name = s["sheet"]
         label = name or "(시트 없음)"
         on = " on" if current is not None and current == name else ""
-        chips.append(f'<a class="chip{on}" href="/tcs?sheet={urllib.parse.quote(name)}">'
+        chips.append(f'<a class="chip{on}" href="{_u("/tcs?sheet=")}{urllib.parse.quote(name)}">'
                      f'{_esc(label)} ({s["enabled"]}/{s["total"]})</a>')
 
     bulk = ""
     if current is not None:
         bulk = f"""
     <span class="bulk">
-      <form method="post" action="/tcs/sheet_enable" style="display:inline">
+      <form method="post" action="{_u('/tcs/sheet_enable')}" style="display:inline">
         <input type="hidden" name="sheet" value="{_esc(current)}">
         <input type="hidden" name="enabled" value="1">
         <button type="submit" class="link">이 시트 전체 실행 포함</button>
       </form>
-      <form method="post" action="/tcs/sheet_enable" style="display:inline">
+      <form method="post" action="{_u('/tcs/sheet_enable')}" style="display:inline">
         <input type="hidden" name="sheet" value="{_esc(current)}">
         <input type="hidden" name="enabled" value="0">
         <button type="submit" class="link">전체 제외</button>
@@ -851,11 +1026,11 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
   <td>{'포함' if tc.get('enabled') else '제외'}</td>
   <td>
     <div class="actions">
-      <a href="/tcs?edit={tc['id']}"><button type="button" class="link">수정</button></a>
-      <form method="post" action="/tcs/toggle/{tc['id']}" style="display:inline">
+      <a href="{_u('/tcs?edit=')}{tc['id']}"><button type="button" class="link">수정</button></a>
+      <form method="post" action="{_u('/tcs/toggle/')}{tc['id']}" style="display:inline">
         <button type="submit" class="link">{toggle_label}</button>
       </form>
-      <form method="post" action="/tcs/delete/{tc['id']}" style="display:inline"
+      <form method="post" action="{_u('/tcs/delete/')}{tc['id']}" style="display:inline"
             onsubmit="return confirm('이 TC를 삭제할까요?')">
         <button type="submit" class="danger">삭제</button>
       </form>
@@ -889,7 +1064,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
   </div>
 
   <div class="card upload">
-    <form method="post" action="/tcs/import" enctype="multipart/form-data">
+    <form method="post" action="{_u('/tcs/import')}" enctype="multipart/form-data">
       <label for="file">TC 엑셀 파일로 한 번에 추가</label>
       <div class="sub" style="margin-bottom:10px">
         확정된 포맷(No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
@@ -907,7 +1082,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
   </div>
 
   <div class="card upload">
-    <form method="post" action="/tcs/import_url">
+    <form method="post" action="{_u('/tcs/import_url')}">
       <label for="gurl">구글 스프레드시트 주소로 추가</label>
       <div class="sub" style="margin-bottom:10px">
         구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름에
@@ -924,7 +1099,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
   </div>
 
   <div class="card">
-    <form method="post" action="/tcs/save">
+    <form method="post" action="{_u('/tcs/save')}">
       <input type="hidden" name="id" value="{_esc(editing.get('id', ''))}">
       <div class="grid">
         <div>
@@ -969,7 +1144,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
       </div>
       <div class="actions" style="margin-top:14px">
         <button type="submit" class="primary">{'TC 수정' if is_edit else 'TC 추가'}</button>
-        {'<a href="/tcs"><button type="button">취소</button></a>' if is_edit else ''}
+        {f'<a href="{_u("/tcs")}"><button type="button">취소</button></a>' if is_edit else ''}
       </div>
     </form>
   </div>
