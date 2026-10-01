@@ -35,11 +35,12 @@ import requests
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
+from tk_clipboard import install_clipboard_support
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.26.0"
+APP_VERSION = "0.27.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -56,10 +57,7 @@ CONFIG_FILENAME = "qa_runner_k_config.json"  # 시작 URL/로그인 정보 등 �
 
 # [NEW v0.25.0] 팀 공용 대시보드(EC2) 주소.
 # [대시보드 바로가기]와 [주소 복사]는 이 주소를 쓴다 - 링크를 팀에 공유하기 위한 버튼이기 때문.
-# 반면 [결과 보기]와 TC 관리는 그대로 로컬 대시보드(127.0.0.1:8765)를 쓴다.
-#   이유: 실행 결과와 스크린샷은 아직 이 PC의 SQLite에만 쌓인다. PC->서버 업로드 API가
-#   없는 상태에서 [결과 보기]까지 서버로 보내면 방금 돌린 결과가 안 보인다.
-#   업로드 API가 생기면 두 경로를 하나로 합칠 것.
+# [결과 보기]와 TC 관리·조회는 기존처럼 로컬 대시보드를 사용한다.
 # 값을 비워두면 [대시보드 바로가기]도 로컬 대시보드로 되돌아간다(서버를 안 쓰는 PC 대비).
 TEAM_DASHBOARD_URL = "https://qa.healthkoob.com/qa-k/"
 
@@ -72,7 +70,7 @@ RESULT_NEEDS_REVIEW = "확인 필요"
 
 # 모달/팝업 판별 셀렉터. 실제 LabConnect staging의 환자 등록 팝업이 role="dialog"를 갖고 있는 걸
 # 브라우저로 직접 확인함(2026-09-11). 여러 곳에서 쓰므로 상수로 둔다.
-MODAL_SELECTOR = 'div[role="dialog"], .modal, [class*="modal"], [class*="popup"]'
+MODAL_SELECTOR = 'div[role="dialog"], .modal, .app-modal-overlay, [class*="modal"], [class*="popup"]'
 
 
 # ============================================================
@@ -896,6 +894,7 @@ class QAWorkerApp:
 
         self._load_local_config()
         self._build_ui()
+        install_clipboard_support(self.root)
         # [NEW v0.4.0] 대시보드에서 TC를 작성할 수 있게 되었으니 시작 시 미리 띄운다
         self._ensure_dashboard()
         self.check_update_and_prompt()

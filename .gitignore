@@ -1,7 +1,41 @@
-# These are some examples of commonly ignored file patterns.
-# You should customize this list as applicable to your project.
-# Learn more about .gitignore:
-#     https://www.atlassian.com/git/tutorials/saving-changes/gitignore
+# QA_runner_K local runtime files
+.venv/
+venv/
+env/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+qa_runner_k_config.json
+
+# SQLite databases and journal files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Screenshots, server volume data, and bundled browsers
+qa_runner_k_screenshots/
+/data/
+ms-playwright/
+
+# Python build artifacts
+build/
+*.egg-info/
 
 # Node artifact files
 node_modules/
@@ -21,7 +55,6 @@ dist/
 
 # Maven
 target/
-dist/
 
 # JetBrains IDE
 .idea/
@@ -47,4 +80,3 @@ Thumbs.db
 *.flv
 *.mov
 *.wmv
-
