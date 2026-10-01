@@ -103,7 +103,7 @@ cd "$HOME/Downloads/QA_runner_K"
 4. 처음에는 **AI 없이 규칙 기반으로만 실행**을 체크한 상태로 진행합니다. 이 모드에서는 API 키가 필요 없습니다. 절차의 `[대괄호]`나 `"따옴표"` 표현을 규칙으로 해석하며, 근거가 부족한 결과는 **확인 필요**로 표시될 수 있습니다.
 5. **TC 소스**를 선택합니다.
    - **로컬 엑셀 파일**: **엑셀 파일 선택...**으로 `.xlsx` 파일을 선택하고 **TC 불러오기**를 누릅니다.
-   - **대시보드 추가 TC**: **대시보드에서 TC 추가/수정...**으로 로컬 TC를 작성하거나 엑셀을 업로드합니다. **실행 포함** 상태로 저장하고 프로그램에서 **TC 불러오기**를 누릅니다. 팀 대시보드에 작성한 TC는 현재 불러오지 않습니다.
+   - **대시보드 추가 TC**: **대시보드에서 TC 추가/수정...**으로 TC를 작성하거나 엑셀을 업로드합니다. **실행 포함** 상태로 저장하고 프로그램에서 **TC 불러오기**를 누릅니다. Python 소스 실행에서는 이 항목을 선택하면 **TC 소스** 제목 옆에 **로컬 QA 대시보드 / 서버** 선택 버튼이 나타납니다. 기본값은 로컬이며, 서버를 선택하면 팀 주소(기본 `https://qa.healthkoob.com/qa-k/`)의 TC 관리·조회 기능을 사용합니다. 서버 조회에는 아래 **서버 전송 토큰**이 필요하며, 서버에도 이 버전의 `dashboard_server.py`를 배포해야 합니다. EXE에서는 기존 로컬 TC 동작을 유지합니다.
    - **EC2 세션**: 연결 가능한 EC2 API 주소를 입력하고 **세션 불러오기**로 세션·시트를 선택한 뒤 **TC 불러오기**를 누릅니다. 로컬 엑셀 또는 로컬 대시보드 TC를 사용할 때는 EC2 세션 연결이 필요 없습니다.
 6. 실행할 TC를 선택하거나 **전체 선택**을 누릅니다. 처음에는 **최대 실행 수**를 `1`로 설정해 동작을 확인하세요. `0`은 실행 수 제한이 없다는 뜻입니다.
 7. **시작**을 누르면 Chromium 창이 열리고 테스트가 진행됩니다. **중지**를 누르면 현재 TC가 완료된 후 멈춥니다.
@@ -148,7 +148,7 @@ TC 관리와 기존 결과 조회만 필요할 때는 본 프로그램 대신 �
 ### 로컬 결과와 팀 대시보드
 
 - **결과 보기**는 이 컴퓨터의 로컬 대시보드를 엽니다.
-- **대시보드 바로가기**는 설정된 팀 대시보드 주소를 엽니다.
+- **대시보드 바로가기 / 주소 복사**는 Python 소스 실행에서는 선택한 대상을 사용하고, EXE에서는 기존 팀 대시보드 주소를 사용합니다.
 - 서버 업로드 토큰을 비워두면 결과는 로컬에만 저장됩니다. 서버에도 결과를 보내려면 팀 대시보드 주소와 서버에서 발급한 업로드 토큰을 설정하고 **연결 확인**을 누르세요.
 
 ## 6. 저장 파일과 종료
@@ -210,3 +210,86 @@ Python 패키지 설치와 브라우저 설치는 별도입니다. 아래 명령
 `deploy/`는 팀 서버에서 **대시보드만** 운영하기 위한 Docker·Nginx 구성입니다. Windows·맥북에서 본 프로그램을 실행할 때는 필요하지 않습니다.
 
 현재 `deploy/docker-compose.yml`은 기존 외부 네트워크 `qa-runner_external`, Nginx 연결, `QA_RUNNER_K_SECRET_KEY` 등의 환경 설정을 전제로 하며, 호스트 포트를 직접 공개하지 않습니다. 로컬 실행용으로 그대로 `docker compose up`을 실행하는 대신 위 Python 실행 절차를 사용하세요.
+
+### v0.28.0 서버 TC 조회 API 적용
+
+`GET https://qa.healthkoob.com/qa-k/api/tcs`는 루트 홈페이지의 `/api/`와 별개입니다. 기존 Nginx의 `/qa-k/` 연결을 통해 **qa-runner-k** 컨테이너의 `GET /api/tcs`로 전달됩니다. 인수인계 문서에 기록된 서버 폴더는 `/opt/qa-runner-k`, 환경 설정은 `/opt/qa-runner-k/deploy/.env`입니다. 실제 서버 경로가 변경됐다면 해당 경로를 사용하세요.
+
+Dockerfile이 Python 소스를 이미지에 `COPY`하므로 **파일 교체 후 재빌드**해야 합니다. Windows EXE 릴리즈나 `docker-compose restart`만으로는 API가 추가되지 않습니다. 저장소에는 서버 자동 배포나 Docker 이미지 레지스트리 push 단계가 없습니다.
+
+**1. 내 PC: 서버용 코드 압축 및 전송**
+
+macOS에서 프로젝트 폴더를 기준으로 실행합니다. 기존 서버의 Docker·Nginx 구성은 유지하며, 대시보드 서버 코드 4개만 전달합니다. `.env`, PC 설정, DB, 스크린샷은 패키지에 포함하지 않습니다.
+
+```bash
+mkdir -p dist
+tar -czf dist/qa-runner-k-v0.28.0-server.tar.gz \
+  dashboard_server.py dashboard_auth.py results_store.py tc_excel.py
+tar -tzf dist/qa-runner-k-v0.28.0-server.tar.gz
+
+# 실제로 사용하는 SSH 키 파일 경로를 넣으세요. 키 내용은 공유하지 않습니다.
+scp -i <키파일경로> dist/qa-runner-k-v0.28.0-server.tar.gz ec2-user@54.180.98.47:/tmp/
+ssh -i <키파일경로> ec2-user@54.180.98.47
+```
+
+**2. 서버: 기존 경로·설정 확인 및 백업**
+
+이하 명령은 SSH로 접속한 **서버에서** 실행합니다. 인수인계 문서의 서버는 `docker-compose`(하이픈)를 사용합니다. `docker compose`가 설치된 서버라면 명령을 그에 맞게 바꾸세요.
+
+```bash
+cd /opt/qa-runner-k/deploy
+sudo docker inspect qa-runner-k --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+sudo test -f .env
+sudo docker exec qa-runner-k python -c 'import os; print("API 토큰 설정:", bool(os.environ.get("QA_RUNNER_K_API_TOKEN", "").strip()))'
+
+qa_k_backup="/opt/qa-runner-k-code-backup-$(date +%Y%m%d-%H%M%S)"
+sudo mkdir -p "$qa_k_backup"
+sudo cp -p /opt/qa-runner-k/dashboard_server.py /opt/qa-runner-k/dashboard_auth.py \
+  /opt/qa-runner-k/results_store.py /opt/qa-runner-k/tc_excel.py "$qa_k_backup/"
+printf '코드 백업: %s\n' "$qa_k_backup"
+
+# SQLite의 backup 기능으로 실행 중에도 일관된 DB 사본을 생성합니다.
+sudo docker exec qa-runner-k python -c 'import os, sqlite3, time; p=os.environ["QA_RUNNER_K_DB_PATH"]; dst=p+".backup-"+time.strftime("%Y%m%d-%H%M%S"); src=sqlite3.connect(p); out=sqlite3.connect(dst); src.backup(out); out.close(); src.close(); print("DB 백업:", dst)'
+```
+
+`/data`가 기존 `/opt/qa-runner-k/data`에 연결됐는지 확인합니다. 토큰이 미설정이면 서버 관리자가 기존 `.env`의 `QA_RUNNER_K_API_TOKEN`을 설정하고, 프로그램에도 같은 값을 입력해야 합니다. 이미 설정된 토큰과 `QA_RUNNER_K_SECRET_KEY`는 유지합니다.
+
+**3. 서버: 코드 반영 및 qa-runner-k만 재빌드**
+
+```bash
+qa_k_stage=$(mktemp -d /tmp/qa-runner-k-deploy.XXXXXX)
+tar -xzf /tmp/qa-runner-k-v0.28.0-server.tar.gz -C "$qa_k_stage"
+sudo cp "$qa_k_stage/dashboard_server.py" "$qa_k_stage/dashboard_auth.py" \
+  "$qa_k_stage/results_store.py" "$qa_k_stage/tc_excel.py" /opt/qa-runner-k/
+
+cd /opt/qa-runner-k/deploy
+sudo docker-compose up -d --build --no-deps qa-runner-k
+sudo docker ps --filter name=qa-runner-k --format '{{.Names}} {{.Status}}'
+sudo docker logs --tail 50 qa-runner-k
+```
+
+재생성하는 동안 `/qa-k/`에 잠깐 접속되지 않을 수 있습니다. `/opt/qa-runner`의 원본 홈페이지 구성, `qa-nginx`, `qa-flask`, `qa-db`는 이번 배포 대상으로 지정하지 않습니다. 기존 `data`와 `.env`를 삭제하거나 교체하지 않으며 TC 재등록은 필요 없습니다. 기존 보관기간 설정에 따른 오래된 실행 결과 정리는 서버 시작 시에도 적용될 수 있습니다.
+
+**4. 배포 검증**
+
+```bash
+# 서버 컨테이너 사이의 API 확인: 인증 토큰 없이 요청
+sudo docker exec qa-nginx curl -sS -o /dev/null -w '%{http_code}\n' \
+  http://qa-runner-k:8765/api/tcs
+
+# 내 PC 또는 서버: 실제 HTTPS 경로 확인 (토큰 없이 요청)
+curl -sS -o /dev/null -w '%{http_code}\n' https://qa.healthkoob.com/qa-k/api/tcs
+
+# 서버: 컨테이너에 설정된 토큰으로 조회. 토큰이나 TC 내용 대신 건수만 출력
+sudo docker exec qa-runner-k python -c 'import os, requests; token=os.environ.get("QA_RUNNER_K_API_TOKEN", "").strip(); r=requests.get("http://127.0.0.1:8765/api/tcs", headers={"Authorization": "Bearer "+token}, timeout=10); print("HTTP:", r.status_code); r.raise_for_status(); rows=r.json(); print("실행 포함 TC:", len(rows))'
+```
+
+- **401**: 토큰 없는 요청에 정상적으로 인증을 요구합니다. API가 등록됐다는 신호입니다.
+- **503**: 서버 API 토큰이 미설정입니다.
+- **404**: 실행 중인 이미지에 새 코드가 없거나 `/qa-k/` 프록시 경로가 맞지 않습니다. 내부 요청은 401인데 외부 요청만 404라면 Nginx 연결을 확인합니다.
+- **200**: 올바른 토큰으로 TC 목록을 조회했습니다. 빈 목록 `[]`이면 서버 DB의 “실행 포함” TC가 없는 것입니다.
+- **SSL 인증서 오류**: 서버 인증서 갱신·적용을 확인합니다. `-k`나 `verify=False`로 검증을 끄지 않습니다.
+
+마지막으로 Python 프로그램에서 **대시보드 추가 TC → 서버 → TC 불러오기**로 HTTPS 경로와 토큰까지 확인합니다. **EC2 세션**의 `/api/sessions/...`는 다른 서비스의 조회 경로이며 이번 `/qa-k/api/tcs` 배포와 구분됩니다.
+
+**코드만 되돌릴 때**는 위에서 기록한 백업 폴더의 Python 파일 4개를 `/opt/qa-runner-k/`에 복사한 후 같은 재빌드 명령을 실행합니다. `data`나 `.env`를 과거 사본으로 덮어쓰지 않습니다.

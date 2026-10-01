@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.parse
 
-from flask import Flask, request, send_file, abort, redirect, url_for
+from flask import Flask, request, send_file, abort, redirect, url_for, jsonify
 
 import dashboard_auth
 import results_store
@@ -162,6 +162,13 @@ def create_app(db_path=None):
     def api_ping():
         """프로그램이 '주소와 토큰이 맞는지'만 확인할 때 쓴다. 결과를 보내기 전에 부른다."""
         return {"ok": True, "app": APP_MARKER}
+
+    @app.route("/api/tcs", methods=["GET"])
+    @dashboard_auth.api_token_required
+    def api_tcs():
+        """소스 실행 클라이언트에 실행 포함 상태의 TC만 제공한다."""
+        return jsonify(results_store.list_custom_tcs(
+            only_enabled=True, db_path=app.config["DB_PATH"]))
 
     @app.route("/api/results", methods=["POST"])
     @dashboard_auth.api_token_required
