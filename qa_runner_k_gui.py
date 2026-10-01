@@ -36,11 +36,12 @@ import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대�
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
 from tk_clipboard import install_clipboard_support
+from tk_scrollable import ScrollableFrame
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.28.0"
+APP_VERSION = "0.29.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -70,7 +71,25 @@ RESULT_NEEDS_REVIEW = "확인 필요"
 
 # 모달/팝업 판별 셀렉터. 실제 LabConnect staging의 환자 등록 팝업이 role="dialog"를 갖고 있는 걸
 # 브라우저로 직접 확인함(2026-09-11). 여러 곳에서 쓰므로 상수로 둔다.
-MODAL_SELECTOR = 'div[role="dialog"], .modal, .app-modal-overlay, [class*="modal"], [class*="popup"]'
+MODAL_SELECTOR = '[role="dialog"], .modal, [class*="modal"], [class*="popup"]'
+
+
+def visible_modal_locator(page):
+    """숨겨진 다른 팝업이 DOM 뒤에 있어도 현재 열린 팝업을 찾는다."""
+    selector = ", ".join(f"{part.strip()}:visible" for part in MODAL_SELECTOR.split(","))
+    return page.locator(selector)
+
+
+def is_modal_visible(page):
+    return visible_modal_locator(page).count() > 0
+
+
+def expects_popup_closed(tc):
+    expected = str(tc.get("expected") or "")
+    return bool(re.search(
+        r"(?:팝업|모달|dialog|레이어)[^.!?\n]{0,40}(?:닫|사라|종료|없어|미노출|노출되지)",
+        expected, re.IGNORECASE,
+    ))
 
 
 # ============================================================
@@ -87,7 +106,7 @@ def get_scoped_locator(page, selector: str):
     """모달/팝업이 열려 있으면 그 안에서 우선 탐색하고, 없으면 page 전체에서 탐색.
     원본의 '엉뚱한 배경 요소를 잘못 클릭하는 문제' 방지 로직을 그대로 가져옴."""
     try:
-        modal = page.locator(MODAL_SELECTOR).last
+        modal = visible_modal_locator(page).last
         if modal.is_visible(timeout=500):
             scoped = modal.locator(selector)
             if scoped.count() > 0:
@@ -391,11 +410,18 @@ def build_rule_actions(tc: dict) -> list:
         # 2) 클릭: [대괄호]로 명시된 대상만 클릭한다. 대괄호가 없으면 클릭 액션을 만들지 않음
         #    (원본 사고: 대상이 불명확할 때 AI가 '환자 등록' 같은 엉뚱한 버튼을 눌렀음)
         if has_click and brackets:
-            for target in brackets:
+            for match in re.finditer(r"\[([^\]]+)\]", line):
+                target = match.group(1)
+                # '[환자 등록] 클릭 시 [환자 등록] 팝업이 열린다'의 두 번째
+                # 대괄호는 클릭 대상이 아니라 결과 설명이다.
+                tail = line[match.end():].split("[", 1)[0]
+                if re.match(r"\s*(?:팝업|모달|dialog|레이어)", tail, re.IGNORECASE):
+                    continue
                 action = {"type": "click", "selector": _click_selector(target),
                           "description": target}  # 엔진이 "클릭: {desc}"로 찍으므로 대상만 담는다
                 if wait_hint:
-                    action["wait"] = wait_hint
+                    action["wait"] = ("dialog_hidden" if wait_hint == "dialog"
+                                      and target.strip() in ("취소", "닫기", "닫음") else wait_hint)
                 actions.append(action)
 
         # 3) 엔터
@@ -516,7 +542,8 @@ def extract_expected_keywords(expected: str) -> list:
     return targets
 
 
-def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None):
+def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None,
+                  modal_seen=False):
     """AI 없이 코드로만 하는 보수적 판정. (judgment, reason) 반환.
 
     확실한 근거가 있을 때만 PASS를 주고, 근거를 못 찾으면 FAIL이 아니라 "확인 필요"로 둔다.
@@ -539,6 +566,11 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
     missing = [k for k in keywords if k not in body]
 
     if verify_type == VERIFY_POPUP:
+        if expects_popup_closed(tc):
+            if modal_seen and modal_visible is False:
+                return RESULT_PASS, "절차 중 팝업이 열린 뒤 마지막 화면에서 닫힌 것을 확인함"
+            return RESULT_NEEDS_REVIEW, ("팝업이 아직 열려 있음" if modal_visible
+                                        else "팝업이 열렸던 근거가 없어 닫힘 판정을 보류함")
         if modal_visible:
             extra = f" / 내용 확인: {', '.join(found[:4])}" if found else ""
             return RESULT_PASS, f"팝업(모달) 요소가 화면에 떠 있음{extra}"
@@ -591,6 +623,7 @@ class TCExecutionEngine:
         self.page = page
         self.log_fn = log_fn
         self.failed_actions = []   # [v0.21.0] 실패한 액션 기록 - 판정에서 PASS를 막는 근거
+        self.modal_seen = False
 
     def _is_dangerous(self, action: dict, tc_steps_text: str) -> bool:
         sel = (action.get("selector") or "").lower()
@@ -612,6 +645,7 @@ class TCExecutionEngine:
         """액션 리스트를 순서대로 실행하고, 실제 실행된 액션 설명 리스트를 반환."""
         actions_done = []
         self.failed_actions = []
+        self.modal_seen = is_modal_visible(self.page)
         tc_steps_text = tc.get("steps", "")
 
         for action in actions:
@@ -643,6 +677,8 @@ class TCExecutionEngine:
                 self.failed_actions.append(f"{desc}: {str(e)[:80]}")
                 self.log_fn(f"  ⚠ 액션 실행 실패 ({desc}): {str(e)[:80]}")
 
+            self.modal_seen = self.modal_seen or is_modal_visible(self.page)
+
         return actions_done
 
     # ---- 개별 액션 실행 (원본 로직 이식) ----
@@ -664,6 +700,7 @@ class TCExecutionEngine:
             return
 
         url_before = self.page.url
+        self.modal_seen = self.modal_seen or is_modal_visible(self.page)
         el.click()
         self._wait_after_click(url_before, action.get("wait"))
         self.log_fn(f"  ✓ 클릭: {desc}")
@@ -679,12 +716,19 @@ class TCExecutionEngine:
         확정적으로 알고 있으므로 그 조건만 넉넉히(5초) 기다린다. 힌트가 없으면
         ① 모달 등장 ② URL 변경 ③ 네트워크 유휴 순으로 시도하고, 마지막에만 짧게 고정 대기.
         """
-        if wait_hint == "dialog":
+        if wait_hint in ("dialog", "dialog_hidden"):
             try:
-                self.page.wait_for_selector(MODAL_SELECTOR, timeout=5000, state="visible")
+                # :visible로 좁혀 strict 다중 매칭과 숨겨진 첫 후보 문제를 피한다.
+                visible_modal_locator(self.page).last.wait_for(
+                    timeout=5000, state="hidden" if wait_hint == "dialog_hidden" else "visible"
+                )
+                if wait_hint == "dialog":
+                    self.modal_seen = True
                 return
             except Exception:
-                self.log_fn("  ⚠ 팝업이 5초 안에 나타나지 않음 (판정에서 확인 필요로 남을 수 있음)")
+                self.log_fn("  ⚠ 팝업이 5초 안에 " + (
+                    "닫히지 않음" if wait_hint == "dialog_hidden" else "나타나지 않음"
+                ) + " (판정에서 확인 필요로 남을 수 있음)")
                 return
         if wait_hint == "url":
             try:
@@ -698,7 +742,8 @@ class TCExecutionEngine:
                 return
 
         try:
-            self.page.wait_for_selector(MODAL_SELECTOR, timeout=1200, state="visible")
+            visible_modal_locator(self.page).last.wait_for(timeout=1200, state="visible")
+            self.modal_seen = True
         except Exception:
             try:
                 self.page.wait_for_function(
@@ -872,9 +917,8 @@ class QAWorkerApp:
 
         # [NEW] TC 소스: 로컬 엑셀 파일을 바로 읽거나(local), 기존처럼 EC2 세션에서 불러오거나(ec2)
         self.tc_source_var = tk.StringVar(value="local")
-        # 소스 실행에서만 명시적으로 서버 TC를 선택한다. 기존 EXE는 로컬 동작 유지.
-        self.dashboard_target_var = (tk.StringVar(value="local")
-                                     if not getattr(sys, "frozen", False) else None)
+        # Python/EXE 모두 연결 대상을 선택할 수 있다. 기본값은 기존처럼 로컬.
+        self.dashboard_target_var = tk.StringVar(value="local")
         self._dashboard_target = "local"
         self.local_xlsx_path_var = tk.StringVar(value="")
         self._dashboard_addr = None  # (host, port) - "결과 보기"로 이미 띄운 서버가 있으면 재사용
@@ -942,7 +986,10 @@ class QAWorkerApp:
 
     # ---- UI 구성 ----                                        [TODO: 실제 배치는 원본 GUI 참고해 다듬기]
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=8)
+        self.scroll_area = ScrollableFrame(self.root)
+        self.scroll_area.pack(fill="both", expand=True)
+        content = self.scroll_area.content
+        top = ttk.Frame(content, padding=8)
         top.pack(fill="x")
 
         ttk.Label(top, text="EC2 API").grid(row=0, column=0, sticky="w")
@@ -963,7 +1010,7 @@ class QAWorkerApp:
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         # [NEW] 시작 지점 설정 영역 - TC 엑셀과 분리
-        start_frame = ttk.LabelFrame(self.root, text="시작 지점 / 로그인 설정", padding=8)
+        start_frame = ttk.LabelFrame(content, text="시작 지점 / 로그인 설정", padding=8)
         start_frame.pack(fill="x", padx=8, pady=4)
         ttk.Label(start_frame, text="시작 URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(start_frame, textvariable=self.start_url_var, width=50).grid(row=0, column=1, sticky="w")
@@ -977,7 +1024,7 @@ class QAWorkerApp:
         ttk.Button(start_frame, text="저장", command=self._save_local_config).grid(row=3, column=2, padx=4)
 
         # [NEW] TC 소스 선택 영역 - 로컬 엑셀 파일을 바로 읽을지, EC2 세션에서 불러올지
-        source_frame = ttk.LabelFrame(self.root, text="TC 소스", padding=8)
+        source_frame = ttk.LabelFrame(content, text="TC 소스", padding=8)
         source_frame.pack(fill="x", padx=8, pady=4)
         self.dashboard_target_frame = None
         if self.dashboard_target_var is not None:
@@ -1028,7 +1075,7 @@ class QAWorkerApp:
         self.sheet_combo.bind("<<ComboboxSelected>>", lambda event: self._clear_ec2_tc_list())
 
         # 세션/시트/TC 선택 영역
-        sel_frame = ttk.LabelFrame(self.root, text="TC 목록", padding=8)
+        sel_frame = ttk.LabelFrame(content, text="TC 목록", padding=8)
         sel_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         ttk.Button(sel_frame, text="TC 불러오기", command=self.load_tc_list).grid(row=0, column=0)
@@ -1038,11 +1085,16 @@ class QAWorkerApp:
 
         self.tc_listbox = tk.Listbox(sel_frame, selectmode="extended", width=100, height=15)
         self.tc_listbox.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=4)
+        tc_scroll = ttk.Scrollbar(sel_frame, orient="vertical", command=self.tc_listbox.yview)
+        tc_scroll.grid(row=1, column=4, sticky="ns", pady=4)
+        self.tc_listbox.configure(yscrollcommand=tc_scroll.set)
+        sel_frame.rowconfigure(1, weight=1)
+        sel_frame.columnconfigure(0, weight=1)
         ttk.Button(sel_frame, text="전체 선택", command=self.select_all_tc).grid(row=2, column=0)
         ttk.Button(sel_frame, text="선택 해제", command=self.deselect_all_tc).grid(row=2, column=1)
 
         # 실행 제어
-        ctrl_frame = ttk.Frame(self.root, padding=8)
+        ctrl_frame = ttk.Frame(content, padding=8)
         ctrl_frame.pack(fill="x")
         ttk.Label(ctrl_frame, text="최대 실행 수(0=전체)").pack(side="left")
         ttk.Entry(ctrl_frame, textvariable=self.limit_var, width=6).pack(side="left")
@@ -1058,7 +1110,7 @@ class QAWorkerApp:
         # [v0.25.0] 노출/복사하는 주소를 팀 공용 서버 주소로 바꿨다. 예전에는 읽기 전용으로
         # 로컬 주소를 보여줬는데, 팀에 링크를 넘길 때 쓸 수 없는 주소였다.
         # 입력 가능하게 둬서 서버 주소가 바뀌어도 빌드 없이 고칠 수 있다.
-        dash_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        dash_frame = ttk.Frame(content, padding=(8, 0, 8, 6))
         dash_frame.pack(fill="x")
         ttk.Button(dash_frame, text="대시보드 바로가기",
                    command=self.open_dashboard).pack(side="left")
@@ -1074,7 +1126,7 @@ class QAWorkerApp:
         # [NEW v0.26.0] 결과를 서버로도 보내기 위한 토큰 줄.
         # 토큰은 서버에서 만들어 서버 .env 에 넣고, 같은 값을 여기에 붙여넣는다.
         # 비워두면 전송을 아예 하지 않으므로, 서버를 안 쓰는 PC도 지금까지처럼 동작한다.
-        up_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        up_frame = ttk.Frame(content, padding=(8, 0, 8, 6))
         up_frame.pack(fill="x")
         ttk.Label(up_frame, text="서버 전송 토큰").pack(side="left")
         ttk.Entry(up_frame, textvariable=self.api_token_var, width=30,
@@ -1085,9 +1137,12 @@ class QAWorkerApp:
                   foreground="#777").pack(side="left", padx=(8, 0))
 
         # 로그
-        log_frame = ttk.LabelFrame(self.root, text="로그", padding=4)
+        log_frame = ttk.LabelFrame(content, text="로그", padding=4)
         log_frame.pack(fill="both", expand=True, padx=8, pady=4)
         self.log_text = tk.Text(log_frame, height=15, state="disabled")
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(fill="both", expand=True)
 
         self._on_tc_source_change()  # 초기 상태: local/ec2 프레임 중 하나만 보이도록 정리
@@ -2091,12 +2146,13 @@ class QAWorkerApp:
             # [NEW] AI 없이 코드로 판정. 근거를 못 찾으면 FAIL이 아니라 "확인 필요".
             # 팝업확인/화면이동 TC는 텍스트보다 확실한 근거(모달 존재, URL 변경)를 같이 넘긴다.
             try:
-                modal_visible = page.locator(MODAL_SELECTOR).last.is_visible(timeout=500)
+                modal_visible = is_modal_visible(page)
             except Exception:
                 modal_visible = False
             judgment, reason = judge_by_text(
                 tc, body_text, modal_visible=modal_visible,
                 url_changed=(page.url != url_before_actions),
+                modal_seen=getattr(engine, "modal_seen", False),
             )
             reason = f"[코드 판정] {reason}"
         else:
