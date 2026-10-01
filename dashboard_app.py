@@ -22,6 +22,7 @@ from tkinter import ttk
 
 import dashboard_server
 import results_store
+from tk_clipboard import install_clipboard_support
 
 APP_TITLE = "QA_runner_K 대시보드"
 
@@ -98,6 +99,7 @@ def _show_window(url, already_running, minimized=False):
     ttk.Label(frm, text=note + "  ·  TC 실행은 QA_Runner_K.exe에서 합니다.",
               foreground="#777", wraplength=430).pack(anchor="w")
 
+    install_clipboard_support(root)
     root.mainloop()
 
 
