@@ -35,11 +35,13 @@ import requests
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
+from tk_clipboard import install_clipboard_support
+from tk_scrollable import ScrollableFrame
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.29.0"
+APP_VERSION = "0.30.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -56,10 +58,7 @@ CONFIG_FILENAME = "qa_runner_k_config.json"  # 시작 URL/로그인 정보 등 �
 
 # [NEW v0.25.0] 팀 공용 대시보드(EC2) 주소.
 # [대시보드 바로가기]와 [주소 복사]는 이 주소를 쓴다 - 링크를 팀에 공유하기 위한 버튼이기 때문.
-# 반면 [결과 보기]와 TC 관리는 그대로 로컬 대시보드(127.0.0.1:8765)를 쓴다.
-#   이유: 실행 결과와 스크린샷은 아직 이 PC의 SQLite에만 쌓인다. PC->서버 업로드 API가
-#   없는 상태에서 [결과 보기]까지 서버로 보내면 방금 돌린 결과가 안 보인다.
-#   업로드 API가 생기면 두 경로를 하나로 합칠 것.
+# [결과 보기]와 TC 관리·조회는 기존처럼 로컬 대시보드를 사용한다.
 # 값을 비워두면 [대시보드 바로가기]도 로컬 대시보드로 되돌아간다(서버를 안 쓰는 PC 대비).
 TEAM_DASHBOARD_URL = "https://qa.healthkoob.com/qa-k/"
 
@@ -72,7 +71,25 @@ RESULT_NEEDS_REVIEW = "확인 필요"
 
 # 모달/팝업 판별 셀렉터. 실제 LabConnect staging의 환자 등록 팝업이 role="dialog"를 갖고 있는 걸
 # 브라우저로 직접 확인함(2026-09-11). 여러 곳에서 쓰므로 상수로 둔다.
-MODAL_SELECTOR = 'div[role="dialog"], .modal, [class*="modal"], [class*="popup"]'
+MODAL_SELECTOR = '[role="dialog"], .modal, [class*="modal"], [class*="popup"]'
+
+
+def visible_modal_locator(page):
+    """숨겨진 다른 팝업이 DOM 뒤에 있어도 현재 열린 팝업을 찾는다."""
+    selector = ", ".join(f"{part.strip()}:visible" for part in MODAL_SELECTOR.split(","))
+    return page.locator(selector)
+
+
+def is_modal_visible(page):
+    return visible_modal_locator(page).count() > 0
+
+
+def expects_popup_closed(tc):
+    expected = str(tc.get("expected") or "")
+    return bool(re.search(
+        r"(?:팝업|모달|dialog|레이어)[^.!?\n]{0,40}(?:닫|사라|종료|없어|미노출|노출되지)",
+        expected, re.IGNORECASE,
+    ))
 
 
 # ============================================================
@@ -89,7 +106,7 @@ def get_scoped_locator(page, selector: str):
     """모달/팝업이 열려 있으면 그 안에서 우선 탐색하고, 없으면 page 전체에서 탐색.
     원본의 '엉뚱한 배경 요소를 잘못 클릭하는 문제' 방지 로직을 그대로 가져옴."""
     try:
-        modal = page.locator(MODAL_SELECTOR).last
+        modal = visible_modal_locator(page).last
         if modal.is_visible(timeout=500):
             scoped = modal.locator(selector)
             if scoped.count() > 0:
@@ -393,11 +410,18 @@ def build_rule_actions(tc: dict) -> list:
         # 2) 클릭: [대괄호]로 명시된 대상만 클릭한다. 대괄호가 없으면 클릭 액션을 만들지 않음
         #    (원본 사고: 대상이 불명확할 때 AI가 '환자 등록' 같은 엉뚱한 버튼을 눌렀음)
         if has_click and brackets:
-            for target in brackets:
+            for match in re.finditer(r"\[([^\]]+)\]", line):
+                target = match.group(1)
+                # '[환자 등록] 클릭 시 [환자 등록] 팝업이 열린다'의 두 번째
+                # 대괄호는 클릭 대상이 아니라 결과 설명이다.
+                tail = line[match.end():].split("[", 1)[0]
+                if re.match(r"\s*(?:팝업|모달|dialog|레이어)", tail, re.IGNORECASE):
+                    continue
                 action = {"type": "click", "selector": _click_selector(target),
                           "description": target}  # 엔진이 "클릭: {desc}"로 찍으므로 대상만 담는다
                 if wait_hint:
-                    action["wait"] = wait_hint
+                    action["wait"] = ("dialog_hidden" if wait_hint == "dialog"
+                                      and target.strip() in ("취소", "닫기", "닫음") else wait_hint)
                 actions.append(action)
 
         # 3) 엔터
@@ -518,7 +542,8 @@ def extract_expected_keywords(expected: str) -> list:
     return targets
 
 
-def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None):
+def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None,
+                  modal_seen=False):
     """AI 없이 코드로만 하는 보수적 판정. (judgment, reason) 반환.
 
     확실한 근거가 있을 때만 PASS를 주고, 근거를 못 찾으면 FAIL이 아니라 "확인 필요"로 둔다.
@@ -541,6 +566,11 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
     missing = [k for k in keywords if k not in body]
 
     if verify_type == VERIFY_POPUP:
+        if expects_popup_closed(tc):
+            if modal_seen and modal_visible is False:
+                return RESULT_PASS, "절차 중 팝업이 열린 뒤 마지막 화면에서 닫힌 것을 확인함"
+            return RESULT_NEEDS_REVIEW, ("팝업이 아직 열려 있음" if modal_visible
+                                        else "팝업이 열렸던 근거가 없어 닫힘 판정을 보류함")
         if modal_visible:
             extra = f" / 내용 확인: {', '.join(found[:4])}" if found else ""
             return RESULT_PASS, f"팝업(모달) 요소가 화면에 떠 있음{extra}"
@@ -593,6 +623,7 @@ class TCExecutionEngine:
         self.page = page
         self.log_fn = log_fn
         self.failed_actions = []   # [v0.21.0] 실패한 액션 기록 - 판정에서 PASS를 막는 근거
+        self.modal_seen = False
 
     def _is_dangerous(self, action: dict, tc_steps_text: str) -> bool:
         sel = (action.get("selector") or "").lower()
@@ -614,6 +645,7 @@ class TCExecutionEngine:
         """액션 리스트를 순서대로 실행하고, 실제 실행된 액션 설명 리스트를 반환."""
         actions_done = []
         self.failed_actions = []
+        self.modal_seen = is_modal_visible(self.page)
         tc_steps_text = tc.get("steps", "")
 
         for action in actions:
@@ -645,6 +677,8 @@ class TCExecutionEngine:
                 self.failed_actions.append(f"{desc}: {str(e)[:80]}")
                 self.log_fn(f"  ⚠ 액션 실행 실패 ({desc}): {str(e)[:80]}")
 
+            self.modal_seen = self.modal_seen or is_modal_visible(self.page)
+
         return actions_done
 
     # ---- 개별 액션 실행 (원본 로직 이식) ----
@@ -666,6 +700,7 @@ class TCExecutionEngine:
             return
 
         url_before = self.page.url
+        self.modal_seen = self.modal_seen or is_modal_visible(self.page)
         el.click()
         self._wait_after_click(url_before, action.get("wait"))
         self.log_fn(f"  ✓ 클릭: {desc}")
@@ -681,12 +716,19 @@ class TCExecutionEngine:
         확정적으로 알고 있으므로 그 조건만 넉넉히(5초) 기다린다. 힌트가 없으면
         ① 모달 등장 ② URL 변경 ③ 네트워크 유휴 순으로 시도하고, 마지막에만 짧게 고정 대기.
         """
-        if wait_hint == "dialog":
+        if wait_hint in ("dialog", "dialog_hidden"):
             try:
-                self.page.wait_for_selector(MODAL_SELECTOR, timeout=5000, state="visible")
+                # :visible로 좁혀 strict 다중 매칭과 숨겨진 첫 후보 문제를 피한다.
+                visible_modal_locator(self.page).last.wait_for(
+                    timeout=5000, state="hidden" if wait_hint == "dialog_hidden" else "visible"
+                )
+                if wait_hint == "dialog":
+                    self.modal_seen = True
                 return
             except Exception:
-                self.log_fn("  ⚠ 팝업이 5초 안에 나타나지 않음 (판정에서 확인 필요로 남을 수 있음)")
+                self.log_fn("  ⚠ 팝업이 5초 안에 " + (
+                    "닫히지 않음" if wait_hint == "dialog_hidden" else "나타나지 않음"
+                ) + " (판정에서 확인 필요로 남을 수 있음)")
                 return
         if wait_hint == "url":
             try:
@@ -700,7 +742,8 @@ class TCExecutionEngine:
                 return
 
         try:
-            self.page.wait_for_selector(MODAL_SELECTOR, timeout=1200, state="visible")
+            visible_modal_locator(self.page).last.wait_for(timeout=1200, state="visible")
+            self.modal_seen = True
         except Exception:
             try:
                 self.page.wait_for_function(
@@ -874,6 +917,9 @@ class QAWorkerApp:
 
         # [NEW] TC 소스: 로컬 엑셀 파일을 바로 읽거나(local), 기존처럼 EC2 세션에서 불러오거나(ec2)
         self.tc_source_var = tk.StringVar(value="local")
+        # Python/EXE 모두 연결 대상을 선택할 수 있다. 기본값은 기존처럼 로컬.
+        self.dashboard_target_var = tk.StringVar(value="local")
+        self._dashboard_target = "local"
         self.local_xlsx_path_var = tk.StringVar(value="")
         self._dashboard_addr = None  # (host, port) - "결과 보기"로 이미 띄운 서버가 있으면 재사용
         # [NEW v0.11.0] 대시보드 주소를 화면에 띄워서 복사/북마크할 수 있게 한다.
@@ -896,6 +942,7 @@ class QAWorkerApp:
 
         self._load_local_config()
         self._build_ui()
+        install_clipboard_support(self.root)
         # [NEW v0.4.0] 대시보드에서 TC를 작성할 수 있게 되었으니 시작 시 미리 띄운다
         self._ensure_dashboard()
         self.check_update_and_prompt()
@@ -939,7 +986,10 @@ class QAWorkerApp:
 
     # ---- UI 구성 ----                                        [TODO: 실제 배치는 원본 GUI 참고해 다듬기]
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=8)
+        self.scroll_area = ScrollableFrame(self.root)
+        self.scroll_area.pack(fill="both", expand=True)
+        content = self.scroll_area.content
+        top = ttk.Frame(content, padding=8)
         top.pack(fill="x")
 
         ttk.Label(top, text="EC2 API").grid(row=0, column=0, sticky="w")
@@ -960,7 +1010,7 @@ class QAWorkerApp:
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         # [NEW] 시작 지점 설정 영역 - TC 엑셀과 분리
-        start_frame = ttk.LabelFrame(self.root, text="시작 지점 / 로그인 설정", padding=8)
+        start_frame = ttk.LabelFrame(content, text="시작 지점 / 로그인 설정", padding=8)
         start_frame.pack(fill="x", padx=8, pady=4)
         ttk.Label(start_frame, text="시작 URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(start_frame, textvariable=self.start_url_var, width=50).grid(row=0, column=1, sticky="w")
@@ -974,8 +1024,20 @@ class QAWorkerApp:
         ttk.Button(start_frame, text="저장", command=self._save_local_config).grid(row=3, column=2, padx=4)
 
         # [NEW] TC 소스 선택 영역 - 로컬 엑셀 파일을 바로 읽을지, EC2 세션에서 불러올지
-        source_frame = ttk.LabelFrame(self.root, text="TC 소스", padding=8)
+        source_frame = ttk.LabelFrame(content, text="TC 소스", padding=8)
         source_frame.pack(fill="x", padx=8, pady=4)
+        self.dashboard_target_frame = None
+        if self.dashboard_target_var is not None:
+            source_header = ttk.Frame(source_frame)
+            ttk.Label(source_header, text="TC 소스").pack(side="left")
+            self.dashboard_target_frame = ttk.Frame(source_header)
+            ttk.Radiobutton(self.dashboard_target_frame, text="로컬 QA 대시보드",
+                            variable=self.dashboard_target_var, value="local",
+                            command=self._on_dashboard_target_change).pack(side="left")
+            ttk.Radiobutton(self.dashboard_target_frame, text="서버 (qa.healthkoob.com)",
+                            variable=self.dashboard_target_var, value="server",
+                            command=self._on_dashboard_target_change).pack(side="left", padx=8)
+            source_frame.configure(labelwidget=source_header)
         ttk.Radiobutton(source_frame, text="로컬 엑셀 파일", variable=self.tc_source_var,
                         value="local", command=self._on_tc_source_change).grid(row=0, column=0, sticky="w")
         # [NEW v0.4.0] 대시보드 화면에서 직접 추가한 TC로 실행
@@ -1003,18 +1065,17 @@ class QAWorkerApp:
         self.ec2_session_frame = ttk.Frame(source_frame)
         self.ec2_session_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Button(self.ec2_session_frame, text="세션 불러오기", command=self.load_sessions).grid(row=0, column=0)
-        # [v0.29.0] 콤보박스를 변수로 들고 있어야 목록을 채울 수 있다.
-        # 예전에는 생성만 하고 참조를 안 남겨서, 세션을 불러와도 채울 방법이 없었다.
         self.session_combo = ttk.Combobox(self.ec2_session_frame, textvariable=self.session_var,
-                                          width=34, state="readonly")
-        self.session_combo.grid(row=0, column=1, padx=4)
-        self.session_combo.bind("<<ComboboxSelected>>", lambda e: self._fill_sheets())
+                                         width=30, state="readonly")
+        self.session_combo.grid(row=0, column=1)
+        self.session_combo.bind("<<ComboboxSelected>>", lambda event: self.load_sheets())
         self.sheet_combo = ttk.Combobox(self.ec2_session_frame, textvariable=self.sheet_var,
-                                        width=20, state="readonly")
+                                       width=20, state="readonly")
         self.sheet_combo.grid(row=0, column=2)
+        self.sheet_combo.bind("<<ComboboxSelected>>", lambda event: self._clear_ec2_tc_list())
 
         # 세션/시트/TC 선택 영역
-        sel_frame = ttk.LabelFrame(self.root, text="TC 목록", padding=8)
+        sel_frame = ttk.LabelFrame(content, text="TC 목록", padding=8)
         sel_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         ttk.Button(sel_frame, text="TC 불러오기", command=self.load_tc_list).grid(row=0, column=0)
@@ -1024,11 +1085,16 @@ class QAWorkerApp:
 
         self.tc_listbox = tk.Listbox(sel_frame, selectmode="extended", width=100, height=15)
         self.tc_listbox.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=4)
+        tc_scroll = ttk.Scrollbar(sel_frame, orient="vertical", command=self.tc_listbox.yview)
+        tc_scroll.grid(row=1, column=4, sticky="ns", pady=4)
+        self.tc_listbox.configure(yscrollcommand=tc_scroll.set)
+        sel_frame.rowconfigure(1, weight=1)
+        sel_frame.columnconfigure(0, weight=1)
         ttk.Button(sel_frame, text="전체 선택", command=self.select_all_tc).grid(row=2, column=0)
         ttk.Button(sel_frame, text="선택 해제", command=self.deselect_all_tc).grid(row=2, column=1)
 
         # 실행 제어
-        ctrl_frame = ttk.Frame(self.root, padding=8)
+        ctrl_frame = ttk.Frame(content, padding=8)
         ctrl_frame.pack(fill="x")
         ttk.Label(ctrl_frame, text="최대 실행 수(0=전체)").pack(side="left")
         ttk.Entry(ctrl_frame, textvariable=self.limit_var, width=6).pack(side="left")
@@ -1044,7 +1110,7 @@ class QAWorkerApp:
         # [v0.25.0] 노출/복사하는 주소를 팀 공용 서버 주소로 바꿨다. 예전에는 읽기 전용으로
         # 로컬 주소를 보여줬는데, 팀에 링크를 넘길 때 쓸 수 없는 주소였다.
         # 입력 가능하게 둬서 서버 주소가 바뀌어도 빌드 없이 고칠 수 있다.
-        dash_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        dash_frame = ttk.Frame(content, padding=(8, 0, 8, 6))
         dash_frame.pack(fill="x")
         ttk.Button(dash_frame, text="대시보드 바로가기",
                    command=self.open_dashboard).pack(side="left")
@@ -1060,7 +1126,7 @@ class QAWorkerApp:
         # [NEW v0.26.0] 결과를 서버로도 보내기 위한 토큰 줄.
         # 토큰은 서버에서 만들어 서버 .env 에 넣고, 같은 값을 여기에 붙여넣는다.
         # 비워두면 전송을 아예 하지 않으므로, 서버를 안 쓰는 PC도 지금까지처럼 동작한다.
-        up_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        up_frame = ttk.Frame(content, padding=(8, 0, 8, 6))
         up_frame.pack(fill="x")
         ttk.Label(up_frame, text="서버 전송 토큰").pack(side="left")
         ttk.Entry(up_frame, textvariable=self.api_token_var, width=30,
@@ -1071,9 +1137,12 @@ class QAWorkerApp:
                   foreground="#777").pack(side="left", padx=(8, 0))
 
         # 로그
-        log_frame = ttk.LabelFrame(self.root, text="로그", padding=4)
+        log_frame = ttk.LabelFrame(content, text="로그", padding=4)
         log_frame.pack(fill="both", expand=True, padx=8, pady=4)
         self.log_text = tk.Text(log_frame, height=15, state="disabled")
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(fill="both", expand=True)
 
         self._on_tc_source_change()  # 초기 상태: local/ec2 프레임 중 하나만 보이도록 정리
@@ -1088,6 +1157,11 @@ class QAWorkerApp:
         for f in frames.values():
             f.grid_remove()
         frames.get(self.tc_source_var.get(), self.local_file_frame).grid()
+        if self.dashboard_target_frame is not None:
+            if self.tc_source_var.get() == "custom":
+                self.dashboard_target_frame.pack(side="left", padx=(12, 0))
+            else:
+                self.dashboard_target_frame.pack_forget()
 
     def _choose_local_xlsx(self):
         path = filedialog.askopenfilename(
@@ -1187,21 +1261,25 @@ class QAWorkerApp:
         return base + path
 
     def open_dashboard(self):
-        """[대시보드 바로가기] - 팀 공용 대시보드를 새 창으로.
-        [NEW v0.11.0] / [v0.25.0] 로컬 주소 -> 팀 서버 주소로 변경.
-
-        주의: 실행 결과는 아직 이 PC에만 쌓이므로 방금 돌린 결과는 여기서 안 보인다.
-        그건 [결과 보기](로컬)에서 본다. PC->서버 업로드 API가 생기면 하나로 합칠 것."""
+        """소스 실행은 선택한 대상, 기존 EXE는 팀 대시보드를 연다."""
+        if getattr(self, "dashboard_target_var", None) is not None:
+            if not self._uses_server_dashboard():
+                self._ensure_dashboard()
+            self._open_browser(self._selected_dashboard_url())
+            return
         if not (self.team_url_var.get() or "").strip():
             self._ensure_dashboard()  # 로컬로 되돌아가는 경우에만 서버를 띄운다
         self._open_browser(self._team_url())
 
     def copy_dashboard_url(self):
-        """주소를 클립보드로. 다른 브라우저나 메신저에 붙여넣을 때 쓴다.
-        [NEW v0.11.0] / [v0.25.0] 팀 서버 주소를 복사한다 - 남에게 보낼 수 있는 주소여야 하므로."""
-        if not (self.team_url_var.get() or "").strip():
+        """소스 실행은 선택한 대상, 기존 EXE는 팀 대시보드 주소를 복사한다."""
+        if (getattr(self, "dashboard_target_var", None) is not None
+                and not self._uses_server_dashboard()):
             self._ensure_dashboard()
-        url = self._team_url()
+        elif not (self.team_url_var.get() or "").strip():
+            self._ensure_dashboard()
+        url = (self._selected_dashboard_url()
+               if getattr(self, "dashboard_target_var", None) is not None else self._team_url())
         if not url:
             return
         try:
@@ -1322,8 +1400,66 @@ class QAWorkerApp:
 
     def open_tc_dashboard(self):
         """대시보드의 'TC 관리' 화면을 바로 연다. [NEW v0.4.0]"""
-        self._ensure_dashboard()
-        self._open_browser(self._dashboard_url("tcs"))
+        if not self._uses_server_dashboard():
+            self._ensure_dashboard()
+        self._open_browser(self._selected_dashboard_url("tcs"))
+
+    def _server_get(self, path, params=None, timeout=15):
+        """[v0.30.0] 서버 읽기 API 호출. 팀 주소 + 서버 전송 토큰을 쓴다.
+
+        서버 TC 세션은 말 그대로 '서버'를 보는 기능이라, 로컬/서버 전환 스위치와 무관하게
+        항상 팀 주소를 쓴다. 실패 이유는 사람이 알아볼 말로 바꿔서 올린다."""
+        base = (self.team_url_var.get() or "").strip()
+        token = (self.api_token_var.get() or "").strip()
+        if not base:
+            raise RuntimeError("팀 주소가 비어 있습니다. '팀 주소' 칸을 채워주세요")
+        if not token:
+            raise RuntimeError("서버 전송 토큰이 비어 있습니다. 토큰을 넣고 [연결 확인]을 눌러주세요")
+        r = requests.get(base.rstrip("/") + "/" + path, params=params, timeout=timeout,
+                         headers={"Authorization": "Bearer " + token})
+        if r.status_code == 401:
+            raise RuntimeError("토큰이 맞지 않습니다")
+        if r.status_code == 503:
+            raise RuntimeError("서버에 토큰이 설정되어 있지 않습니다")
+        if r.status_code == 404:
+            raise RuntimeError("서버에 해당 API가 없습니다. 새 dashboard_server.py를 배포했는지 확인해 주세요")
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def _rows_from_tc_response(data):
+        """[v0.30.0] 서버 /api/tcs 응답에서 TC 목록을 꺼낸다.
+
+        서버 버전에 따라 목록을 그대로 주기도 하고 {"tcs": [...]} 로 감싸 주기도 한다.
+        exe와 서버 버전이 어긋나는 일이 실제로 있었으므로 둘 다 받아준다.
+        한쪽만 고집하면 버전이 반 발짝만 어긋나도 조용히 실패한다."""
+        rows = data.get("tcs") if isinstance(data, dict) else data
+        if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+            raise ValueError("서버 TC 응답 형식이 올바르지 않습니다")
+        return [r for r in rows if r.get("included", r.get("enabled", True))]
+
+    def _uses_server_dashboard(self):
+        target = getattr(self, "dashboard_target_var", None)
+        return target is not None and target.get() == "server"
+
+    def _selected_dashboard_url(self, path=""):
+        if self._uses_server_dashboard():
+            base = (self.team_url_var.get() or TEAM_DASHBOARD_URL).strip()
+            return base.rstrip("/") + "/" + path
+        return self._dashboard_url(path)
+
+    def _on_dashboard_target_change(self):
+        if self.running:
+            self.dashboard_target_var.set(self._dashboard_target)
+            self.log_msg("⚠ 실행 중에는 대시보드 연결 대상을 변경할 수 없습니다")
+            return
+        self._dashboard_target = self.dashboard_target_var.get()
+        # 다른 대상에서 불러온 TC를 잘못 실행하지 않도록 목록을 비운다.
+        if self.tc_source_var.get() == "custom":
+            self.tc_data = []
+            self.tc_listbox.delete(0, "end")
+        label = "서버" if self._uses_server_dashboard() else "로컬"
+        self.log_msg(f"QA 대시보드 연결 대상: {label}. 대시보드 TC는 [TC 불러오기]로 다시 불러오세요.")
 
     def log_msg(self, msg, tag="info"):
         def _append():
@@ -1374,72 +1510,72 @@ class QAWorkerApp:
             else:
                 self.log_msg("⚠ 다운로드 URL을 찾지 못했습니다.")
 
-    # ---- 서버 TC 세션 ----                                   [v0.29.0 전면 수정]
-    # 전에는 원래 도구의 API 주소(DEFAULT_EC2_API = https://qa.healthkoob.com)를 그대로
-    # 가정한 미완성 뼈대였다. /qa-k 접두어가 없어서 **우리 대시보드가 아니라 원래 서비스**를
-    # 부르고 있었고, load_sheets() 는 비어 있었으며 세션 콤보박스도 갱신되지 않았다.
-    #
-    # 이제 결과 전송과 **같은 주소·같은 토큰**(팀 주소 + 서버 전송 토큰)을 쓴다.
-    # 서버를 가리키는 설정이 두 군데라 서로 다른 곳을 보던 것이 이 사고의 원인이라,
-    # 아예 하나로 합쳤다.
-
-    def _server_get(self, path, params=None, timeout=15):
-        """서버 읽기 API 호출. 실패하면 사람이 알아볼 이유를 붙여 예외를 올린다."""
-        token = (self.api_token_var.get() or "").strip()
-        if not (self.team_url_var.get() or "").strip():
-            raise RuntimeError("팀 주소가 비어 있습니다. '팀 주소' 칸을 채워주세요")
-        if not token:
-            raise RuntimeError("서버 전송 토큰이 비어 있습니다. 토큰을 넣고 [연결 확인]을 눌러주세요")
-        r = requests.get(self._team_url(path), params=params, timeout=timeout,
-                         headers={"Authorization": "Bearer " + token})
-        if r.status_code == 401:
-            raise RuntimeError("토큰이 맞지 않습니다")
-        if r.status_code == 503:
-            raise RuntimeError("서버에 토큰이 설정되어 있지 않습니다")
-        if r.status_code == 404:
-            raise RuntimeError((r.json() or {}).get("error") or "서버에서 찾지 못했습니다")
-        r.raise_for_status()
-        return r.json() or {}
-
+    # ---- EC2 연동 ----                                        [TODO: 실제 응답 필드명 확정 필요]
     def load_sessions(self):
-        """[세션 불러오기] - 서버의 TC 세션 목록을 받아 콤보박스를 채운다."""
+        """[v0.30.0] 서버의 TC 세션 목록을 받아 콤보박스를 채운다.
+
+        예전에는 {ec2}/api/sessions 를 불렀는데 그 주소에는 /qa-k 접두어가 없어서,
+        우리 대시보드가 아니라 원래 서비스를 보고 있었다. '다른 서버의 세션이 보인다'는
+        증상의 원인이 그것이었다."""
+        previous = self.session_var.get()
+        self.session_map = {}
+        self.session_combo.configure(values=())
+        self.session_var.set("")
+        self.sheet_combo.configure(values=())
+        self.sheet_var.set("")
+        self._clear_ec2_tc_list()
         try:
             data = self._server_get("api/tc_sessions")
+            sessions = data.get("sessions") if isinstance(data, dict) else data
+            if not isinstance(sessions, list) or any(not isinstance(x, dict) for x in sessions):
+                raise ValueError("서버 세션 응답 형식이 올바르지 않습니다")
+            for session in sessions:
+                sid = session.get("session_id")
+                if not sid:
+                    raise ValueError("서버 세션 응답에 session_id가 없습니다")
+                mark = " ★실행대상" if session.get("selected") else ""
+                name = session.get("label") or sid
+                self.session_map[f"{name} ({session.get('tc_count', 0)}건){mark}"] = session
+            labels = list(self.session_map)
+            self.session_combo.configure(values=labels)
+            if previous in self.session_map:
+                self.session_var.set(previous)
+            elif labels:
+                self.session_var.set(next((n for n in labels if "★" in n), labels[0]))
+            self.log_msg(f"서버에서 세션 {len(labels)}건 로드")
         except Exception as e:
+            self.session_map = {}
             self.log_msg(f"⚠ 세션 로드 실패: {str(e)[:150]}")
             return
-        sessions = data.get("sessions") or []
-        self.session_map = {}
-        names = []
-        for s in sessions:
-            mark = " ★실행대상" if s.get("selected") else ""
-            name = f"{s.get('label') or s.get('session_id')} ({s.get('tc_count', 0)}건){mark}"
-            self.session_map[name] = s
-            names.append(name)
-        self.session_combo["values"] = names
-        self.sheet_combo["values"] = []
-        self.sheet_var.set("")
-        if names:
-            # 서버에서 '실행 대상'인 세션을 기본으로 골라준다 - 대개 그걸 돌리려는 참이다
-            default = next((n for n in names if "★" in n), names[0])
-            self.session_var.set(default)
-            self._fill_sheets()
-            self.log_msg(f"서버에서 세션 {len(names)}건 로드 - {self._team_url()}")
+        if labels:
+            self.load_sheets()
         else:
-            self.session_var.set("")
             self.log_msg("⚠ 서버에 TC 세션이 없습니다. 대시보드에서 TC를 먼저 불러오세요")
 
-    def _fill_sheets(self):
-        """고른 세션에 들어 있는 시트 목록을 시트 콤보박스에 채운다.
-        예전에는 load_sheets() 가 비어 있어서(pass) 시트 칸이 늘 비어 있었다."""
-        info = self.session_map.get(self.session_var.get()) or {}
-        raw = str(info.get("sheets") or "")
-        sheets = [x.strip() for x in raw.split(",") if x.strip()]
-        self.sheet_combo["values"] = (["전체"] + sheets) if sheets else ["전체"]
-        self.sheet_var.set("전체")
-
     def load_sheets(self):
-        self._fill_sheets()
+        """[v0.30.0] 고른 세션의 시트 목록을 채운다.
+
+        세션 응답에 시트 이름이 이미 들어 있어 따로 물어볼 필요가 없다.
+        (예전에는 /api/sessions/{id}/sheets 를 한 번 더 불렀는데 그 주소는 없었다)"""
+        self._clear_ec2_tc_list()
+        self.sheet_combo.configure(values=("전체",))
+        self.sheet_var.set("전체")
+        session = self.session_map.get(self.session_var.get())
+        if not session:
+            return
+        names = ["전체"]
+        for name in str(session.get("sheets") or "").split(","):
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+        self.sheet_combo.configure(values=names)
+        if len(names) > 1:
+            self.log_msg(f"시트 {len(names) - 1}건. 시트를 고른 뒤 [TC 불러오기]를 누르세요.")
+
+    def _clear_ec2_tc_list(self):
+        if self.tc_source_var.get() == "ec2":
+            self.tc_data = []
+            self.tc_listbox.delete(0, "end")
 
     def load_tc_list(self):
         """"TC 불러오기" 버튼 핸들러. TC 소스(로컬 엑셀 / 대시보드 / EC2)에 따라 분기. [NEW]"""
@@ -1461,7 +1597,21 @@ class QAWorkerApp:
         엑셀 로더(_load_tcs_from_local_xlsx)와 완전히 같은 모양의 dict를 만들어서,
         실행 루프/판정/결과 저장 쪽은 TC가 어디서 왔는지 몰라도 되게 한다."""
         try:
-            rows = results_store.list_custom_tcs(only_enabled=True)
+            if self._uses_server_dashboard():
+                self.tc_data = []
+                self.tc_listbox.delete(0, "end")
+                token = self.api_token_var.get().strip()
+                if not token:
+                    raise ValueError("서버 TC를 불러오려면 아래 서버 전송 토큰을 입력하세요")
+                response = requests.get(self._selected_dashboard_url("api/tcs"),
+                                        headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                if response.status_code == 404:
+                    raise ValueError("서버에 TC 조회 API가 없습니다. 변경된 dashboard_server.py를 서버에 배포하세요")
+                response.raise_for_status()
+                # [v0.30.0] 목록이든 {"tcs": [...]} 든 둘 다 받는다.
+                rows = self._rows_from_tc_response(response.json())
+            else:
+                rows = results_store.list_custom_tcs(only_enabled=True)
         except Exception as e:
             self.log_msg(f"⚠ 대시보드 TC 로드 실패: {e}")
             return
@@ -1493,15 +1643,15 @@ class QAWorkerApp:
                          "[대시보드에서 TC 추가/수정...] 버튼으로 추가하세요")
 
     def _load_tcs_from_ec2(self):
-        """서버 TC 세션에서 TC를 불러온다. [v0.29.0]
+        """서버 TC 세션에서 TC를 불러온다. [v0.30.0]
 
-        대시보드 추가 TC 경로(_load_tcs_from_custom)와 **완전히 같은 모양의 dict**를 만든다.
-        실행 루프·판정·결과 저장은 TC가 로컬에서 왔는지 서버에서 왔는지 몰라도 된다."""
+        대시보드 추가 TC 경로와 완전히 같은 모양의 dict를 만든다.
+        실행 루프·판정·결과 저장은 TC가 어디서 왔는지 몰라도 된다."""
         if not self.session_var.get():
             self.log_msg("⚠ 먼저 [세션 불러오기]를 누르고 세션을 고르세요")
             return
-        info = self.session_map.get(self.session_var.get()) or {}
-        session_id = info.get("session_id")
+        session = self.session_map.get(self.session_var.get()) or {}
+        session_id = session.get("session_id")
         if not session_id:
             self.log_msg("⚠ 세션을 다시 불러와 주세요")
             return
@@ -1510,13 +1660,13 @@ class QAWorkerApp:
         if sheet and sheet != "전체":
             params["sheet"] = sheet
         try:
-            data = self._server_get("api/tcs", params=params)
+            rows = self._rows_from_tc_response(self._server_get("api/tcs", params=params))
         except Exception as e:
             self.log_msg(f"⚠ TC 로드 실패: {str(e)[:150]}")
             return
 
         tcs = []
-        for r in (data.get("tcs") or []):
+        for r in rows:
             tc_id = clean_text(r.get("tc_no")) or f"c{r.get('id')}"
             tcs.append({
                 "id": f"server:{r.get('id')}",
@@ -1535,7 +1685,7 @@ class QAWorkerApp:
         self.tc_listbox.delete(0, "end")
         for tc in self.tc_data:
             self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
-        label = (data.get("session") or {}).get("label") or session_id
+        label = session.get("label") or session_id
         if tcs:
             self.log_msg(f"서버 세션 '{label}'에서 TC {len(tcs)}건 로드")
         else:
@@ -2044,12 +2194,13 @@ class QAWorkerApp:
             # [NEW] AI 없이 코드로 판정. 근거를 못 찾으면 FAIL이 아니라 "확인 필요".
             # 팝업확인/화면이동 TC는 텍스트보다 확실한 근거(모달 존재, URL 변경)를 같이 넘긴다.
             try:
-                modal_visible = page.locator(MODAL_SELECTOR).last.is_visible(timeout=500)
+                modal_visible = is_modal_visible(page)
             except Exception:
                 modal_visible = False
             judgment, reason = judge_by_text(
                 tc, body_text, modal_visible=modal_visible,
                 url_changed=(page.url != url_before_actions),
+                modal_seen=getattr(engine, "modal_seen", False),
             )
             reason = f"[코드 판정] {reason}"
         else:
