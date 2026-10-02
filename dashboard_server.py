@@ -203,7 +203,45 @@ def create_app(db_path=None):
         sheet = (request.args.get("sheet") or "").strip()
         if sheet and sheet != "전체":
             rows = [r for r in rows if (r.get("sheet") or "") == sheet]
+        latest = results_store.latest_tc_details(db_path=dbp)
+        enriched = []
+        for row in rows:
+            history = latest.get(results_store.tc_result_key(
+                dict(row, tc_no=row.get('tc_no') or f"c{row.get('id')}")), {})
+            enriched.append(dict(row, last_result=history.get('result', ''),
+                                 last_reason=history.get('reason', ''),
+                                 last_executed_at=history.get('created_at', 0)))
+        rows = enriched
         return {"ok": True, "session": info, "tcs": rows}
+
+    @app.route('/api/tcs/<int:row_id>', methods=['PUT'])
+    @dashboard_auth.api_token_required
+    def api_update_tc_text(row_id):
+        body = request.get_json(silent=True)
+        if isinstance(body, dict) and 'changes' in body:
+            try:
+                results_store.update_custom_tc_details(row_id, body['changes'], body.get('previous'),
+                                                      db_path=app.config.get('DB_PATH'))
+            except results_store.TCEditConflict as e:
+                return {'ok': False, 'error': str(e)}, 409
+            except KeyError:
+                return {'ok': False, 'error': 'TC가 존재하지 않습니다'}, 404
+            except ValueError as e:
+                return {'ok': False, 'error': str(e)}, 400
+            return {'ok': True}
+        if not isinstance(body, dict) or not all(k in body for k in
+                ('steps', 'expected', 'previous_steps', 'previous_expected')):
+            return {'ok': False, 'error': '문구와 변경 전 절차·예상 결과가 필요합니다'}, 400
+        try:
+            results_store.update_custom_tc_text(row_id, body['steps'], body['expected'],
+                body['previous_steps'], body['previous_expected'], db_path=app.config.get('DB_PATH'))
+        except results_store.TCEditConflict as e:
+            return {'ok': False, 'error': str(e)}, 409
+        except KeyError:
+            return {'ok': False, 'error': 'TC가 존재하지 않습니다'}, 404
+        except ValueError as e:
+            return {'ok': False, 'error': str(e)}, 400
+        return {'ok': True}
 
     @app.route("/api/results", methods=["POST"])
     @dashboard_auth.api_token_required

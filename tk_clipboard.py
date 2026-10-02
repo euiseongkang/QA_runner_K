@@ -26,10 +26,14 @@ def _mac_command_action(event):
 
 
 def _editable(widget):
-    return not isinstance(widget, tk.Listbox) and str(widget.cget("state")) == "normal"
+    return not isinstance(widget, (tk.Listbox, ttk.Treeview)) and str(widget.cget("state")) == "normal"
 
 
 def _selection(widget):
+    if isinstance(widget, ttk.Treeview):
+        selected = set(widget.selection())
+        return "\n".join("\t".join(map(str, widget.item(item, 'values')))
+                         for item in widget.get_children() if item in selected)
     if isinstance(widget, tk.Text):
         return widget.get("sel.first", "sel.last")
     if isinstance(widget, tk.Listbox):
@@ -68,7 +72,9 @@ def edit(widget, action):
                 value = value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
             widget.insert("insert", value)
         elif action == "select_all":
-            if isinstance(widget, tk.Text):
+            if isinstance(widget, ttk.Treeview):
+                widget.selection_set(widget.get_children())
+            elif isinstance(widget, tk.Text):
                 widget.tag_add("sel", "1.0", "end-1c")
             elif isinstance(widget, tk.Listbox):
                 widget.selection_set(0, "end")
@@ -83,7 +89,7 @@ def edit(widget, action):
 
 def install_clipboard_support(root):
     """입력란 생성 후 호출한다. 위젯 바인딩으로 기본 단축키의 중복 실행을 막는다."""
-    supported = (tk.Entry, ttk.Entry, tk.Text, tk.Listbox)
+    supported = (tk.Entry, ttk.Entry, tk.Text, tk.Listbox, ttk.Treeview)
     labels = (("잘라내기", "cut", "X"), ("복사", "copy", "C"),
               ("붙여넣기", "paste", "V"), ("전체 선택", "select_all", "A"))
     is_mac = root.tk.call("tk", "windowingsystem") == "aqua"
@@ -139,7 +145,8 @@ def install_clipboard_support(root):
     root.configure(menu=menubar)
 
     for widget in widgets:
-        widget.configure(exportselection=False)
+        if not isinstance(widget, ttk.Treeview):
+            widget.configure(exportselection=False)
         widget.bind("<FocusIn>", remember_editor, add=True)
         widget.bind("<Button-1>", remember_editor, add=True)
         context = tk.Menu(root, tearoff=False)

@@ -458,6 +458,99 @@ def delete_run(run_id, db_path=None, remove_screenshots=True):
     return deleted
 
 
+def tc_result_key(tc):
+    """같은 번호의 다른 시트나 내용이 바뀐 TC에 이전 결과를 붙이지 않는다."""
+    sheet = str(tc.get('sheet_name', tc.get('sheet')) or '').strip()
+    if sheet in ('대시보드', '서버'):
+        sheet = ''
+    return tuple(' '.join(str(value or '').split()) for value in (
+        tc.get('tc_id', tc.get('tc_no')), tc.get('title'), sheet,
+        tc.get('steps'), tc.get('expected')))
+
+
+def latest_tc_details(source=None, source_ref=None, db_path=None):
+    """TC별 최신 실행 결과. 300건 표시 제한과 무관하게 전체 이력을 조회한다."""
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        where, args = [], []
+        for field, value in [('source', source), ('source_ref', source_ref)]:
+            if value is not None:
+                where.append(field + '=?')
+                args.append(value)
+        sql = 'SELECT tc_no, title, sheet, steps, expected, result, reason, created_at FROM results'
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        sql += ' ORDER BY created_at DESC, id DESC'
+        latest = {}
+        for row in conn.execute(sql, args):
+            if row['result'] in ('PASS', 'FAIL', '확인 필요'):
+                latest.setdefault(tc_result_key(dict(row)), dict(row))
+        return latest
+    finally:
+        conn.close()
+
+
+def latest_tc_results(source=None, source_ref=None, db_path=None):
+    return {key: row['result'] for key, row in
+            latest_tc_details(source, source_ref, db_path).items()}
+
+
+class TCEditConflict(ValueError):
+    pass
+
+
+def update_custom_tc_text(row_id, steps, expected, previous_steps, previous_expected, db_path=None):
+    """절차·예상 결과만 갱신한다. 다른 사용자의 편집을 덮어쓰지 않는다."""
+    if not isinstance(steps, str) or not isinstance(expected, str) or not steps.strip() or not expected.strip():
+        raise ValueError('테스트 절차와 예상 결과를 모두 입력하세요')
+    if len(steps) > MAX_FIELD_LEN or len(expected) > MAX_FIELD_LEN:
+        raise ValueError(f'각 문구는 {MAX_FIELD_LEN}자 이내로 입력하세요')
+    conn = _connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT steps, expected FROM custom_tcs WHERE id=?', (int(row_id),)).fetchone()
+        if row is None:
+            raise KeyError('TC가 삭제되었거나 존재하지 않습니다')
+        normalize = lambda text: ' '.join(str(text or '').split())
+        if (normalize(row[0]), normalize(row[1])) != (normalize(previous_steps), normalize(previous_expected)):
+            raise TCEditConflict('다른 곳에서 TC가 수정되었습니다. 목록을 다시 불러와 주세요')
+        conn.execute('UPDATE custom_tcs SET steps=?, expected=? WHERE id=?',
+                     (steps.strip(), expected.strip(), int(row_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_custom_tc_details(row_id, changes, previous, db_path=None):
+    fields = ('title', 'priority', 'sheet', 'precondition', 'steps', 'expected')
+    if not isinstance(changes, dict) or not isinstance(previous, dict) or any(
+            not isinstance(changes.get(key), str) or not isinstance(previous.get(key), str) for key in fields):
+        raise ValueError('TC 항목과 변경 전 정보가 필요합니다')
+    limits = dict(title=4000, priority=20, sheet=100, precondition=4000, steps=4000, expected=4000)
+    values = {key: changes[key].strip() for key in fields}
+    if any(not values[key] for key in ('title', 'steps', 'expected')):
+        raise ValueError('TC 제목·테스트 절차·예상 결과는 필수입니다')
+    if any(len(values[key]) > limits[key] for key in fields):
+        raise ValueError('TC 항목의 최대 길이를 초과했습니다')
+    if values['priority'] not in ('', 'P1', 'P2', 'P3', 'P4') and values['priority'] != previous['priority']:
+        raise ValueError('우선순위는 P1~P4 또는 미지정이어야 합니다')
+    conn = _connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT title, priority, sheet, precondition, steps, expected FROM custom_tcs WHERE id=?', (int(row_id),)).fetchone()
+        if row is None:
+            raise KeyError('TC가 삭제되었거나 존재하지 않습니다')
+        normalize = lambda value: ' '.join(str(value or '').split())
+        if any(normalize(row[index]) != normalize(previous[key]) for index, key in enumerate(fields)):
+            raise TCEditConflict('다른 곳에서 TC가 수정되었습니다. 목록을 다시 불러와 주세요')
+        conn.execute('UPDATE custom_tcs SET title=?, priority=?, sheet=?, precondition=?, steps=?, expected=? WHERE id=?',
+                     (*[values[key] for key in fields], int(row_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def list_results(run_id=None, db_path=None, limit=300, sheet=None):
     """실행 결과 행. sheet를 주면 그 시트(화면)의 결과만. [sheet: v0.15.0]"""
     conn = _connect(db_path)

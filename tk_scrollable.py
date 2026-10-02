@@ -34,7 +34,7 @@ class ScrollableFrame(ttk.Frame):
     def _wheel(self, event):
         widget = event.widget
         # TC 목록·로그·콤보박스는 자신의 기본 휠 동작을 유지한다.
-        if widget.winfo_class() in ("Text", "Listbox", "TCombobox", "Scrollbar", "TScrollbar"):
+        if widget.winfo_class() in ("Text", "Listbox", "Treeview", "TCombobox", "Scrollbar", "TScrollbar"):
             return
         while widget is not None and widget is not self:
             widget = getattr(widget, "master", None)

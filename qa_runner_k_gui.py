@@ -37,11 +37,14 @@ import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
 from tk_clipboard import install_clipboard_support
 from tk_scrollable import ScrollableFrame
+from tk_tc_table import TCTable
+from tc_review_dialog import TCReviewDialog, TCDetailDialog
+import tc_optimization
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.30.0"
+APP_VERSION = "0.31.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -908,6 +911,7 @@ class QAWorkerApp:
         self.session_var = tk.StringVar()
         self.sheet_var = tk.StringVar()
         self.priority_var = tk.StringVar(value="전체")
+        self.result_filter_var = tk.StringVar(value="전체")
         self.limit_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="대기 중")
 
@@ -945,6 +949,7 @@ class QAWorkerApp:
         install_clipboard_support(self.root)
         # [NEW v0.4.0] 대시보드에서 TC를 작성할 수 있게 되었으니 시작 시 미리 띄운다
         self._ensure_dashboard()
+        self._on_tc_source_change(persist=False)
         self.check_update_and_prompt()
 
     # ---- 로컬 설정 (시작 URL/로그인) ----                    [NEW][TODO: 저장 경로/암호화 방식 확정]
@@ -965,6 +970,12 @@ class QAWorkerApp:
             # [NEW v0.25.0] 키가 없는 예전 설정 파일이면 기본값(팀 서버)을 그대로 쓴다.
             self.team_url_var.set(cfg.get("team_dashboard_url", TEAM_DASHBOARD_URL))
             self.api_token_var.set(cfg.get("api_token", ""))          # [NEW v0.26.0]
+            source = cfg.get('tc_source', 'local')
+            self.tc_source_var.set(source if source in ('local', 'custom', 'ec2') else 'local')
+            target = cfg.get('dashboard_target', 'local')
+            self.dashboard_target_var.set(target if target in ('local', 'server') else 'local')
+            self._dashboard_target = self.dashboard_target_var.get()
+            self.local_xlsx_path_var.set(cfg.get('local_xlsx_path', ''))
         except Exception:
             pass
 
@@ -977,12 +988,31 @@ class QAWorkerApp:
             "login_pw": self.login_pw_var.get(),
             "team_dashboard_url": self.team_url_var.get(),  # [NEW v0.25.0]
             "api_token": self.api_token_var.get(),          # [NEW v0.26.0]
+            'tc_source': self.tc_source_var.get(),
+            'dashboard_target': self.dashboard_target_var.get(),
+            'local_xlsx_path': self.local_xlsx_path_var.get(),
         }
         try:
             with open(self._config_path(), "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.log_msg(f"⚠ 설정 저장 실패: {e}")
+
+    def _save_tc_selection(self):
+        """선택 변경만 저장하며 기존 로그인·서버 설정을 보존한다."""
+        try:
+            try:
+                with open(self._config_path(), 'r', encoding='utf-8') as file:
+                    cfg = json.load(file)
+            except FileNotFoundError:
+                cfg = {}
+            cfg.update(tc_source=self.tc_source_var.get(),
+                       dashboard_target=self.dashboard_target_var.get(),
+                       local_xlsx_path=self.local_xlsx_path_var.get())
+            with open(self._config_path(), 'w', encoding='utf-8') as file:
+                json.dump(cfg, file, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log_msg(f'⚠ TC 선택 설정 저장 실패: {e}')
 
     # ---- UI 구성 ----                                        [TODO: 실제 배치는 원본 GUI 참고해 다듬기]
     def _build_ui(self):
@@ -1064,7 +1094,6 @@ class QAWorkerApp:
 
         self.ec2_session_frame = ttk.Frame(source_frame)
         self.ec2_session_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        ttk.Button(self.ec2_session_frame, text="세션 불러오기", command=self.load_sessions).grid(row=0, column=0)
         self.session_combo = ttk.Combobox(self.ec2_session_frame, textvariable=self.session_var,
                                          width=30, state="readonly")
         self.session_combo.grid(row=0, column=1)
@@ -1072,26 +1101,36 @@ class QAWorkerApp:
         self.sheet_combo = ttk.Combobox(self.ec2_session_frame, textvariable=self.sheet_var,
                                        width=20, state="readonly")
         self.sheet_combo.grid(row=0, column=2)
-        self.sheet_combo.bind("<<ComboboxSelected>>", lambda event: self._clear_ec2_tc_list())
+        self.sheet_combo.bind("<<ComboboxSelected>>", lambda event: self.load_tc_list())
 
         # 세션/시트/TC 선택 영역
         sel_frame = ttk.LabelFrame(content, text="TC 목록", padding=8)
         sel_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
-        ttk.Button(sel_frame, text="TC 불러오기", command=self.load_tc_list).grid(row=0, column=0)
-        ttk.Combobox(sel_frame, textvariable=self.priority_var,
+        self.priority_combo = ttk.Combobox(sel_frame, textvariable=self.priority_var,
                      values=["전체", "P1", "P2", "P3", "P4", "P1+P2", "P1+P2+P3"],
-                     width=10, state="readonly").grid(row=0, column=1)
+                     width=10, state="readonly")
+        self.priority_combo.grid(row=0, column=1)
+        self.priority_combo.bind('<<ComboboxSelected>>', self._apply_result_filter)
+        result_filter = ttk.Combobox(sel_frame, textvariable=self.result_filter_var,
+                                    values=("전체", "PASS", "확인 필요", "FAIL"),
+                                    width=10, state="readonly")
+        result_filter.grid(row=0, column=2, padx=(6, 0))
+        result_filter.bind('<<ComboboxSelected>>', self._apply_result_filter)
 
-        self.tc_listbox = tk.Listbox(sel_frame, selectmode="extended", width=100, height=15)
+        self.tc_listbox = TCTable(sel_frame)
+        self.tc_listbox.bind('<Double-1>', self._open_tc_review)
         self.tc_listbox.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=4)
         tc_scroll = ttk.Scrollbar(sel_frame, orient="vertical", command=self.tc_listbox.yview)
         tc_scroll.grid(row=1, column=4, sticky="ns", pady=4)
         self.tc_listbox.configure(yscrollcommand=tc_scroll.set)
         sel_frame.rowconfigure(1, weight=1)
         sel_frame.columnconfigure(0, weight=1)
-        ttk.Button(sel_frame, text="전체 선택", command=self.select_all_tc).grid(row=2, column=0)
-        ttk.Button(sel_frame, text="선택 해제", command=self.deselect_all_tc).grid(row=2, column=1)
+        tc_buttons = ttk.Frame(sel_frame)
+        tc_buttons.grid(row=2, column=0, columnspan=4, sticky="ew")
+        ttk.Button(tc_buttons, text="전체 선택", command=self.select_all_tc).pack(side="left")
+        ttk.Button(tc_buttons, text="선택 해제", command=self.deselect_all_tc).pack(side="left", padx=6)
+        ttk.Button(tc_buttons, text="수정", command=self._open_tc_review).pack(side="right")
 
         # 실행 제어
         ctrl_frame = ttk.Frame(content, padding=8)
@@ -1145,10 +1184,16 @@ class QAWorkerApp:
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(fill="both", expand=True)
 
-        self._on_tc_source_change()  # 초기 상태: local/ec2 프레임 중 하나만 보이도록 정리
 
     # ---- TC 소스: 로컬 엑셀 / 대시보드 추가 TC / EC2 세션 ----     [NEW]
-    def _on_tc_source_change(self):
+    def _on_tc_source_change(self, persist=True):
+        if self.running:
+            self.tc_source_var.set(self._active_tc_source)
+            self.log_msg('⚠ 실행 중에는 TC 소스를 변경할 수 없습니다')
+            return
+        self._active_tc_source = self.tc_source_var.get()
+        if persist:
+            self._save_tc_selection()
         frames = {
             "local": self.local_file_frame,
             "custom": self.custom_tc_frame,
@@ -1162,8 +1207,19 @@ class QAWorkerApp:
                 self.dashboard_target_frame.pack(side="left", padx=(12, 0))
             else:
                 self.dashboard_target_frame.pack_forget()
+        self.tc_data = []
+        self.tc_listbox.delete(0, 'end')
+        if self._active_tc_source == 'ec2':
+            self.load_sessions()
+        elif self._active_tc_source == 'custom':
+            self.load_tc_list()
+        elif self.local_xlsx_path_var.get():
+            self.load_tc_list()
 
     def _choose_local_xlsx(self):
+        if self.running:
+            self.log_msg('⚠ 실행 중에는 엑셀 파일을 변경할 수 없습니다')
+            return
         path = filedialog.askopenfilename(
             title="TC 엑셀 파일 선택 (개요 + 테스트케이스 시트 포맷)",
             filetypes=[("Excel files", "*.xlsx")],
@@ -1171,6 +1227,7 @@ class QAWorkerApp:
         if not path:
             return
         self.local_xlsx_path_var.set(path)
+        self._save_tc_selection()
         self._load_tcs_from_local_xlsx(path)
 
     def _load_tcs_from_local_xlsx(self, path):
@@ -1188,6 +1245,7 @@ class QAWorkerApp:
         self.tc_data = [{
             "id": f"local:{os.path.basename(path)}:{t['no']}",  # EC2 tc id가 없으므로 파일+식별자로 대체
             "tc_id": t["no"],
+            "excel_row": t['row'],
             "sheet_name": t.get("sheet") or tc_excel.SHEET_NAME,   # [v0.15.0] 시트별 구분
             "title": t["title"],
             "precondition": t["precondition"],
@@ -1198,9 +1256,7 @@ class QAWorkerApp:
             "result": "",  # 엑셀에 적힌 기존 결과값은 참고만 하고 실행 대상 필터링에는 쓰지 않음
         } for t in tcs_raw]
 
-        self.tc_listbox.delete(0, "end")
-        for tc in self.tc_data:
-            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        self._render_tc_table('local', path)
         self.log_msg(f"로컬 엑셀에서 TC {len(self.tc_data)}건 로드: {os.path.basename(path)}")
         for w in warnings[:5]:
             self.log_msg(f"  ⓘ {w}")
@@ -1454,12 +1510,15 @@ class QAWorkerApp:
             self.log_msg("⚠ 실행 중에는 대시보드 연결 대상을 변경할 수 없습니다")
             return
         self._dashboard_target = self.dashboard_target_var.get()
+        self._save_tc_selection()
         # 다른 대상에서 불러온 TC를 잘못 실행하지 않도록 목록을 비운다.
         if self.tc_source_var.get() == "custom":
             self.tc_data = []
             self.tc_listbox.delete(0, "end")
         label = "서버" if self._uses_server_dashboard() else "로컬"
-        self.log_msg(f"QA 대시보드 연결 대상: {label}. 대시보드 TC는 [TC 불러오기]로 다시 불러오세요.")
+        self.log_msg(f"QA 대시보드 연결 대상: {label}")
+        if self.tc_source_var.get() == 'custom':
+            self.load_tc_list()
 
     def log_msg(self, msg, tag="info"):
         def _append():
@@ -1570,7 +1629,8 @@ class QAWorkerApp:
                 names.append(name)
         self.sheet_combo.configure(values=names)
         if len(names) > 1:
-            self.log_msg(f"시트 {len(names) - 1}건. 시트를 고른 뒤 [TC 불러오기]를 누르세요.")
+            self.log_msg(f"시트 {len(names) - 1}건")
+        self.load_tc_list()
 
     def _clear_ec2_tc_list(self):
         if self.tc_source_var.get() == "ec2":
@@ -1578,7 +1638,10 @@ class QAWorkerApp:
             self.tc_listbox.delete(0, "end")
 
     def load_tc_list(self):
-        """"TC 불러오기" 버튼 핸들러. TC 소스(로컬 엑셀 / 대시보드 / EC2)에 따라 분기. [NEW]"""
+        """선택된 TC 소스에서 목록을 불러온다."""
+        if self.running:
+            self.log_msg('⚠ 실행 중에는 TC 목록을 다시 불러올 수 없습니다')
+            return
         source = self.tc_source_var.get()
         if source == "local":
             path = self.local_xlsx_path_var.get()
@@ -1629,13 +1692,16 @@ class QAWorkerApp:
                 "expected": clean_text(r.get("expected")),
                 "priority": clean_text(r.get("priority")) or "미지정",
                 "note": clean_text(r.get("note")),
+                "_stored_sheet": clean_text(r.get("sheet")),
+                "_stored_priority": clean_text(r.get("priority")),
+                "last_result": r.get("last_result", ""),
+                "last_reason": r.get('last_reason', ''),
+                "last_executed_at": r.get('last_executed_at', 0),
                 "result": "",
             })
 
         self.tc_data = tcs
-        self.tc_listbox.delete(0, "end")
-        for tc in self.tc_data:
-            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        self._render_tc_table('custom', '대시보드 추가 TC')
         if tcs:
             self.log_msg(f"대시보드에서 TC {len(tcs)}건 로드 (실행 포함 상태만)")
         else:
@@ -1678,18 +1744,209 @@ class QAWorkerApp:
                 "expected": clean_text(r.get("expected")),
                 "priority": clean_text(r.get("priority")) or "미지정",
                 "note": clean_text(r.get("note")),
+                "_stored_sheet": clean_text(r.get("sheet")),
+                "_stored_priority": clean_text(r.get("priority")),
+                "last_result": r.get("last_result", ""),
+                "last_reason": r.get('last_reason', ''),
+                "last_executed_at": r.get('last_executed_at', 0),
                 "result": "",
             })
 
         self.tc_data = tcs
-        self.tc_listbox.delete(0, "end")
-        for tc in self.tc_data:
-            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        self._render_tc_table('ec2', self.session_var.get())
         label = session.get("label") or session_id
         if tcs:
             self.log_msg(f"서버 세션 '{label}'에서 TC {len(tcs)}건 로드")
         else:
             self.log_msg(f"⚠ 세션 '{label}'에 '실행 포함' 상태인 TC가 없습니다")
+
+    def _render_tc_table(self, source, source_ref):
+        try:
+            latest = results_store.latest_tc_details(source, source_ref)
+        except Exception as e:
+            self.log_msg(f"⚠ 이전 실행 결과 조회 실패: {str(e)[:120]}")
+            latest = {}
+        self.tc_listbox.delete(0, 'end')
+        for index, tc in enumerate(self.tc_data):
+            history = latest.get(results_store.tc_result_key(tc), {})
+            if history and (not tc.get('last_result') or history.get('created_at', 0) > (tc.get('last_executed_at') or 0)):
+                tc.update(last_result=history['result'], last_reason=history.get('reason', ''),
+                          last_executed_at=history.get('created_at', 0))
+            result = tc.get('last_result', '')
+            server = source == 'ec2' or (source == 'custom' and self._uses_server_dashboard())
+            tc['_edit_context'] = {'source': source, 'source_ref': source_ref,
+                                   'server_url': self._team_url() if source == 'ec2' else
+                                   (self._selected_dashboard_url() if server else None)}
+            if result not in (RESULT_PASS, RESULT_FAIL, RESULT_NEEDS_REVIEW):
+                result = ''
+            # 과거 결과는 실행 대상 필터용 result 필드에 넣지 않는다. 재실행 가능.
+            label = f"[{tc.get('priority') or '미지정'}] {tc['tc_id']} | {tc['title']}"
+            self.tc_listbox.insert('', 'end', iid=str(index),
+                                   values=(label, result), tags=(result,) if result else ())
+        self._apply_result_filter()
+
+    def _apply_result_filter(self, event=None):
+        chosen = self.result_filter_var.get() if hasattr(self, 'result_filter_var') else '전체'
+        priority = self.priority_var.get() if hasattr(self, 'priority_var') else '전체'
+        priorities = priority.split('+')
+        for index in range(len(self.tc_data)):
+            item = str(index)
+            if not self.tc_listbox.exists(item):
+                continue
+            matches_priority = priority == '전체' or self.tc_data[index].get('priority') in priorities
+            matches_result = chosen == '전체' or self.tc_listbox.set(item, 'result') == chosen
+            if matches_priority and matches_result:
+                self.tc_listbox.move(item, '', 'end')
+            else:
+                self.tc_listbox.selection_remove(item)
+                self.tc_listbox.detach(item)
+
+    def _publish_tc_result(self, tc, result, reason):
+        """각 TC 판정 직후 UI를 갱신한다. 저장·서버 전송 완료를 기다리지 않는다."""
+        snapshot = dict(tc)
+        self.root.after(0, lambda: self._update_tc_table_result(snapshot, result, reason))
+
+    def _update_tc_table_result(self, tc, result, reason=''):
+        for index, current in enumerate(self.tc_data):
+            if (current.get('id') == tc.get('id')
+                    and results_store.tc_result_key(current) == results_store.tc_result_key(tc)):
+                item = str(index)
+                if self.tc_listbox.exists(item):
+                    current['last_result'] = result
+                    current['last_reason'] = reason
+                    current['last_executed_at'] = time.time()
+                    self.tc_listbox.set(item, 'result', result)
+                    self.tc_listbox.item(item, tags=(result,))
+                    self._apply_result_filter()
+                break
+
+    def _open_tc_review(self, event=None):
+        if event is not None:
+            item = self.tc_listbox.identify_row(event.y)
+        else:
+            selection = self.tc_listbox.selection()
+            if len(selection) != 1:
+                messagebox.showinfo('TC 상세정보', '상세정보를 볼 TC를 하나 선택하세요.')
+                return
+            item = selection[0]
+        if not item:
+            return
+        tc = self.tc_data[int(item)]
+        sheets = list(dict.fromkeys(t.get('sheet_name', '') for t in self.tc_data))
+        if hasattr(self, 'sheet_combo') and self.tc_source_var.get() == 'ec2':
+            sheets.extend(name for name in self.sheet_combo['values'] if name != '전체')
+        original = dict(tc)
+        context = dict(tc.get('_edit_context', {}))
+        context['token'] = self.api_token_var.get().strip()
+        def save(values):
+            if self.running:
+                raise ValueError('TC 실행이 끝난 뒤 저장하세요')
+            return self._persist_tc_details(original, values, context)
+        def saved(values, result):
+            if context.get('source') == 'local':
+                self._load_tcs_from_local_xlsx(context['source_ref'])
+            else:
+                tc.update(values, last_result='', last_reason='', last_executed_at=0)
+                if result:
+                    tc.update(result)
+                self.tc_listbox.set(item, 'title', f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+                self.tc_listbox.set(item, 'result', '')
+                self.tc_listbox.item(item, tags=())
+                self._apply_result_filter()
+            original.update(values)
+            original['_stored_sheet'] = tc.get('_stored_sheet', values['sheet_name'])
+            original['_stored_priority'] = tc.get('_stored_priority', values['priority'])
+            if result:
+                original.update(result)
+            self.log_msg(f"TC {tc['tc_id']} 저장 완료")
+        return TCDetailDialog(self.root, original, sheets=tuple(dict.fromkeys(sheets)), save=save, on_saved=saved)
+
+    def _persist_tc_details(self, tc, values, context):
+        if any(not values[key].strip() for key in ('title', 'steps', 'expected')):
+            raise ValueError('TC 제목·테스트 절차·예상 결과는 필수입니다')
+        if any(len(values[key]) > 4000 for key in ('title', 'precondition', 'steps', 'expected')):
+            raise ValueError('각 텍스트 항목은 4000자 이내로 입력하세요')
+        if context['source'] == 'local':
+            return tc_optimization.save_excel_details(context['source_ref'], tc, values)
+        def fields(data, original=False):
+            return dict(title=data['title'], steps=data['steps'], expected=data['expected'],
+                        precondition=data.get('precondition', ''),
+                        priority=data.get('_stored_priority', data.get('priority', '')) if original else
+                        ('' if data['priority'] == '미지정' else data['priority']),
+                        sheet=data.get('_stored_sheet', data.get('sheet_name', '')) if original else
+                        (tc.get('_stored_sheet', data['sheet_name']) if data['sheet_name'] == tc.get('sheet_name')
+                         else data['sheet_name']))
+        changes, previous = fields(values), fields(tc, True)
+        row_id = int(str(tc['id']).rsplit(':', 1)[1])
+        if context.get('server_url'):
+            if not context.get('token'):
+                raise ValueError('서버 전송 토큰을 입력하세요')
+            response = requests.put(context['server_url'].rstrip('/') + f'/api/tcs/{row_id}',
+                                    headers={'Authorization': 'Bearer ' + context['token']},
+                                    json={'changes': changes, 'previous': previous}, timeout=15)
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if response.status_code != 200 or body.get('ok') is not True:
+                raise ValueError(body.get('error') or f'서버 TC 저장 실패 (HTTP {response.status_code}). 변경된 TC 수정 API 배포와 토큰을 확인하세요')
+        else:
+            results_store.update_custom_tc_details(row_id, changes, previous)
+        return {'_stored_sheet': changes['sheet'], '_stored_priority': changes['priority']}
+
+    def _optimize_tc_text(self, tc, reason, provider, key, model):
+        if not key:
+            raise ValueError('AI Provider에 맞는 API Key를 입력하세요')
+        if provider == 'Claude':
+            import anthropic
+            client = anthropic.Anthropic(api_key=key, timeout=45)
+        elif provider == 'OpenAI':
+            import openai
+            client = openai.OpenAI(api_key=key, timeout=45)
+        else:
+            raise ValueError('지원하지 않는 AI Provider입니다')
+        try:
+            response = self.call_ai(client, provider, model,
+                tc_optimization.optimization_prompt(tc, reason), 2000, timeout=45)
+            return tc_optimization.parse_proposal(response or '')
+        finally:
+            client.close()
+
+    def _persist_tc_text(self, tc, steps, expected, context):
+        if not steps.strip() or not expected.strip() or max(len(steps), len(expected)) > 4000:
+            raise ValueError('테스트 절차와 예상 결과를 각각 1~4000자로 입력하세요')
+        if context.get('server_url'):
+            if not context.get('token'):
+                raise ValueError('서버 전송 토큰을 입력하세요')
+            row_id = int(str(tc['id']).rsplit(':', 1)[1])
+            response = requests.put(context['server_url'].rstrip('/') + f'/api/tcs/{row_id}',
+                headers={'Authorization': 'Bearer ' + context['token']},
+                json={'steps': steps, 'expected': expected, 'previous_steps': tc['steps'],
+                      'previous_expected': tc['expected']}, timeout=15)
+            if response.status_code != 200:
+                try:
+                    error = response.json().get('error')
+                except (ValueError, AttributeError):
+                    error = None
+                raise ValueError(error or f'서버 TC 저장 실패 (HTTP {response.status_code}). 새 API 배포와 토큰을 확인하세요')
+            if response.json().get('ok') is not True:
+                raise ValueError('서버가 TC 저장 성공을 확인하지 않았습니다')
+        elif context['source'] == 'local':
+            tc_optimization.save_excel_text(context['source_ref'], tc['sheet_name'],
+                tc['excel_row'], tc, steps, expected)
+        else:
+            results_store.update_custom_tc_text(int(str(tc['id']).rsplit(':', 1)[1]),
+                steps, expected, tc['steps'], tc['expected'])
+
+    def _apply_tc_text(self, tc, steps, expected):
+        tc.update(steps=steps.strip(), expected=expected.strip(), last_result='', last_reason='',
+                  last_executed_at=0)
+        for index, current in enumerate(self.tc_data):
+            if current is tc and self.tc_listbox.exists(str(index)):
+                self.tc_listbox.set(str(index), 'result', '')
+                self.tc_listbox.item(str(index), tags=())
+                break
+        self.log_msg(f"TC {tc['tc_id']} 문구 저장 완료. 다시 실행해 결과를 확인하세요.")
 
     @staticmethod
     def _normalize_tc(raw: dict) -> dict:
@@ -1875,6 +2132,7 @@ class QAWorkerApp:
                         pass
 
                 results[judgment] = results.get(judgment, 0) + 1
+                self._publish_tc_result(tc, judgment, reason)
                 self._save_result(tc, judgment, reason, after_b64, before_b64,
                                    run_id=run_id, source=tc_source, source_ref=source_ref, ec2=ec2)
 

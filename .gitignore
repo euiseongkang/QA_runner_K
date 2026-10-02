@@ -80,3 +80,4 @@ Thumbs.db
 *.flv
 *.mov
 *.wmv
+tests/
