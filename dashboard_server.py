@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.parse
 
-from flask import Flask, request, send_file, abort, redirect, url_for, jsonify
+from flask import Flask, request, send_file, abort, redirect, url_for
 
 import dashboard_auth
 import results_store
@@ -42,6 +42,13 @@ RESULT_STYLE = {
 }
 
 PRIORITIES = ["P1", "P2", "P3", "P4"]
+
+# [v0.28.0] 세션 목록에서 '실행 대상' 줄을 눈에 띄게.
+SESSION_CSS = """
+.pick{font-size:12px;color:#777}
+.pick.on{color:#1f9d55;font-weight:700}
+tr.picked td{background:#f3fbf6}
+"""
 
 
 def create_app(db_path=None):
@@ -163,12 +170,40 @@ def create_app(db_path=None):
         """프로그램이 '주소와 토큰이 맞는지'만 확인할 때 쓴다. 결과를 보내기 전에 부른다."""
         return {"ok": True, "app": APP_MARKER}
 
-    @app.route("/api/tcs", methods=["GET"])
+    @app.route("/api/tc_sessions")
+    @dashboard_auth.api_token_required
+    def api_tc_sessions():
+        """[NEW v0.29.0] 프로그램이 서버의 TC 세션 목록을 받아간다.
+
+        지금까지 프로그램의 [EC2 세션]은 원래 도구의 API 주소를 그대로 가정한 미완성
+        뼈대였다(한 번도 우리 대시보드를 본 적이 없다). 이 엔드포인트가 그 자리를 채운다."""
+        return {"sessions": results_store.list_tc_sessions(db_path=app.config.get("DB_PATH"))}
+
+    @app.route("/api/tcs")
     @dashboard_auth.api_token_required
     def api_tcs():
-        """소스 실행 클라이언트에 실행 포함 상태의 TC만 제공한다."""
-        return jsonify(results_store.list_custom_tcs(
-            only_enabled=True, db_path=app.config["DB_PATH"]))
+        """[NEW v0.29.0] 한 세션의 TC를 돌려준다. session 을 안 주면 '실행 대상' 세션.
+
+        기준은 enabled 가 아니라 included 다. 프로그램이 세션을 콕 집어 물어본 경우,
+        서버에서 어느 세션이 선택돼 있든 그 세션의 TC를 줘야 묻는 대로 답하는 것이 된다.
+        (enabled 는 '서버에서 선택된 세션'까지 곱해진 값이라 여기서 쓰면 엉뚱해진다)"""
+        dbp = app.config.get("DB_PATH")
+        session_id = (request.args.get("session") or "").strip()
+        if not session_id:
+            picked = [s for s in results_store.list_tc_sessions(db_path=dbp) if s.get("selected")]
+            if not picked:
+                return {"ok": False, "error": "실행 대상으로 선택된 세션이 없습니다",
+                        "tcs": []}, 404
+            session_id = picked[0]["session_id"]
+        info = results_store.get_tc_session(session_id, db_path=dbp)
+        if not info:
+            return {"ok": False, "error": "그런 세션이 없습니다", "tcs": []}, 404
+        rows = [r for r in results_store.list_custom_tcs(session_id=session_id, db_path=dbp)
+                if r.get("included")]
+        sheet = (request.args.get("sheet") or "").strip()
+        if sheet and sheet != "전체":
+            rows = [r for r in rows if (r.get("sheet") or "") == sheet]
+        return {"ok": True, "session": info, "tcs": rows}
 
     @app.route("/api/results", methods=["POST"])
     @dashboard_auth.api_token_required
@@ -231,19 +266,60 @@ def create_app(db_path=None):
     # ---- TC 관리 ----                                            [NEW v0.4.0]
     @app.route("/tcs")
     def tcs():
-        # [v0.14.0] sheet 파라미터가 있으면 그 시트(화면)의 TC만 보여준다.
-        sheet = request.args.get("sheet")
-        tc_list = results_store.list_custom_tcs(sheet=sheet, db_path=app.config["DB_PATH"])
-        sheets = results_store.list_custom_tc_sheets(db_path=app.config["DB_PATH"])
+        """[v0.28.0] 첫 화면은 '세션 목록'. 세션을 고르면 그 세션의 TC 목록으로 간다.
+        실행 내역(/)과 같은 구조로 맞췄다 - 쓰는 사람이 두 화면을 다르게 익힐 이유가 없다."""
+        dbp = app.config["DB_PATH"]
+        session_id = request.args.get("session")
+        if not session_id:
+            return _render_tc_sessions(
+                results_store.list_tc_sessions(db_path=dbp),
+                request.args.get("msg", ""), request.args.get("err", ""),
+                request.args.get("rename"))
+
+        sheet = request.args.get("sheet")      # [v0.14.0] 세션 안에서 시트로 한 번 더 좁히기
+        tc_list = results_store.list_custom_tcs(sheet=sheet, session_id=session_id, db_path=dbp)
+        sheets = results_store.list_custom_tc_sheets(session_id=session_id, db_path=dbp)
         edit_id = request.args.get("edit")
         editing = None
         if edit_id:
             try:
-                editing = results_store.get_custom_tc(edit_id, db_path=app.config["DB_PATH"])
+                editing = results_store.get_custom_tc(edit_id, db_path=dbp)
             except Exception:
                 editing = None
         return _render_tcs(tc_list, editing, request.args.get("msg", ""),
-                           request.args.get("err", ""), sheets, sheet)
+                           request.args.get("err", ""), sheets, sheet,
+                           session=results_store.get_tc_session(session_id, db_path=dbp))
+
+    # ---- 세션 조작 ----                                            [NEW v0.28.0]
+
+    @app.route("/tcs/session/select/<path:session_id>", methods=["POST"])
+    def tcs_session_select(session_id):
+        """이 세션을 실행 대상으로. 다른 세션은 자동으로 해제된다.
+
+        여러 세션이 동시에 실행 대상이 되면 옛 TC와 새 TC가 섞여 돌아간다(v0.18.0 사고).
+        한 번에 하나만 고르게 해서 그 상황 자체를 못 만들게 한다."""
+        _reject_cross_site()
+        if not results_store.get_tc_session(session_id, db_path=app.config["DB_PATH"]):
+            abort(404)
+        results_store.set_tc_session_selected(session_id, True, exclusive=True,
+                                              db_path=app.config["DB_PATH"])
+        return redirect(url_for("tcs", msg="이 세션의 TC가 실행 대상이 되었습니다"))
+
+    @app.route("/tcs/session/rename/<path:session_id>", methods=["POST"])
+    def tcs_session_rename(session_id):
+        _reject_cross_site()
+        try:
+            results_store.rename_tc_session(session_id, request.form.get("label"),
+                                            db_path=app.config["DB_PATH"])
+            return redirect(url_for("tcs", msg="세션 이름을 바꿨습니다"))
+        except ValueError as e:
+            return redirect(url_for("tcs", err=str(e)))
+
+    @app.route("/tcs/session/delete/<path:session_id>", methods=["POST"])
+    def tcs_session_delete(session_id):
+        _reject_cross_site()
+        n = results_store.delete_tc_session(session_id, db_path=app.config["DB_PATH"])
+        return redirect(url_for("tcs", msg=f"세션과 그 안의 TC {n}건을 삭제했습니다"))
 
     @app.route("/tcs/sheet_enable", methods=["POST"])
     def tcs_sheet_enable():
@@ -271,18 +347,28 @@ def create_app(db_path=None):
                 )
                 msg = f"TC를 수정했습니다"
             else:
+                # [v0.28.0] 보고 있던 세션에 넣는다. 세션 없이 들어오면 '직접 작성' 세션을 만든다.
+                sid = (f.get("session_id") or "").strip()
+                if not sid:
+                    sid = results_store.create_tc_session(
+                        "직접 작성 · " + time.strftime("%m-%d %H:%M"),
+                        source="직접 작성", select=True, db_path=app.config["DB_PATH"])
+                existing = results_store.list_custom_tcs(session_id=sid,
+                                                         db_path=app.config["DB_PATH"])
                 results_store.insert_custom_tc(
                     f.get("title"), f.get("steps"), f.get("expected"),
                     precondition=f.get("precondition"), priority=f.get("priority"),
                     tc_no=f.get("tc_no"), note=f.get("note"), sheet=f.get("sheet"),
-                    db_path=app.config["DB_PATH"],
+                    session_id=sid, seq=len(existing), db_path=app.config["DB_PATH"],
                 )
                 msg = "TC를 추가했습니다. 프로그램에서 [TC 불러오기]를 누르면 목록에 나옵니다"
-            return redirect(url_for("tcs", msg=msg))
+                return redirect(url_for("tcs", session=sid, msg=msg))
+            return redirect(url_for("tcs", session=(f.get("session_id") or ""), msg=msg))
         except ValueError as e:
-            return redirect(url_for("tcs", err=str(e)))
+            return redirect(url_for("tcs", session=(f.get("session_id") or ""), err=str(e)))
         except Exception as e:
-            return redirect(url_for("tcs", err=f"저장 실패: {e}"))
+            return redirect(url_for("tcs", session=(f.get("session_id") or ""),
+                                    err=f"저장 실패: {e}"))
 
     @app.route("/tcs/import", methods=["POST"])
     def tcs_import():
@@ -305,9 +391,11 @@ def create_app(db_path=None):
         except Exception as e:
             return redirect(url_for("tcs", err=f"엑셀을 읽지 못했습니다: {str(e)[:150]}"))
 
-        msg, ok = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings,
-                                os.path.basename(f.filename), "엑셀에서")
-        return redirect(url_for("tcs", msg=msg) if ok else url_for("tcs", err=msg))
+        msg, ok, sid = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings,
+                                     os.path.basename(f.filename), "엑셀에서")
+        if not ok:
+            return redirect(url_for("tcs", err=msg))
+        return redirect(url_for("tcs", session=sid, msg=msg))
 
     @app.route("/tcs/import_url", methods=["POST"])
     def tcs_import_url():
@@ -326,8 +414,11 @@ def create_app(db_path=None):
         except Exception as e:
             return redirect(url_for("tcs", err=f"시트를 읽지 못했습니다: {str(e)[:150]}"))
 
-        msg, ok = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings, "구글 시트", "구글 시트에서")
-        return redirect(url_for("tcs", msg=msg) if ok else url_for("tcs", err=msg))
+        msg, ok, sid = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings,
+                                     "구글 시트", "구글 시트에서")
+        if not ok:
+            return redirect(url_for("tcs", err=msg))
+        return redirect(url_for("tcs", session=sid, msg=msg))
 
     @app.route("/tcs/toggle/<int:row_id>", methods=["POST"])
     def tcs_toggle(row_id):
@@ -335,16 +426,21 @@ def create_app(db_path=None):
         cur = results_store.get_custom_tc(row_id, db_path=app.config["DB_PATH"])
         if not cur:
             abort(404)
-        results_store.set_custom_tc_enabled(row_id, not cur.get("enabled"),
-                                            db_path=app.config["DB_PATH"])
-        state = "제외" if cur.get("enabled") else "포함"
-        return redirect(url_for("tcs", msg=f"TC를 실행 대상에서 {state}했습니다"))
+        # [v0.28.0] enabled 가 아니라 included 를 바꾼다. enabled 는 세션 선택과 곱해져
+        # 자동으로 다시 계산되는 값이라, 직접 쓰면 세션을 바꾼 순간 덮어써진다.
+        results_store.set_custom_tc_included(row_id, not cur.get("included"),
+                                             db_path=app.config["DB_PATH"])
+        state = "제외" if cur.get("included") else "포함"
+        return redirect(url_for("tcs", session=cur.get("session_id") or "",
+                                msg=f"TC를 실행 대상에서 {state}했습니다"))
 
     @app.route("/tcs/delete/<int:row_id>", methods=["POST"])
     def tcs_delete(row_id):
         _reject_cross_site()
+        cur = results_store.get_custom_tc(row_id, db_path=app.config["DB_PATH"])
         results_store.delete_custom_tc(row_id, db_path=app.config["DB_PATH"])
-        return redirect(url_for("tcs", msg="TC를 삭제했습니다"))
+        return redirect(url_for("tcs", session=(cur or {}).get("session_id") or "",
+                                msg="TC를 삭제했습니다"))
 
     return app
 
@@ -558,7 +654,7 @@ def _page(title, active, body):
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(title)}</title>
-<style>{STYLE}</style></head>
+<style>{STYLE}{SESSION_CSS}</style></head>
 <body>
   <nav><div class="inner">
     <span class="brand">QA_runner_K</span>
@@ -674,83 +770,64 @@ def _tc_changed(row, t):
 
 
 def _bulk_add_tcs(db_path, tcs, warnings, source_name, source_phrase):
-    """파싱된 TC들을 custom_tcs에 반영하고 안내 문구를 만든다. 엑셀 업로드와 구글 시트가 공유한다.
+    """파싱된 TC들을 **새 세션 하나**로 넣는다. 엑셀 업로드와 구글 시트가 공유한다.
+    반환: (안내 문구, 성공 여부, session_id)
 
-    [v0.18.0] 같은 시트의 같은 No 인 TC가 이미 있으면 새 줄을 만들지 않고 그 줄을 덮어쓴다.
-    v0.17.0까지는 내용이 조금이라도 다르면 새 줄로 쌓여서, 시트에서 고친 TC를 다시 가져와도
-    고치기 전 줄이 '실행 포함' 상태로 남아 같이 실행되는 문제가 있었다.
-    같은 키로 이미 여러 줄이 쌓여 있으면 첫 줄만 남기고 나머지는 지워서 예전 중복도 정리한다.
-    실행 포함/제외 상태(enabled)는 덮어써도 그대로 유지된다."""
-    index = {}
-    for row in results_store.list_custom_tcs(db_path=db_path):
-        index.setdefault(
-            _tc_key(row.get("sheet"), row.get("tc_no"), row.get("title")), []).append(row)
+    [v0.28.0] 불러오기 한 번 = 세션 하나. 그래서 여기서는 덮어쓰기(upsert)를 하지 않고
+    전부 새로 넣는다. 예전 세션의 TC는 지우지도, 고치지도 않는다.
 
-    added = updated = same = removed = failed = 0
-    seen = set()
+    v0.18.0에서 덮어쓰기를 넣었던 이유는 "시트를 고쳐 다시 불러왔는데 고치기 전 TC가
+    실행 포함으로 남아 같이 실행된다"는 문제 때문이었다. 이제는 **실행할 세션을 하나만
+    고르는** 구조라 그 상황이 생기지 않는다 - 새 세션만 선택되고 예전 세션은 꺼진다.
+    덮어쓰기를 걷어낸 대신 이력이 남아서, 어느 시점의 TC로 돌렸는지 되짚을 수 있다.
+
+    시트에서의 행 순서를 seq 로 같이 저장한다. 목록 정렬이 '시트 등록 순'이 되는 근거다.
+    """
+    sheets = []
     for t in tcs:
-        key = _tc_key(t.get("sheet"), t.get("no"), t.get("title"))
-        seen.add(key)
-        note = t["note"] or f"[{source_name}]"
-        old = index.get(key) or []
+        s = str(t.get("sheet") or "").strip()
+        if s and s not in sheets:
+            sheets.append(s)
+
+    label = f"{source_name} · {time.strftime('%m-%d %H:%M')}"
+    session_id = results_store.create_tc_session(
+        label, source=source_name, sheets=", ".join(sheets), select=True, db_path=db_path)
+
+    added = failed = 0
+    for i, t in enumerate(tcs):
         try:
-            if old:
-                head = old[0]
-                for dup in old[1:]:          # 예전 버전에서 쌓인 중복 줄 정리
-                    try:
-                        results_store.delete_custom_tc(dup["id"], db_path=db_path)
-                        removed += 1
-                    except Exception:
-                        pass
-                changed = _tc_changed(head, t)
-                results_store.update_custom_tc(
-                    head["id"], t["title"], t["steps"], t["expected"],
-                    precondition=t["precondition"], priority=t["priority"],
-                    tc_no=t["no"], note=note, sheet=t.get("sheet", ""), db_path=db_path,
-                )
-                if changed:
-                    updated += 1
-                else:
-                    same += 1
-                index[key] = [head]
-            else:
-                new_id = results_store.insert_custom_tc(
-                    t["title"], t["steps"], t["expected"],
-                    precondition=t["precondition"], priority=t["priority"],
-                    tc_no=t["no"], note=note,
-                    sheet=t.get("sheet", ""), db_path=db_path,
-                )
-                index[key] = [{"id": new_id, "title": t["title"], "steps": t["steps"],
-                               "expected": t["expected"], "precondition": t["precondition"],
-                               "priority": t["priority"], "sheet": t.get("sheet", ""),
-                               "tc_no": t["no"]}]
-                added += 1
+            results_store.insert_custom_tc(
+                t["title"], t["steps"], t["expected"],
+                precondition=t["precondition"], priority=t["priority"],
+                tc_no=t["no"], note=t["note"] or f"[{source_name}]",
+                sheet=t.get("sheet", ""), session_id=session_id, seq=i, db_path=db_path,
+            )
+            added += 1
         except Exception:
             failed += 1
 
-    # 이번 시트에는 없는데 DB에는 남아 있는 TC - 지우지는 않고 알려만 준다
-    sheets = {str(t.get("sheet") or "").strip() for t in tcs}
-    stale = sum(len(rows) for key, rows in index.items()
-                if key not in seen and key[1] in sheets)
+    if not added:
+        # 한 건도 못 넣었으면 빈 세션만 남는다 - 목록을 어지럽히지 않게 치운다
+        try:
+            results_store.delete_tc_session(session_id, db_path=db_path)
+        except Exception:
+            pass
+        parts = [f"{source_phrase} 가져올 TC가 없습니다"]
+        if failed:
+            parts.append(f"저장 실패 {failed}건")
+        if warnings:
+            parts.append(" / ".join(warnings[:3]))
+        return " · ".join(parts), False, None
 
-    parts = [f"{source_phrase} TC {added}건 추가"]
-    if updated:
-        parts.append(f"{updated}건 갱신")
-    if same:
-        parts.append(f"{same}건 변경 없음")
-    if removed:
-        parts.append(f"중복 {removed}건 정리")
+    parts = [f"{source_phrase} TC {added}건을 새 세션으로 가져왔습니다"]
+    if sheets:
+        parts.append("시트: " + ", ".join(sheets[:3]) + ("…" if len(sheets) > 3 else ""))
     if failed:
         parts.append(f"저장 실패 {failed}건")
-    if stale:
-        parts.append(f"시트에 없는 기존 TC {stale}건은 그대로 남아 있습니다")
     if warnings:
         parts.append(" / ".join(warnings[:3]))
-    if added or updated:
-        parts.append("프로그램에서 [TC 불러오기] 후 [시작]하면 실행됩니다")
-    # 전부 '변경 없음'이라 추가/갱신이 없는 건 오류가 아니므로 경고색으로 띄우지 않는다
-    ok = not failed and bool(added or updated or same)
-    return " · ".join(parts), ok
+    parts.append("이 세션이 실행 대상으로 선택되었습니다")
+    return " · ".join(parts), True, session_id
 
 
 def _when(ts):
@@ -870,6 +947,103 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
     return _page("QA_runner_K 실행 내역", "results", body)
 
 
+def _render_tc_import_forms():
+    """[NEW v0.28.0] TC 불러오기 카드. 세션 목록 화면에만 둔다 - 불러오기는 곧 새 세션이라서다."""
+    return f"""
+  <div class="card upload">
+    <form method="post" action="{_u('/tcs/import')}" enctype="multipart/form-data">
+      <label for="file">TC 엑셀 파일로 한 번에 추가</label>
+      <div class="sub" style="margin-bottom:10px">
+        확정된 포맷(No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
+        그대로 올리면 됩니다. <b>시트 이름에 "TC" 또는 "테스트케이스"가 들어간 시트는 모두</b> 읽고,
+        시트 이름이 화면 구분값으로 붙어 아래에서 시트별로 걸러볼 수 있습니다.
+        <b>가져올 때마다 세션이 하나 만들어지고, 그 세션이 실행 대상이 됩니다.</b>
+        예전 세션의 TC는 지워지지 않고 그대로 남아 있지만 실행되지는 않습니다 —
+        어느 시점의 TC로 돌렸는지 나중에 되짚어볼 수 있습니다.
+      </div>
+      <div class="actions">
+        <input type="file" id="file" name="file" accept=".xlsx,.xlsm" required>
+        <button type="submit" class="primary">엑셀에서 TC 가져오기</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card upload">
+    <form method="post" action="{_u('/tcs/import_url')}">
+      <label for="gurl">구글 스프레드시트 주소로 추가</label>
+      <div class="sub" style="margin-bottom:10px">
+        구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름에
+        <b>TC</b>(또는 테스트케이스)가 들어가면 되고, 컬럼은 위와 동일해야 합니다. 시트가 여러 개면 전부 가져옵니다.
+        시트가 <b>[공유] → '링크가 있는 모든 사용자'(뷰어)</b> 로 열려 있어야 읽을 수 있습니다.
+        시트에서 TC를 고친 뒤 다시 가져오면 <b>새 세션</b>으로 들어오고, 그 세션이 실행 대상이 됩니다.
+      </div>
+      <div class="actions">
+        <input type="text" id="gurl" name="url" style="max-width:520px"
+               placeholder="https://docs.google.com/spreadsheets/d/..../edit" required>
+        <button type="submit" class="primary">구글 시트에서 가져오기</button>
+      </div>
+    </form>
+  </div>
+"""
+
+
+def _render_tc_sessions(sessions, msg, err, rename_id=None):
+    """[NEW v0.28.0] TC 세션 목록. 실행 내역 화면과 같은 생김새로 맞췄다.
+
+    한 줄 = 불러오기 한 번. 줄을 누르면 그 세션의 TC 목록으로 들어간다."""
+    rows = []
+    for s in sessions:
+        sid = urllib.parse.quote(str(s["session_id"]))
+        detail = _u("/tcs?session=") + sid
+        picked = bool(s.get("selected"))
+        mark = ('<span class="pick on">실행 대상</span>' if picked
+                else f"""<form method="post" action="{_u('/tcs/session/select/')}{sid}" style="display:inline">
+      <button type="submit" class="btnlike">이 세션으로 실행</button>
+    </form>""")
+        if rename_id is not None and rename_id == s["session_id"]:
+            name_cell = f"""<form method="post" action="{_u('/tcs/session/rename/')}{sid}" class="rename">
+      <input type="text" name="label" value="{_esc(s.get('label'))}" maxlength="120"
+             placeholder="예) 환자관리 10월 회귀" autofocus>
+      <button type="submit" class="primary">저장</button>
+      <a class="btnlike" href="{_u('/tcs')}">취소</a>
+      <div class="sub2small">{_esc(_when(s['created_at']))}</div>
+    </form>"""
+            actions = ""
+        else:
+            name_cell = (f'<a class="runlink" href="{detail}">{_esc(s.get("label"))}</a>'
+                         f'<div class="sub2small">{_esc(_when(s["created_at"]))}</div>')
+            actions = f"""
+    <a class="btnlike" href="{detail}">TC 보기</a>
+    <a class="btnlike" href="{_u('/tcs?rename=')}{sid}">이름 수정</a>
+    <form method="post" action="{_u('/tcs/session/delete/')}{sid}" style="display:inline"
+          onsubmit="return confirm('{_esc(s.get('label'))} 세션과 그 안의 TC {s['tc_count']}건을 삭제할까요? 되돌릴 수 없습니다.');">
+      <button type="submit" class="danger">삭제</button>
+    </form>"""
+        rows.append(f"""<tr{' class="picked"' if picked else ''}>
+  <td>{name_cell}</td>
+  <td>{_esc(s.get('sheets') or '-')}</td>
+  <td>{s['tc_count']}건<div class="sub2small">실행 포함 {s['included_count']}건</div></td>
+  <td>{mark}</td>
+  <td class="right">{actions}</td>
+</tr>""")
+
+    msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
+    err_html = f'<div class="msg err">{_esc(err)}</div>' if err else ""
+    empty = ('<tr><td colspan="5">아직 세션이 없습니다. 아래에서 TC 엑셀이나 구글 시트를 '
+             '가져오면 세션이 하나 만들어집니다.</td></tr>')
+    body = f"""
+  <h2>TC 세션</h2>
+  <div class="sub">TC를 불러올 때마다 세션이 하나씩 쌓입니다. 줄을 누르면 그 세션의 TC를 봅니다.
+  <b>실행되는 것은 &apos;실행 대상&apos;으로 표시된 세션 하나뿐</b>이라, 예전 세션의 TC가 섞여 돌아가지 않습니다.</div>
+  {msg_html}{err_html}
+  <table>
+    <thead><tr><th>세션 이름 / 불러온 시각</th><th>시트</th><th>TC</th><th>실행</th><th class="right">&nbsp;</th></tr></thead>
+    <tbody>{''.join(rows) or empty}</tbody>
+  </table>
+  {_render_tc_import_forms()}"""
+    return _page("QA_runner_K TC 세션", "tcs", body)
+
+
 PROGRESS_REPORT_EVERY = 5   # [v0.23.0] 프로그램 로그의 중간 보고와 같은 단위
 
 
@@ -973,17 +1147,20 @@ def _render_results(results, current_run, current_sheet=None, run_label=""):
     return _page("QA_runner_K 실행 결과", "results", body)
 
 
-def _render_sheet_filter(sheets, current):
-    """[NEW v0.14.0] 시트(화면)별 필터 줄. 시트가 하나뿐이면 굳이 보여주지 않는다."""
+def _render_sheet_filter(sheets, current, session_id=""):
+    """[NEW v0.14.0] 시트(화면)별 필터 줄. 시트가 하나뿐이면 굳이 보여주지 않는다.
+    [v0.28.0] 세션 안에서 쓰므로 링크에 session 을 유지한다 - 안 그러면 세션 밖으로 튕긴다."""
     if not sheets or (len(sheets) == 1 and not sheets[0]["sheet"]):
         return ""
+    base = _u("/tcs") + ("?session=" + urllib.parse.quote(str(session_id)) if session_id else "")
+    joiner = "&" if session_id else "?"
     total = sum(s["total"] for s in sheets)
-    chips = [f'<a class="chip{"" if current is not None else " on"}" href="{_u("/tcs")}">전체 ({total})</a>']
+    chips = [f'<a class="chip{"" if current is not None else " on"}" href="{base}">전체 ({total})</a>']
     for s in sheets:
         name = s["sheet"]
         label = name or "(시트 없음)"
         on = " on" if current is not None and current == name else ""
-        chips.append(f'<a class="chip{on}" href="{_u("/tcs?sheet=")}{urllib.parse.quote(name)}">'
+        chips.append(f'<a class="chip{on}" href="{base}{joiner}sheet={urllib.parse.quote(name)}">'
                      f'{_esc(label)} ({s["enabled"]}/{s["total"]})</a>')
 
     bulk = ""
@@ -1009,7 +1186,10 @@ def _render_sheet_filter(sheets, current):
   <div class="sub" style="margin:-6px 0 14px">괄호 안은 (실행 포함 / 전체) 건수입니다. 프로그램은 '실행 포함'인 TC만 돌립니다.</div>"""
 
 
-def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
+def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None, session=None):
+    """세션 하나의 TC 목록. [v0.28.0] 세션 안에서만 보이도록 바뀌었다."""
+    session = session or {}
+    sid = urllib.parse.quote(str(session.get("session_id") or ""))
     editing = editing or {}
     is_edit = bool(editing.get("id"))
 
@@ -1020,9 +1200,10 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
 
     rows = []
     for tc in tc_list:
-        off = "" if tc.get("enabled") else ' class="off"'
+        inc = bool(tc.get("included"))
+        off = "" if inc else ' class="off"'
         no = _esc(tc.get("tc_no") or f"c{tc['id']}")
-        toggle_label = "실행 제외" if tc.get("enabled") else "실행 포함"
+        toggle_label = "실행 제외" if inc else "실행 포함"
         rows.append(f"""<tr{off}>
   <td>{no}</td>
   <td>{_esc(tc.get('sheet') or '-')}</td>
@@ -1030,10 +1211,10 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
   <td>{_esc(tc.get('priority'))}</td>
   <td class="pre">{_esc(tc.get('steps'))}</td>
   <td class="pre">{_esc(tc.get('expected'))}</td>
-  <td>{'포함' if tc.get('enabled') else '제외'}</td>
+  <td>{'포함' if inc else '제외'}</td>
   <td>
     <div class="actions">
-      <a href="{_u('/tcs?edit=')}{tc['id']}"><button type="button" class="link">수정</button></a>
+      <a href="{_u('/tcs?session=')}{sid}&edit={tc['id']}"><button type="button" class="link">수정</button></a>
       <form method="post" action="{_u('/tcs/toggle/')}{tc['id']}" style="display:inline">
         <button type="submit" class="link">{toggle_label}</button>
       </form>
@@ -1047,12 +1228,21 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
 
     msg_html = f'<div class="msg ok">{_esc(msg)}</div>' if msg else ""
     err_html = f'<div class="msg err">{_esc(err)}</div>' if err else ""
-    enabled_count = sum(1 for t in tc_list if t.get("enabled"))
+    enabled_count = sum(1 for t in tc_list if t.get("included"))
     title_suffix = f" - {_esc(current_sheet or '(시트 없음)')}" if current_sheet is not None else ""
+    if session.get("selected"):
+        session_state = ('<b class="pick on">실행 대상 세션입니다</b> — 아래에서 "포함"인 TC가 실행됩니다.<br>')
+    elif session:
+        session_state = (f'<b>지금은 실행 대상이 아닙니다.</b> 이 세션으로 돌리려면 '
+                         f'<a href="{_u("/tcs")}">세션 목록</a>에서 [이 세션으로 실행]을 눌러주세요.<br>')
+    else:
+        session_state = ""
 
     body = f"""
-  <h2>TC 관리</h2>
-  <div class="sub">엑셀 없이 여기서 TC를 작성하고, 프로그램에서 TC 소스를 <b>"대시보드 추가 TC"</b>로 선택해 그대로 실행할 수 있습니다.</div>
+  <p class="sub"><a href="{_u('/tcs')}">&#8592; TC 세션 목록</a></p>
+  <h2>{_esc(session.get('label') or 'TC 관리')}{title_suffix}</h2>
+  <div class="sub">{session_state}
+  엑셀 없이 여기서 TC를 작성하고, 프로그램에서 TC 소스를 <b>"대시보드 추가 TC"</b>로 선택해 그대로 실행할 수 있습니다.</div>
   {msg_html}{err_html}
 
   <div class="guide">
@@ -1070,44 +1260,10 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
     · "팝업이 노출된다" / "~화면으로 이동한다" 처럼 쓰면 팝업 등장·화면 이동을 직접 확인합니다.
   </div>
 
-  <div class="card upload">
-    <form method="post" action="{_u('/tcs/import')}" enctype="multipart/form-data">
-      <label for="file">TC 엑셀 파일로 한 번에 추가</label>
-      <div class="sub" style="margin-bottom:10px">
-        확정된 포맷(No / 테스트 항목 / 사전조건 / 테스트 절차 / 예상 결과 / 우선순위 / 결과 / 비고)
-        그대로 올리면 됩니다. <b>시트 이름에 "TC" 또는 "테스트케이스"가 들어간 시트는 모두</b> 읽고,
-        시트 이름이 화면 구분값으로 붙어 아래에서 시트별로 걸러볼 수 있습니다.
-        추가된 TC는 <b>실행 포함</b> 상태로 들어갑니다.
-        <b>다시 가져오면 같은 시트·같은 No 의 TC는 새로 쌓이지 않고 최신 내용으로 덮어씁니다</b>
-        (실행 포함/제외 상태는 그대로 유지됩니다).
-      </div>
-      <div class="actions">
-        <input type="file" id="file" name="file" accept=".xlsx,.xlsm" required>
-        <button type="submit" class="primary">엑셀에서 TC 가져오기</button>
-      </div>
-    </form>
-  </div>
-
-  <div class="card upload">
-    <form method="post" action="{_u('/tcs/import_url')}">
-      <label for="gurl">구글 스프레드시트 주소로 추가</label>
-      <div class="sub" style="margin-bottom:10px">
-        구글 시트 주소를 그대로 붙여넣으면 내려받지 않고 바로 가져옵니다. 시트 탭 이름에
-        <b>TC</b>(또는 테스트케이스)가 들어가면 되고, 컬럼은 위와 동일해야 합니다. 시트가 여러 개면 전부 가져옵니다.
-        시트가 <b>[공유] → '링크가 있는 모든 사용자'(뷰어)</b> 로 열려 있어야 읽을 수 있습니다.
-        시트에서 TC를 고친 뒤 <b>같은 주소로 다시 가져오면 기존 TC가 최신 내용으로 갱신</b>됩니다.
-      </div>
-      <div class="actions">
-        <input type="text" id="gurl" name="url" style="max-width:520px"
-               placeholder="https://docs.google.com/spreadsheets/d/..../edit" required>
-        <button type="submit" class="primary">구글 시트에서 가져오기</button>
-      </div>
-    </form>
-  </div>
-
   <div class="card">
     <form method="post" action="{_u('/tcs/save')}">
       <input type="hidden" name="id" value="{_esc(editing.get('id', ''))}">
+      <input type="hidden" name="session_id" value="{_esc(session.get('session_id', ''))}">
       <div class="grid">
         <div>
           <label class="req" for="title">테스트 항목</label>
@@ -1158,7 +1314,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None):
 
   <h2>추가된 TC{title_suffix} ({len(tc_list)}건 · 실행 대상 {enabled_count}건)</h2>
   <div class="sub">프로그램에서 <b>TC 소스 → "대시보드 추가 TC" → [TC 불러오기] → [시작]</b> 순서로 실행하세요.</div>
-  {_render_sheet_filter(sheets, current_sheet)}
+  {_render_sheet_filter(sheets, current_sheet, session.get('session_id',''))}
   <table>
     <thead><tr><th>No</th><th>시트</th><th>테스트 항목</th><th>우선순위</th><th>테스트 절차</th><th>예상 결과</th><th>실행</th><th></th></tr></thead>
     <tbody>{''.join(rows) or '<tr><td colspan="8">아직 추가된 TC가 없습니다. 위 폼에서 추가해보세요.</td></tr>'}</tbody>

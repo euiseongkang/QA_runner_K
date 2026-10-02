@@ -41,7 +41,7 @@ from tk_scrollable import ScrollableFrame
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.29.0"
+APP_VERSION = "0.30.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -1043,7 +1043,7 @@ class QAWorkerApp:
         # [NEW v0.4.0] 대시보드 화면에서 직접 추가한 TC로 실행
         ttk.Radiobutton(source_frame, text="대시보드 추가 TC", variable=self.tc_source_var,
                         value="custom", command=self._on_tc_source_change).grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(source_frame, text="EC2 세션", variable=self.tc_source_var,
+        ttk.Radiobutton(source_frame, text="서버 TC 세션", variable=self.tc_source_var,
                         value="ec2", command=self._on_tc_source_change).grid(row=0, column=2, sticky="w")
 
         self.local_file_frame = ttk.Frame(source_frame)
@@ -1404,6 +1404,40 @@ class QAWorkerApp:
             self._ensure_dashboard()
         self._open_browser(self._selected_dashboard_url("tcs"))
 
+    def _server_get(self, path, params=None, timeout=15):
+        """[v0.30.0] 서버 읽기 API 호출. 팀 주소 + 서버 전송 토큰을 쓴다.
+
+        서버 TC 세션은 말 그대로 '서버'를 보는 기능이라, 로컬/서버 전환 스위치와 무관하게
+        항상 팀 주소를 쓴다. 실패 이유는 사람이 알아볼 말로 바꿔서 올린다."""
+        base = (self.team_url_var.get() or "").strip()
+        token = (self.api_token_var.get() or "").strip()
+        if not base:
+            raise RuntimeError("팀 주소가 비어 있습니다. '팀 주소' 칸을 채워주세요")
+        if not token:
+            raise RuntimeError("서버 전송 토큰이 비어 있습니다. 토큰을 넣고 [연결 확인]을 눌러주세요")
+        r = requests.get(base.rstrip("/") + "/" + path, params=params, timeout=timeout,
+                         headers={"Authorization": "Bearer " + token})
+        if r.status_code == 401:
+            raise RuntimeError("토큰이 맞지 않습니다")
+        if r.status_code == 503:
+            raise RuntimeError("서버에 토큰이 설정되어 있지 않습니다")
+        if r.status_code == 404:
+            raise RuntimeError("서버에 해당 API가 없습니다. 새 dashboard_server.py를 배포했는지 확인해 주세요")
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def _rows_from_tc_response(data):
+        """[v0.30.0] 서버 /api/tcs 응답에서 TC 목록을 꺼낸다.
+
+        서버 버전에 따라 목록을 그대로 주기도 하고 {"tcs": [...]} 로 감싸 주기도 한다.
+        exe와 서버 버전이 어긋나는 일이 실제로 있었으므로 둘 다 받아준다.
+        한쪽만 고집하면 버전이 반 발짝만 어긋나도 조용히 실패한다."""
+        rows = data.get("tcs") if isinstance(data, dict) else data
+        if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+            raise ValueError("서버 TC 응답 형식이 올바르지 않습니다")
+        return [r for r in rows if r.get("included", r.get("enabled", True))]
+
     def _uses_server_dashboard(self):
         target = getattr(self, "dashboard_target_var", None)
         return target is not None and target.get() == "server"
@@ -1478,7 +1512,11 @@ class QAWorkerApp:
 
     # ---- EC2 연동 ----                                        [TODO: 실제 응답 필드명 확정 필요]
     def load_sessions(self):
-        ec2 = self.ec2_var.get().rstrip("/")
+        """[v0.30.0] 서버의 TC 세션 목록을 받아 콤보박스를 채운다.
+
+        예전에는 {ec2}/api/sessions 를 불렀는데 그 주소에는 /qa-k 접두어가 없어서,
+        우리 대시보드가 아니라 원래 서비스를 보고 있었다. '다른 서버의 세션이 보인다'는
+        증상의 원인이 그것이었다."""
         previous = self.session_var.get()
         self.session_map = {}
         self.session_combo.configure(values=())
@@ -1487,55 +1525,52 @@ class QAWorkerApp:
         self.sheet_var.set("")
         self._clear_ec2_tc_list()
         try:
-            resp = requests.get(f"{ec2}/api/sessions", timeout=10)
-            resp.raise_for_status()
-            sessions = resp.json()
-            if not isinstance(sessions, list) or any(not isinstance(s, dict) for s in sessions):
+            data = self._server_get("api/tc_sessions")
+            sessions = data.get("sessions") if isinstance(data, dict) else data
+            if not isinstance(sessions, list) or any(not isinstance(x, dict) for x in sessions):
                 raise ValueError("서버 세션 응답 형식이 올바르지 않습니다")
             for session in sessions:
-                if session.get("id") is None:
-                    raise ValueError("서버 세션 응답에 id가 없습니다")
-                name = session.get("name") or session.get("file_name") or "세션"
-                # 동명이 세션도 각각 선택할 수 있게 ID를 함께 표시한다.
-                self.session_map[f"{name} (ID: {session['id']})"] = session
+                sid = session.get("session_id")
+                if not sid:
+                    raise ValueError("서버 세션 응답에 session_id가 없습니다")
+                mark = " ★실행대상" if session.get("selected") else ""
+                name = session.get("label") or sid
+                self.session_map[f"{name} ({session.get('tc_count', 0)}건){mark}"] = session
             labels = list(self.session_map)
             self.session_combo.configure(values=labels)
-            self.session_var.set(previous if previous in self.session_map else (labels[0] if labels else ""))
-            self.log_msg(f"세션 {len(labels)}건 로드")
+            if previous in self.session_map:
+                self.session_var.set(previous)
+            elif labels:
+                self.session_var.set(next((n for n in labels if "★" in n), labels[0]))
+            self.log_msg(f"서버에서 세션 {len(labels)}건 로드")
         except Exception as e:
             self.session_map = {}
-            self.log_msg(f"⚠ 세션 로드 실패: {e}")
+            self.log_msg(f"⚠ 세션 로드 실패: {str(e)[:150]}")
             return
         if labels:
             self.load_sheets()
         else:
-            self.log_msg("⚠ 서버에 등록된 세션이 없습니다")
+            self.log_msg("⚠ 서버에 TC 세션이 없습니다. 대시보드에서 TC를 먼저 불러오세요")
 
     def load_sheets(self):
+        """[v0.30.0] 고른 세션의 시트 목록을 채운다.
+
+        세션 응답에 시트 이름이 이미 들어 있어 따로 물어볼 필요가 없다.
+        (예전에는 /api/sessions/{id}/sheets 를 한 번 더 불렀는데 그 주소는 없었다)"""
         self._clear_ec2_tc_list()
         self.sheet_combo.configure(values=("전체",))
         self.sheet_var.set("전체")
         session = self.session_map.get(self.session_var.get())
         if not session:
             return
-        ec2 = self.ec2_var.get().rstrip("/")
-        try:
-            response = requests.get(f"{ec2}/api/sessions/{session['id']}/sheets", timeout=10)
-            response.raise_for_status()
-            sheets = response.json()
-            if not isinstance(sheets, list):
-                raise ValueError("서버 시트 응답 형식이 올바르지 않습니다")
-            names = ["전체"]
-            for sheet in sheets:
-                name = sheet.get("name") if isinstance(sheet, dict) else sheet
-                if not isinstance(name, str):
-                    raise ValueError("서버 시트 응답에 시트 이름이 없습니다")
-                if name and name not in names:
-                    names.append(name)
-            self.sheet_combo.configure(values=names)
-            self.log_msg(f"시트 {len(names) - 1}건 로드. 시트를 선택한 뒤 [TC 불러오기]를 누르세요.")
-        except Exception as e:
-            self.log_msg(f"⚠ 시트 로드 실패: {e}. '전체'로 TC를 불러올 수 있습니다.")
+        names = ["전체"]
+        for name in str(session.get("sheets") or "").split(","):
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+        self.sheet_combo.configure(values=names)
+        if len(names) > 1:
+            self.log_msg(f"시트 {len(names) - 1}건. 시트를 고른 뒤 [TC 불러오기]를 누르세요.")
 
     def _clear_ec2_tc_list(self):
         if self.tc_source_var.get() == "ec2":
@@ -1573,10 +1608,8 @@ class QAWorkerApp:
                 if response.status_code == 404:
                     raise ValueError("서버에 TC 조회 API가 없습니다. 변경된 dashboard_server.py를 서버에 배포하세요")
                 response.raise_for_status()
-                rows = response.json()
-                if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
-                    raise ValueError("서버 TC 응답 형식이 올바르지 않습니다")
-                rows = [r for r in rows if r.get("enabled", True)]
+                # [v0.30.0] 목록이든 {"tcs": [...]} 든 둘 다 받는다.
+                rows = self._rows_from_tc_response(response.json())
             else:
                 rows = results_store.list_custom_tcs(only_enabled=True)
         except Exception as e:
@@ -1610,38 +1643,53 @@ class QAWorkerApp:
                          "[대시보드에서 TC 추가/수정...] 버튼으로 추가하세요")
 
     def _load_tcs_from_ec2(self):
-        """TC 목록 로드(EC2). 새 포맷 필드(테스트 항목/사전조건/테스트 절차/예상 결과/우선순위)로 매핑.
+        """서버 TC 세션에서 TC를 불러온다. [v0.30.0]
 
-        TODO: 실제 EC2 응답 JSON의 키 이름을 백엔드와 확인해서 아래 매핑을 맞출 것.
-        지금은 원본 API 계약(/api/sessions/{id}/tcs?sheet=...)을 그대로 가정하고,
-        원본 필드명(depth_path 등) 대신 새 포맷 필드명을 우선 사용하되 원본 키가
-        오면 폴백하도록 작성함 (백엔드 마이그레이션 전환기 대비).
-        """
-        ec2 = self.ec2_var.get().rstrip("/")
-        info = self.session_map.get(self.session_var.get(), {})
-        session_id = info.get("id") if isinstance(info, dict) else None
+        대시보드 추가 TC 경로와 완전히 같은 모양의 dict를 만든다.
+        실행 루프·판정·결과 저장은 TC가 어디서 왔는지 몰라도 된다."""
+        if not self.session_var.get():
+            self.log_msg("⚠ 먼저 [세션 불러오기]를 누르고 세션을 고르세요")
+            return
+        session = self.session_map.get(self.session_var.get()) or {}
+        session_id = session.get("session_id")
         if not session_id:
-            self.log_msg("⚠ 세션을 먼저 선택하세요")
+            self.log_msg("⚠ 세션을 다시 불러와 주세요")
             return
+        params = {"session": session_id}
         sheet = self.sheet_var.get()
-        url = f"{ec2}/api/sessions/{session_id}/tcs"
         if sheet and sheet != "전체":
-            url += f"?sheet={urllib.parse.quote(sheet)}"
+            params["sheet"] = sheet
         try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            raw_tcs = resp.json()
+            rows = self._rows_from_tc_response(self._server_get("api/tcs", params=params))
         except Exception as e:
-            self.log_msg(f"⚠ TC 로드 실패: {e}")
+            self.log_msg(f"⚠ TC 로드 실패: {str(e)[:150]}")
             return
 
-        self.tc_data = [self._normalize_tc(t) for t in raw_tcs]
+        tcs = []
+        for r in rows:
+            tc_id = clean_text(r.get("tc_no")) or f"c{r.get('id')}"
+            tcs.append({
+                "id": f"server:{r.get('id')}",
+                "tc_id": tc_id,
+                "sheet_name": clean_text(r.get("sheet")) or "서버",
+                "title": clean_text(r.get("title")),
+                "precondition": clean_text(r.get("precondition")),
+                "steps": r.get("steps") or "",
+                "expected": clean_text(r.get("expected")),
+                "priority": clean_text(r.get("priority")) or "미지정",
+                "note": clean_text(r.get("note")),
+                "result": "",
+            })
+
+        self.tc_data = tcs
         self.tc_listbox.delete(0, "end")
         for tc in self.tc_data:
-            self.tc_listbox.insert(
-                "end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}"
-            )
-        self.log_msg(f"TC {len(self.tc_data)}건 로드")
+            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        label = session.get("label") or session_id
+        if tcs:
+            self.log_msg(f"서버 세션 '{label}'에서 TC {len(tcs)}건 로드")
+        else:
+            self.log_msg(f"⚠ 세션 '{label}'에 '실행 포함' 상태인 TC가 없습니다")
 
     @staticmethod
     def _normalize_tc(raw: dict) -> dict:

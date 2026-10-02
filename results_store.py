@@ -9,6 +9,7 @@ EC2를 TC 소스로 쓰는 경우에도 동일하게 로컬에 남겨서, 로컬
 """
 
 import os
+import secrets
 import sqlite3
 import time
 
@@ -68,6 +69,29 @@ CREATE TABLE IF NOT EXISTS custom_tcs (
 """
 
 
+# [NEW v0.28.0] TC 불러오기 한 번 = 세션 하나.
+# 전에는 묶음 구분이 '시트 이름'뿐이라, 같은 시트를 고쳐서 다시 불러오면 덮어쓰는 수밖에 없었다
+# (v0.18.0). 이제는 불러올 때마다 세션이 쌓이고, **실행할 세션을 고르는** 방식으로 바꾼다.
+# 고른 세션의 TC만 실행되므로 옛 세션이 섞여 실행되던 문제가 구조적으로 사라진다.
+#
+# 중요한 설계: 프로그램(exe)은 예전처럼 enabled=1 인 TC를 읽는다. 그래서 enabled 를
+# **파생 값**으로 둔다 -> enabled = (세션이 선택됨) AND (TC가 포함됨).
+# 사람이 끄고 켜는 값은 custom_tcs.included 에 따로 저장하므로, 세션 선택을 바꿔도
+# 개별 TC의 포함/제외 상태가 보존된다. 덕분에 **exe를 다시 빌드하지 않아도 동작한다.**
+TC_SESSION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tc_sessions (
+    session_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,           -- 사람이 알아볼 이름. 기본값은 출처 + 시각
+    source TEXT,                   -- 엑셀 파일명 / 구글 시트 / 직접 작성
+    sheets TEXT,                   -- 이 세션에 들어온 시트 이름들 (쉼표로 이어붙임)
+    selected INTEGER NOT NULL DEFAULT 0,   -- 실행 대상 세션인가
+    created_at REAL NOT NULL
+);
+"""
+
+LEGACY_SESSION_ID = "legacy"       # 세션 개념이 생기기 전에 있던 TC들을 담을 자리
+
+
 def _base_dir():
     """exe로 빌드됐을 때도 실행 파일 옆에 DB/스크린샷을 두기 위한 기준 경로."""
     import sys
@@ -104,6 +128,7 @@ def _connect(db_path=None):
     conn.execute(SCHEMA)
     conn.execute(CUSTOM_TC_SCHEMA)
     conn.execute(RUN_LABEL_SCHEMA)
+    conn.execute(TC_SESSION_SCHEMA)          # [v0.28.0]
     _migrate(conn)
     return conn
 
@@ -135,6 +160,44 @@ def _migrate(conn):
                 conn.commit()
         except Exception:
             pass
+
+    # [v0.28.0] 세션 컬럼 추가. 이미 쓰고 있는 DB가 있으므로 지우고 다시 만들면 안 된다.
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(custom_tcs)").fetchall()}
+        for name, decl in (("session_id", "TEXT"),
+                           ("seq", "INTEGER"),
+                           ("included", "INTEGER NOT NULL DEFAULT 1")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE custom_tcs ADD COLUMN {name} {decl}")
+        conn.commit()
+    except Exception:
+        return          # 컬럼을 못 만들었으면 아래 백필도 의미가 없다
+
+    # 세션이 없던 시절의 TC를 '기존 TC' 세션으로 옮긴다. 사라지는 TC가 있으면 안 된다.
+    try:
+        orphan = conn.execute(
+            "SELECT COUNT(*) FROM custom_tcs WHERE IFNULL(session_id,'')=''").fetchone()[0]
+        if orphan:
+            conn.execute(
+                "INSERT OR IGNORE INTO tc_sessions"
+                " (session_id, label, source, sheets, selected, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (LEGACY_SESSION_ID, "기존 TC (세션 구분 전)", "", "", 1, time.time()),
+            )
+            # included 는 지금까지의 enabled 를 그대로 물려받는다 - 꺼둔 TC가 되살아나지 않게.
+            conn.execute(
+                "UPDATE custom_tcs SET session_id=?, included=enabled"
+                " WHERE IFNULL(session_id,'')=''", (LEGACY_SESSION_ID,))
+            conn.commit()
+        # seq 가 비어 있으면 id 순서를 등록 순으로 본다(그때까지의 실제 입력 순서).
+        missing = conn.execute(
+            "SELECT id FROM custom_tcs WHERE seq IS NULL ORDER BY id").fetchall()
+        if missing:
+            conn.executemany("UPDATE custom_tcs SET seq=? WHERE id=?",
+                             [(i, r[0]) for i, r in enumerate(missing)])
+            conn.commit()
+    except Exception:
+        pass
 
 
 def insert_result(tc: dict, result: str, reason: str, source: str, source_ref: str,
@@ -432,10 +495,11 @@ def _clip(value, limit=MAX_FIELD_LEN):
 
 
 def insert_custom_tc(title, steps, expected, precondition="", priority="", tc_no="", note="",
-                     sheet="", db_path=None):
+                     sheet="", session_id=None, seq=None, db_path=None):
     """대시보드 입력 폼에서 TC 1건 추가. 추가된 row id 반환.
     필수는 테스트 항목/테스트 절차/예상 결과 3개 (엑셀 로더의 필수 컬럼과 동일 기준).
-    sheet는 엑셀/구글 시트의 시트 이름 = 화면별 구분값. [v0.14.0]"""
+    sheet는 엑셀/구글 시트의 시트 이름 = 화면별 구분값. [v0.14.0]
+    session_id/seq 는 [v0.28.0] - seq 가 시트에서의 행 순서라 목록 정렬 기준이 된다."""
     title, steps, expected = _clip(title), _clip(steps), _clip(expected)
     if not title or not steps or not expected:
         raise ValueError("테스트 항목 / 테스트 절차 / 예상 결과는 필수입니다")
@@ -444,15 +508,18 @@ def insert_custom_tc(title, steps, expected, precondition="", priority="", tc_no
         cur = conn.execute(
             """INSERT INTO custom_tcs
                (tc_no, title, precondition, steps, expected, priority, note, sheet,
-                enabled, created_at)
-               VALUES (?,?,?,?,?,?,?,?,1,?)""",
+                session_id, seq, included, enabled, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,1,1,?)""",
             (_clip(tc_no, 40), title, _clip(precondition), steps, expected,
-             _clip(priority, 20), _clip(note, 500), _clip(sheet, 100), time.time()),
+             _clip(priority, 20), _clip(note, 500), _clip(sheet, 100),
+             (str(session_id) if session_id else None), seq, time.time()),
         )
         conn.commit()
-        return cur.lastrowid
+        row_id = cur.lastrowid
     finally:
         conn.close()
+    _recompute_enabled(db_path)      # 선택되지 않은 세션에 넣었으면 enabled 는 0이 된다
+    return row_id
 
 
 def update_custom_tc(row_id, title, steps, expected, precondition="", priority="", tc_no="",
@@ -494,9 +561,12 @@ def delete_custom_tc(row_id, db_path=None):
         conn.close()
 
 
-def list_custom_tcs(only_enabled=False, sheet=None, db_path=None):
+def list_custom_tcs(only_enabled=False, sheet=None, session_id=None, db_path=None):
     """대시보드에서 추가한 TC 목록. 프로그램 실행 시에는 only_enabled=True로 쓴다.
-    sheet를 주면 그 시트(화면)의 TC만. [v0.14.0]"""
+    sheet를 주면 그 시트(화면)의 TC만. [v0.14.0]  session_id 필터는 [v0.28.0]
+
+    [v0.28.0] 정렬을 id 에서 **시트 등록 순(seq)** 으로 바꿨다.
+    id 순이면 나중에 시트 중간에 끼워 넣은 TC가 목록 맨 끝에 붙어서, 시트와 순서가 달라진다."""
     conn = _connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -507,23 +577,157 @@ def list_custom_tcs(only_enabled=False, sheet=None, db_path=None):
         if sheet is not None:
             where.append("IFNULL(sheet,'')=?")
             args.append(str(sheet))
+        if session_id is not None:
+            where.append("IFNULL(session_id,'')=?")
+            args.append(str(session_id))
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY id"
+        sql += " ORDER BY IFNULL(seq, id), id"
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
     finally:
         conn.close()
 
 
-def list_custom_tc_sheets(db_path=None):
-    """시트(화면)별 TC 건수. 대시보드 필터를 만들기 위한 것. [NEW v0.14.0]
-    [{sheet, total, enabled}, ...] - 시트 이름이 없는 TC는 sheet=''로 묶인다."""
+# ============================================================
+# TC 세션                                                      [NEW v0.28.0]
+# ============================================================
+
+def create_tc_session(label, source="", sheets="", select=True, db_path=None):
+    """불러오기 한 번에 해당하는 세션을 만든다. 반환: session_id
+
+    select=True 면 이 세션만 실행 대상이 된다 - 방금 불러온 것이 실행되는 게 자연스럽고,
+    예전 세션이 같이 실행돼 옛 TC가 섞이는 사고(v0.18.0)를 막는다.
+    예전 세션의 TC 자체는 건드리지 않는다(지우지도, 내용을 바꾸지도 않는다)."""
+    session_id = time.strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(2)
     conn = _connect(db_path)
     try:
+        conn.execute(
+            "INSERT INTO tc_sessions (session_id, label, source, sheets, selected, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (session_id, _clip(str(label or session_id)), _clip(str(source or "")),
+             _clip(str(sheets or "")), 0, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if select:
+        set_tc_session_selected(session_id, True, exclusive=True, db_path=db_path)
+    return session_id
+
+
+def list_tc_sessions(db_path=None):
+    """세션 목록을 최신순으로. 각 세션의 TC 건수와 실행 포함 건수를 같이 준다."""
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM tc_sessions ORDER BY created_at DESC").fetchall()]
+        counts = {}
+        for sid, total, on in conn.execute(
+                "SELECT IFNULL(session_id,''), COUNT(*), SUM(CASE WHEN included=1 THEN 1 ELSE 0 END)"
+                " FROM custom_tcs GROUP BY IFNULL(session_id,'')").fetchall():
+            counts[sid] = (total, on or 0)
+        for r in rows:
+            r["tc_count"], r["included_count"] = counts.get(r["session_id"], (0, 0))
+        return rows
+    finally:
+        conn.close()
+
+
+def get_tc_session(session_id, db_path=None):
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        r = conn.execute("SELECT * FROM tc_sessions WHERE session_id=?",
+                         (str(session_id),)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def rename_tc_session(session_id, label, db_path=None):
+    label = _clip(str(label or "").strip())
+    if not label:
+        raise ValueError("세션 이름이 비어 있습니다")
+    conn = _connect(db_path)
+    try:
+        conn.execute("UPDATE tc_sessions SET label=? WHERE session_id=?",
+                     (label, str(session_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_tc_session(session_id, db_path=None):
+    """세션과 그 안의 TC를 함께 지운다. 다른 세션은 건드리지 않는다. 반환: 지운 TC 수"""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        raise ValueError("session_id가 필요합니다")
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute("DELETE FROM custom_tcs WHERE IFNULL(session_id,'')=?", (session_id,))
+        conn.execute("DELETE FROM tc_sessions WHERE session_id=?", (session_id,))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def set_tc_session_selected(session_id, selected, exclusive=False, db_path=None):
+    """세션을 실행 대상으로 켜거나 끈다. exclusive=True면 이 세션만 남기고 나머지는 끈다."""
+    conn = _connect(db_path)
+    try:
+        if exclusive:
+            conn.execute("UPDATE tc_sessions SET selected=0")
+        conn.execute("UPDATE tc_sessions SET selected=? WHERE session_id=?",
+                     (1 if selected else 0, str(session_id)))
+        conn.commit()
+    finally:
+        conn.close()
+    _recompute_enabled(db_path)
+
+
+def set_custom_tc_included(row_id, included, db_path=None):
+    """TC 하나의 실행 포함/제외. 세션 선택과 곱해져 enabled 가 정해진다. [v0.28.0]"""
+    conn = _connect(db_path)
+    try:
+        conn.execute("UPDATE custom_tcs SET included=? WHERE id=?",
+                     (1 if included else 0, int(row_id)))
+        conn.commit()
+    finally:
+        conn.close()
+    _recompute_enabled(db_path)
+
+
+def _recompute_enabled(db_path=None):
+    """enabled = (세션이 선택됨) AND (TC가 포함됨).
+
+    프로그램(exe)은 예전 그대로 enabled=1 을 읽으므로, 이 한 줄이 두 세계를 이어준다.
+    세션 개념을 몰라도 exe가 올바른 TC만 실행하게 되는 지점이다."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE custom_tcs SET enabled = CASE WHEN included=1 AND IFNULL(session_id,'') IN"
+            " (SELECT session_id FROM tc_sessions WHERE selected=1) THEN 1 ELSE 0 END")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_custom_tc_sheets(session_id=None, db_path=None):
+    """시트(화면)별 TC 건수. 대시보드 필터를 만들기 위한 것. [NEW v0.14.0]
+    [{sheet, total, enabled}, ...] - 시트 이름이 없는 TC는 sheet=''로 묶인다.
+    session_id 를 주면 그 세션 안에서만 센다. [v0.28.0]"""
+    conn = _connect(db_path)
+    try:
+        where, args = "", []
+        if session_id is not None:
+            where = " WHERE IFNULL(session_id,'')=?"
+            args.append(str(session_id))
         rows = conn.execute(
-            """SELECT IFNULL(sheet,''), COUNT(*), SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END)
-               FROM custom_tcs GROUP BY IFNULL(sheet,'') ORDER BY IFNULL(sheet,'')"""
-        ).fetchall()
+            "SELECT IFNULL(sheet,''), COUNT(*), SUM(CASE WHEN included=1 THEN 1 ELSE 0 END)"
+            " FROM custom_tcs" + where + " GROUP BY IFNULL(sheet,'') ORDER BY IFNULL(sheet,'')",
+            args).fetchall()
         return [{"sheet": r[0], "total": r[1], "enabled": r[2] or 0} for r in rows]
     finally:
         conn.close()
