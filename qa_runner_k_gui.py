@@ -35,12 +35,11 @@ import requests
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
-from tk_clipboard import install_clipboard_support
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.28.0"
+APP_VERSION = "0.29.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -57,7 +56,10 @@ CONFIG_FILENAME = "qa_runner_k_config.json"  # 시작 URL/로그인 정보 등 �
 
 # [NEW v0.25.0] 팀 공용 대시보드(EC2) 주소.
 # [대시보드 바로가기]와 [주소 복사]는 이 주소를 쓴다 - 링크를 팀에 공유하기 위한 버튼이기 때문.
-# [결과 보기]와 TC 관리·조회는 기존처럼 로컬 대시보드를 사용한다.
+# 반면 [결과 보기]와 TC 관리는 그대로 로컬 대시보드(127.0.0.1:8765)를 쓴다.
+#   이유: 실행 결과와 스크린샷은 아직 이 PC의 SQLite에만 쌓인다. PC->서버 업로드 API가
+#   없는 상태에서 [결과 보기]까지 서버로 보내면 방금 돌린 결과가 안 보인다.
+#   업로드 API가 생기면 두 경로를 하나로 합칠 것.
 # 값을 비워두면 [대시보드 바로가기]도 로컬 대시보드로 되돌아간다(서버를 안 쓰는 PC 대비).
 TEAM_DASHBOARD_URL = "https://qa.healthkoob.com/qa-k/"
 
@@ -70,7 +72,7 @@ RESULT_NEEDS_REVIEW = "확인 필요"
 
 # 모달/팝업 판별 셀렉터. 실제 LabConnect staging의 환자 등록 팝업이 role="dialog"를 갖고 있는 걸
 # 브라우저로 직접 확인함(2026-09-11). 여러 곳에서 쓰므로 상수로 둔다.
-MODAL_SELECTOR = 'div[role="dialog"], .modal, .app-modal-overlay, [class*="modal"], [class*="popup"]'
+MODAL_SELECTOR = 'div[role="dialog"], .modal, [class*="modal"], [class*="popup"]'
 
 
 # ============================================================
@@ -872,10 +874,6 @@ class QAWorkerApp:
 
         # [NEW] TC 소스: 로컬 엑셀 파일을 바로 읽거나(local), 기존처럼 EC2 세션에서 불러오거나(ec2)
         self.tc_source_var = tk.StringVar(value="local")
-        # 소스 실행에서만 명시적으로 서버 TC를 선택한다. 기존 EXE는 로컬 동작 유지.
-        self.dashboard_target_var = (tk.StringVar(value="local")
-                                     if not getattr(sys, "frozen", False) else None)
-        self._dashboard_target = "local"
         self.local_xlsx_path_var = tk.StringVar(value="")
         self._dashboard_addr = None  # (host, port) - "결과 보기"로 이미 띄운 서버가 있으면 재사용
         # [NEW v0.11.0] 대시보드 주소를 화면에 띄워서 복사/북마크할 수 있게 한다.
@@ -898,7 +896,6 @@ class QAWorkerApp:
 
         self._load_local_config()
         self._build_ui()
-        install_clipboard_support(self.root)
         # [NEW v0.4.0] 대시보드에서 TC를 작성할 수 있게 되었으니 시작 시 미리 띄운다
         self._ensure_dashboard()
         self.check_update_and_prompt()
@@ -979,24 +976,12 @@ class QAWorkerApp:
         # [NEW] TC 소스 선택 영역 - 로컬 엑셀 파일을 바로 읽을지, EC2 세션에서 불러올지
         source_frame = ttk.LabelFrame(self.root, text="TC 소스", padding=8)
         source_frame.pack(fill="x", padx=8, pady=4)
-        self.dashboard_target_frame = None
-        if self.dashboard_target_var is not None:
-            source_header = ttk.Frame(source_frame)
-            ttk.Label(source_header, text="TC 소스").pack(side="left")
-            self.dashboard_target_frame = ttk.Frame(source_header)
-            ttk.Radiobutton(self.dashboard_target_frame, text="로컬 QA 대시보드",
-                            variable=self.dashboard_target_var, value="local",
-                            command=self._on_dashboard_target_change).pack(side="left")
-            ttk.Radiobutton(self.dashboard_target_frame, text="서버 (qa.healthkoob.com)",
-                            variable=self.dashboard_target_var, value="server",
-                            command=self._on_dashboard_target_change).pack(side="left", padx=8)
-            source_frame.configure(labelwidget=source_header)
         ttk.Radiobutton(source_frame, text="로컬 엑셀 파일", variable=self.tc_source_var,
                         value="local", command=self._on_tc_source_change).grid(row=0, column=0, sticky="w")
         # [NEW v0.4.0] 대시보드 화면에서 직접 추가한 TC로 실행
         ttk.Radiobutton(source_frame, text="대시보드 추가 TC", variable=self.tc_source_var,
                         value="custom", command=self._on_tc_source_change).grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(source_frame, text="EC2 세션", variable=self.tc_source_var,
+        ttk.Radiobutton(source_frame, text="서버 TC 세션", variable=self.tc_source_var,
                         value="ec2", command=self._on_tc_source_change).grid(row=0, column=2, sticky="w")
 
         self.local_file_frame = ttk.Frame(source_frame)
@@ -1018,14 +1003,15 @@ class QAWorkerApp:
         self.ec2_session_frame = ttk.Frame(source_frame)
         self.ec2_session_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Button(self.ec2_session_frame, text="세션 불러오기", command=self.load_sessions).grid(row=0, column=0)
+        # [v0.29.0] 콤보박스를 변수로 들고 있어야 목록을 채울 수 있다.
+        # 예전에는 생성만 하고 참조를 안 남겨서, 세션을 불러와도 채울 방법이 없었다.
         self.session_combo = ttk.Combobox(self.ec2_session_frame, textvariable=self.session_var,
-                                         width=30, state="readonly")
-        self.session_combo.grid(row=0, column=1)
-        self.session_combo.bind("<<ComboboxSelected>>", lambda event: self.load_sheets())
+                                          width=34, state="readonly")
+        self.session_combo.grid(row=0, column=1, padx=4)
+        self.session_combo.bind("<<ComboboxSelected>>", lambda e: self._fill_sheets())
         self.sheet_combo = ttk.Combobox(self.ec2_session_frame, textvariable=self.sheet_var,
-                                       width=20, state="readonly")
+                                        width=20, state="readonly")
         self.sheet_combo.grid(row=0, column=2)
-        self.sheet_combo.bind("<<ComboboxSelected>>", lambda event: self._clear_ec2_tc_list())
 
         # 세션/시트/TC 선택 영역
         sel_frame = ttk.LabelFrame(self.root, text="TC 목록", padding=8)
@@ -1102,11 +1088,6 @@ class QAWorkerApp:
         for f in frames.values():
             f.grid_remove()
         frames.get(self.tc_source_var.get(), self.local_file_frame).grid()
-        if self.dashboard_target_frame is not None:
-            if self.tc_source_var.get() == "custom":
-                self.dashboard_target_frame.pack(side="left", padx=(12, 0))
-            else:
-                self.dashboard_target_frame.pack_forget()
 
     def _choose_local_xlsx(self):
         path = filedialog.askopenfilename(
@@ -1206,25 +1187,21 @@ class QAWorkerApp:
         return base + path
 
     def open_dashboard(self):
-        """소스 실행은 선택한 대상, 기존 EXE는 팀 대시보드를 연다."""
-        if getattr(self, "dashboard_target_var", None) is not None:
-            if not self._uses_server_dashboard():
-                self._ensure_dashboard()
-            self._open_browser(self._selected_dashboard_url())
-            return
+        """[대시보드 바로가기] - 팀 공용 대시보드를 새 창으로.
+        [NEW v0.11.0] / [v0.25.0] 로컬 주소 -> 팀 서버 주소로 변경.
+
+        주의: 실행 결과는 아직 이 PC에만 쌓이므로 방금 돌린 결과는 여기서 안 보인다.
+        그건 [결과 보기](로컬)에서 본다. PC->서버 업로드 API가 생기면 하나로 합칠 것."""
         if not (self.team_url_var.get() or "").strip():
             self._ensure_dashboard()  # 로컬로 되돌아가는 경우에만 서버를 띄운다
         self._open_browser(self._team_url())
 
     def copy_dashboard_url(self):
-        """소스 실행은 선택한 대상, 기존 EXE는 팀 대시보드 주소를 복사한다."""
-        if (getattr(self, "dashboard_target_var", None) is not None
-                and not self._uses_server_dashboard()):
+        """주소를 클립보드로. 다른 브라우저나 메신저에 붙여넣을 때 쓴다.
+        [NEW v0.11.0] / [v0.25.0] 팀 서버 주소를 복사한다 - 남에게 보낼 수 있는 주소여야 하므로."""
+        if not (self.team_url_var.get() or "").strip():
             self._ensure_dashboard()
-        elif not (self.team_url_var.get() or "").strip():
-            self._ensure_dashboard()
-        url = (self._selected_dashboard_url()
-               if getattr(self, "dashboard_target_var", None) is not None else self._team_url())
+        url = self._team_url()
         if not url:
             return
         try:
@@ -1345,32 +1322,8 @@ class QAWorkerApp:
 
     def open_tc_dashboard(self):
         """대시보드의 'TC 관리' 화면을 바로 연다. [NEW v0.4.0]"""
-        if not self._uses_server_dashboard():
-            self._ensure_dashboard()
-        self._open_browser(self._selected_dashboard_url("tcs"))
-
-    def _uses_server_dashboard(self):
-        target = getattr(self, "dashboard_target_var", None)
-        return target is not None and target.get() == "server"
-
-    def _selected_dashboard_url(self, path=""):
-        if self._uses_server_dashboard():
-            base = (self.team_url_var.get() or TEAM_DASHBOARD_URL).strip()
-            return base.rstrip("/") + "/" + path
-        return self._dashboard_url(path)
-
-    def _on_dashboard_target_change(self):
-        if self.running:
-            self.dashboard_target_var.set(self._dashboard_target)
-            self.log_msg("⚠ 실행 중에는 대시보드 연결 대상을 변경할 수 없습니다")
-            return
-        self._dashboard_target = self.dashboard_target_var.get()
-        # 다른 대상에서 불러온 TC를 잘못 실행하지 않도록 목록을 비운다.
-        if self.tc_source_var.get() == "custom":
-            self.tc_data = []
-            self.tc_listbox.delete(0, "end")
-        label = "서버" if self._uses_server_dashboard() else "로컬"
-        self.log_msg(f"QA 대시보드 연결 대상: {label}. 대시보드 TC는 [TC 불러오기]로 다시 불러오세요.")
+        self._ensure_dashboard()
+        self._open_browser(self._dashboard_url("tcs"))
 
     def log_msg(self, msg, tag="info"):
         def _append():
@@ -1421,71 +1374,72 @@ class QAWorkerApp:
             else:
                 self.log_msg("⚠ 다운로드 URL을 찾지 못했습니다.")
 
-    # ---- EC2 연동 ----                                        [TODO: 실제 응답 필드명 확정 필요]
+    # ---- 서버 TC 세션 ----                                   [v0.29.0 전면 수정]
+    # 전에는 원래 도구의 API 주소(DEFAULT_EC2_API = https://qa.healthkoob.com)를 그대로
+    # 가정한 미완성 뼈대였다. /qa-k 접두어가 없어서 **우리 대시보드가 아니라 원래 서비스**를
+    # 부르고 있었고, load_sheets() 는 비어 있었으며 세션 콤보박스도 갱신되지 않았다.
+    #
+    # 이제 결과 전송과 **같은 주소·같은 토큰**(팀 주소 + 서버 전송 토큰)을 쓴다.
+    # 서버를 가리키는 설정이 두 군데라 서로 다른 곳을 보던 것이 이 사고의 원인이라,
+    # 아예 하나로 합쳤다.
+
+    def _server_get(self, path, params=None, timeout=15):
+        """서버 읽기 API 호출. 실패하면 사람이 알아볼 이유를 붙여 예외를 올린다."""
+        token = (self.api_token_var.get() or "").strip()
+        if not (self.team_url_var.get() or "").strip():
+            raise RuntimeError("팀 주소가 비어 있습니다. '팀 주소' 칸을 채워주세요")
+        if not token:
+            raise RuntimeError("서버 전송 토큰이 비어 있습니다. 토큰을 넣고 [연결 확인]을 눌러주세요")
+        r = requests.get(self._team_url(path), params=params, timeout=timeout,
+                         headers={"Authorization": "Bearer " + token})
+        if r.status_code == 401:
+            raise RuntimeError("토큰이 맞지 않습니다")
+        if r.status_code == 503:
+            raise RuntimeError("서버에 토큰이 설정되어 있지 않습니다")
+        if r.status_code == 404:
+            raise RuntimeError((r.json() or {}).get("error") or "서버에서 찾지 못했습니다")
+        r.raise_for_status()
+        return r.json() or {}
+
     def load_sessions(self):
-        ec2 = self.ec2_var.get().rstrip("/")
-        previous = self.session_var.get()
-        self.session_map = {}
-        self.session_combo.configure(values=())
-        self.session_var.set("")
-        self.sheet_combo.configure(values=())
-        self.sheet_var.set("")
-        self._clear_ec2_tc_list()
+        """[세션 불러오기] - 서버의 TC 세션 목록을 받아 콤보박스를 채운다."""
         try:
-            resp = requests.get(f"{ec2}/api/sessions", timeout=10)
-            resp.raise_for_status()
-            sessions = resp.json()
-            if not isinstance(sessions, list) or any(not isinstance(s, dict) for s in sessions):
-                raise ValueError("서버 세션 응답 형식이 올바르지 않습니다")
-            for session in sessions:
-                if session.get("id") is None:
-                    raise ValueError("서버 세션 응답에 id가 없습니다")
-                name = session.get("name") or session.get("file_name") or "세션"
-                # 동명이 세션도 각각 선택할 수 있게 ID를 함께 표시한다.
-                self.session_map[f"{name} (ID: {session['id']})"] = session
-            labels = list(self.session_map)
-            self.session_combo.configure(values=labels)
-            self.session_var.set(previous if previous in self.session_map else (labels[0] if labels else ""))
-            self.log_msg(f"세션 {len(labels)}건 로드")
+            data = self._server_get("api/tc_sessions")
         except Exception as e:
-            self.session_map = {}
-            self.log_msg(f"⚠ 세션 로드 실패: {e}")
+            self.log_msg(f"⚠ 세션 로드 실패: {str(e)[:150]}")
             return
-        if labels:
-            self.load_sheets()
+        sessions = data.get("sessions") or []
+        self.session_map = {}
+        names = []
+        for s in sessions:
+            mark = " ★실행대상" if s.get("selected") else ""
+            name = f"{s.get('label') or s.get('session_id')} ({s.get('tc_count', 0)}건){mark}"
+            self.session_map[name] = s
+            names.append(name)
+        self.session_combo["values"] = names
+        self.sheet_combo["values"] = []
+        self.sheet_var.set("")
+        if names:
+            # 서버에서 '실행 대상'인 세션을 기본으로 골라준다 - 대개 그걸 돌리려는 참이다
+            default = next((n for n in names if "★" in n), names[0])
+            self.session_var.set(default)
+            self._fill_sheets()
+            self.log_msg(f"서버에서 세션 {len(names)}건 로드 - {self._team_url()}")
         else:
-            self.log_msg("⚠ 서버에 등록된 세션이 없습니다")
+            self.session_var.set("")
+            self.log_msg("⚠ 서버에 TC 세션이 없습니다. 대시보드에서 TC를 먼저 불러오세요")
+
+    def _fill_sheets(self):
+        """고른 세션에 들어 있는 시트 목록을 시트 콤보박스에 채운다.
+        예전에는 load_sheets() 가 비어 있어서(pass) 시트 칸이 늘 비어 있었다."""
+        info = self.session_map.get(self.session_var.get()) or {}
+        raw = str(info.get("sheets") or "")
+        sheets = [x.strip() for x in raw.split(",") if x.strip()]
+        self.sheet_combo["values"] = (["전체"] + sheets) if sheets else ["전체"]
+        self.sheet_var.set("전체")
 
     def load_sheets(self):
-        self._clear_ec2_tc_list()
-        self.sheet_combo.configure(values=("전체",))
-        self.sheet_var.set("전체")
-        session = self.session_map.get(self.session_var.get())
-        if not session:
-            return
-        ec2 = self.ec2_var.get().rstrip("/")
-        try:
-            response = requests.get(f"{ec2}/api/sessions/{session['id']}/sheets", timeout=10)
-            response.raise_for_status()
-            sheets = response.json()
-            if not isinstance(sheets, list):
-                raise ValueError("서버 시트 응답 형식이 올바르지 않습니다")
-            names = ["전체"]
-            for sheet in sheets:
-                name = sheet.get("name") if isinstance(sheet, dict) else sheet
-                if not isinstance(name, str):
-                    raise ValueError("서버 시트 응답에 시트 이름이 없습니다")
-                if name and name not in names:
-                    names.append(name)
-            self.sheet_combo.configure(values=names)
-            self.log_msg(f"시트 {len(names) - 1}건 로드. 시트를 선택한 뒤 [TC 불러오기]를 누르세요.")
-        except Exception as e:
-            self.log_msg(f"⚠ 시트 로드 실패: {e}. '전체'로 TC를 불러올 수 있습니다.")
-
-    def _clear_ec2_tc_list(self):
-        if self.tc_source_var.get() == "ec2":
-            self.tc_data = []
-            self.tc_listbox.delete(0, "end")
+        self._fill_sheets()
 
     def load_tc_list(self):
         """"TC 불러오기" 버튼 핸들러. TC 소스(로컬 엑셀 / 대시보드 / EC2)에 따라 분기. [NEW]"""
@@ -1507,23 +1461,7 @@ class QAWorkerApp:
         엑셀 로더(_load_tcs_from_local_xlsx)와 완전히 같은 모양의 dict를 만들어서,
         실행 루프/판정/결과 저장 쪽은 TC가 어디서 왔는지 몰라도 되게 한다."""
         try:
-            if self._uses_server_dashboard():
-                self.tc_data = []
-                self.tc_listbox.delete(0, "end")
-                token = self.api_token_var.get().strip()
-                if not token:
-                    raise ValueError("서버 TC를 불러오려면 아래 서버 전송 토큰을 입력하세요")
-                response = requests.get(self._selected_dashboard_url("api/tcs"),
-                                        headers={"Authorization": f"Bearer {token}"}, timeout=10)
-                if response.status_code == 404:
-                    raise ValueError("서버에 TC 조회 API가 없습니다. 변경된 dashboard_server.py를 서버에 배포하세요")
-                response.raise_for_status()
-                rows = response.json()
-                if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
-                    raise ValueError("서버 TC 응답 형식이 올바르지 않습니다")
-                rows = [r for r in rows if r.get("enabled", True)]
-            else:
-                rows = results_store.list_custom_tcs(only_enabled=True)
+            rows = results_store.list_custom_tcs(only_enabled=True)
         except Exception as e:
             self.log_msg(f"⚠ 대시보드 TC 로드 실패: {e}")
             return
@@ -1555,38 +1493,53 @@ class QAWorkerApp:
                          "[대시보드에서 TC 추가/수정...] 버튼으로 추가하세요")
 
     def _load_tcs_from_ec2(self):
-        """TC 목록 로드(EC2). 새 포맷 필드(테스트 항목/사전조건/테스트 절차/예상 결과/우선순위)로 매핑.
+        """서버 TC 세션에서 TC를 불러온다. [v0.29.0]
 
-        TODO: 실제 EC2 응답 JSON의 키 이름을 백엔드와 확인해서 아래 매핑을 맞출 것.
-        지금은 원본 API 계약(/api/sessions/{id}/tcs?sheet=...)을 그대로 가정하고,
-        원본 필드명(depth_path 등) 대신 새 포맷 필드명을 우선 사용하되 원본 키가
-        오면 폴백하도록 작성함 (백엔드 마이그레이션 전환기 대비).
-        """
-        ec2 = self.ec2_var.get().rstrip("/")
-        info = self.session_map.get(self.session_var.get(), {})
-        session_id = info.get("id") if isinstance(info, dict) else None
+        대시보드 추가 TC 경로(_load_tcs_from_custom)와 **완전히 같은 모양의 dict**를 만든다.
+        실행 루프·판정·결과 저장은 TC가 로컬에서 왔는지 서버에서 왔는지 몰라도 된다."""
+        if not self.session_var.get():
+            self.log_msg("⚠ 먼저 [세션 불러오기]를 누르고 세션을 고르세요")
+            return
+        info = self.session_map.get(self.session_var.get()) or {}
+        session_id = info.get("session_id")
         if not session_id:
-            self.log_msg("⚠ 세션을 먼저 선택하세요")
+            self.log_msg("⚠ 세션을 다시 불러와 주세요")
             return
+        params = {"session": session_id}
         sheet = self.sheet_var.get()
-        url = f"{ec2}/api/sessions/{session_id}/tcs"
         if sheet and sheet != "전체":
-            url += f"?sheet={urllib.parse.quote(sheet)}"
+            params["sheet"] = sheet
         try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            raw_tcs = resp.json()
+            data = self._server_get("api/tcs", params=params)
         except Exception as e:
-            self.log_msg(f"⚠ TC 로드 실패: {e}")
+            self.log_msg(f"⚠ TC 로드 실패: {str(e)[:150]}")
             return
 
-        self.tc_data = [self._normalize_tc(t) for t in raw_tcs]
+        tcs = []
+        for r in (data.get("tcs") or []):
+            tc_id = clean_text(r.get("tc_no")) or f"c{r.get('id')}"
+            tcs.append({
+                "id": f"server:{r.get('id')}",
+                "tc_id": tc_id,
+                "sheet_name": clean_text(r.get("sheet")) or "서버",
+                "title": clean_text(r.get("title")),
+                "precondition": clean_text(r.get("precondition")),
+                "steps": r.get("steps") or "",
+                "expected": clean_text(r.get("expected")),
+                "priority": clean_text(r.get("priority")) or "미지정",
+                "note": clean_text(r.get("note")),
+                "result": "",
+            })
+
+        self.tc_data = tcs
         self.tc_listbox.delete(0, "end")
         for tc in self.tc_data:
-            self.tc_listbox.insert(
-                "end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}"
-            )
-        self.log_msg(f"TC {len(self.tc_data)}건 로드")
+            self.tc_listbox.insert("end", f"[{tc['priority']}] {tc['tc_id']} | {tc['title']}")
+        label = (data.get("session") or {}).get("label") or session_id
+        if tcs:
+            self.log_msg(f"서버 세션 '{label}'에서 TC {len(tcs)}건 로드")
+        else:
+            self.log_msg(f"⚠ 세션 '{label}'에 '실행 포함' 상태인 TC가 없습니다")
 
     @staticmethod
     def _normalize_tc(raw: dict) -> dict:
