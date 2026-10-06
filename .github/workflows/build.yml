@@ -67,6 +67,7 @@ jobs:
           --collect-all flask `
           --add-data "$ms_playwright;ms-playwright" `
           --add-data "$certifi_path;certifi" `
+          --add-data "TC_EXECUTION_RULES.md;." `
           qa_runner_k_gui.py
 
     - name: 대시보드 바로가기 생성

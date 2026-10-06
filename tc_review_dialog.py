@@ -1,19 +1,24 @@
 """확인 필요 TC를 검토하고 AI 제안을 확인한 뒤 명시적으로 저장한다."""
 import threading
+import json
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 from tk_clipboard import install_clipboard_support
 from tk_scrollable import ScrollableFrame
+from tc_optimization import parse_detail_proposal, details_unchanged
 
 
 class TCDetailDialog:
     """원본과 달라진 항목이 있을 때 명시적으로 저장한다."""
     EDITABLE = ('title', 'priority', 'sheet_name', 'precondition', 'steps', 'expected')
 
-    def __init__(self, root, tc, sheets=(), save=None, on_saved=None):
+    def __init__(self, root, tc, sheets=(), save=None, on_saved=None, optimize=None):
         self.root, self.save_callback, self.on_saved = root, save, on_saved
         self.saving = False
+        self.optimizing = False
+        self.optimize_callback = optimize
+        self.optimization_dialog = None
         self.window = tk.Toplevel(root)
         self.window.title('TC 상세정보')
         self.window.transient(root)
@@ -58,6 +63,9 @@ class TCDetailDialog:
         self.status.pack(anchor='w')
         buttons = ttk.Frame(self.window, padding=8)
         buttons.pack(fill='x')
+        self.optimize_button = ttk.Button(buttons, text='최적화', command=self.optimize,
+                                          state='normal' if optimize else 'disabled')
+        self.optimize_button.pack(side='left')
         self.close_button = ttk.Button(buttons, text='닫기', command=self.window.destroy)
         self.close_button.pack(side='right')
         self.save_button = ttk.Button(buttons, text='저장', command=self.save, state='disabled')
@@ -73,7 +81,7 @@ class TCDetailDialog:
                 widget.configure(textvariable=var)
                 var.trace_add('write', lambda *args: self._refresh_save())
                 self.variables.append(var)
-        self.window.protocol('WM_DELETE_WINDOW', lambda: None if self.saving else self.window.destroy())
+        self.window.protocol('WM_DELETE_WINDOW', lambda: None if self.saving or self.optimizing else self.window.destroy())
         install_clipboard_support(self.window)
         self.window.grab_set()
 
@@ -88,11 +96,53 @@ class TCDetailDialog:
 
     def _refresh_save(self):
         changed = self.values() != self.original
-        self.save_button.configure(state='normal' if changed and self.save_callback and not self.saving else 'disabled')
+        self.save_button.configure(state='normal' if changed and self.save_callback and not self.saving and not self.optimizing else 'disabled')
+
+    def optimize(self):
+        if self.saving or self.optimizing or not self.optimize_callback:
+            return
+        values = self.values()
+        if not values['steps']:
+            messagebox.showerror('TC 최적화', '테스트 절차를 먼저 입력하세요.', parent=self.window)
+            return
+        try:
+            work = self.optimize_callback(values)
+        except Exception as error:
+            messagebox.showerror('TC 최적화', str(error), parent=self.window)
+            return
+        self.optimizing = True
+        self._refresh_save()
+        self.optimize_button.configure(state='disabled')
+        self.close_button.configure(state='disabled')
+        self.window.configure(cursor='watch')
+        for key in self.EDITABLE:
+            self.fields[key].configure(state='disabled')
+
+        def finish(proposal):
+            self.optimizing = False
+            self.window.configure(cursor='')
+            for key in self.EDITABLE:
+                self.fields[key].configure(state='readonly' if key in ('priority', 'sheet_name') else 'normal')
+            if proposal is not None:
+                for key in ('precondition', 'steps', 'expected'):
+                    self.fields[key].delete('1.0', 'end')
+                    self.fields[key].insert('1.0', proposal[key])
+                label = '기본 교정' if proposal.get('correction_only') else 'AI 제안'
+                self.status.configure(text=f'{label}을 적용했습니다. [저장]을 눌러야 원본에 반영됩니다.')
+            elif getattr(self.optimization_dialog, 'no_changes', False):
+                self.status.configure(text='변경이 필요 없습니다. 입력 내용은 유지됩니다.')
+            else:
+                self.status.configure(text='최적화를 취소했습니다. 입력 내용은 유지됩니다.')
+            self.optimize_button.configure(state='normal')
+            self.close_button.configure(state='normal')
+            self._refresh_save()
+            self.window.grab_set()
+
+        self.optimization_dialog = TCOptimizationDialog(self.window, values, work, finish)
 
     def save(self):
         values = self.values()
-        if self.saving or values == self.original or not self.save_callback:
+        if self.saving or self.optimizing or values == self.original or not self.save_callback:
             return
         if any(not values[key] for key in ('title', 'steps', 'expected')):
             messagebox.showerror('TC 저장', 'TC 제목·테스트 절차·예상 결과는 필수입니다.', parent=self.window)
@@ -100,6 +150,7 @@ class TCDetailDialog:
         self.saving = True
         self._refresh_save()
         self.close_button.configure(state='disabled')
+        self.optimize_button.configure(state='disabled')
         self.status.configure(text='저장 중...')
         for key in self.EDITABLE:
             self.fields[key].configure(state='disabled')
@@ -108,6 +159,7 @@ class TCDetailDialog:
             for key in self.EDITABLE:
                 self.fields[key].configure(state='readonly' if key in ('priority', 'sheet_name') else 'normal')
             self.close_button.configure(state='normal')
+            self.optimize_button.configure(state='normal' if self.optimize_callback else 'disabled')
             if error:
                 self.status.configure(text='저장 요청을 완료하지 못했습니다.')
                 messagebox.showerror('TC 저장', error, parent=self.window)
@@ -129,6 +181,110 @@ class TCDetailDialog:
             else:
                 self.root.after(0, lambda: finish(result=result))
         threading.Thread(target=worker, daemon=True).start()
+
+
+class TCOptimizationDialog:
+    """UI를 멈추지 않고 명시적인 적용으로만 부모의 입력란을 변경한다."""
+    def __init__(self, parent, before, work, finished):
+        self.parent, self.finished = parent, finished
+        self.before, self.proposal = before, None
+        self.closed = False
+        self.window = tk.Toplevel(parent)
+        self.window.title('AI TC 최적화')
+        self.window.transient(parent)
+        self.window.geometry('780x620')
+        self.window.configure(cursor='watch')
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(2, weight=1)
+        self.window.minsize(360, 240)
+        self.status = ttk.Label(self.window, text='현재 AI최적화 진행 중 입니다...', padding=12,
+                                wraplength=740)
+        self.status.grid(row=0, column=0, sticky='ew')
+        self.status.bind('<Configure>', lambda event: self.status.configure(wraplength=max(1, event.width - 24)))
+        self.progress = ttk.Progressbar(self.window, mode='indeterminate')
+        self.progress.grid(row=1, column=0, sticky='ew', padx=12, pady=6)
+        self.progress.start(12)
+        area = ScrollableFrame(self.window)
+        area.grid(row=2, column=0, sticky='nsew')
+        self.content = area.content
+        self.buttons = ttk.Frame(self.window, padding=12)
+        # 창이 작아지면 스크롤 영역만 줄이고 적용·취소 버튼 행은 확보한다.
+        self.buttons.grid(row=3, column=0, sticky='ew')
+        self.apply_button = ttk.Button(self.buttons, text='적용', command=self.apply, state='disabled')
+        self.apply_button.pack(side='right', padx=6)
+        self.cancel_button = ttk.Button(self.buttons, text='취소', command=self.cancel)
+        self.cancel_button.pack(side='right')
+        self.window.protocol('WM_DELETE_WINDOW', self.cancel)
+        install_clipboard_support(self.window)
+        self.window.grab_set()
+
+        def complete(proposal=None, error=None):
+            if self.closed:
+                return
+            self.progress.stop()
+            self.progress.grid_remove()
+            self.window.configure(cursor='')
+            self.parent.configure(cursor='')
+            if error:
+                self.status.configure(text='⚠ 품질 검증 · 최적화 결과를 적용할 수 없습니다. 입력 내용은 유지됩니다.')
+                messagebox.showerror('TC 최적화', error, parent=self.window)
+                return
+            self.proposal = proposal
+            self.no_changes = details_unchanged(before, proposal)
+            basic = proposal.get('correction_only', False)
+            badge = '✓ 기본 교정' if basic else '✓ 품질 검증'
+            if self.no_changes:
+                self.status.configure(text=badge + ' · 변경이 필요 없습니다. 입력 내용은 유지됩니다.')
+                review = ttk.LabelFrame(self.content, text=badge, padding=10)
+                review.pack(fill='x', padx=12, pady=8)
+                ttk.Label(review, text=proposal.get('review_reason', '원문과 동일한 결과입니다.'),
+                          wraplength=560).pack(fill='x')
+                self.cancel_button.configure(text='닫기')
+                return
+            self.status.configure(text=(badge + ' · 기본 교정 결과를 확인한 뒤 [적용]을 누르세요.' if basic else
+                                       '✓ 품질 검증 · AI 최적화가 완료되었습니다. 변경 전후를 확인한 뒤 [적용]을 누르세요.'))
+            if proposal.get('review_reason'):
+                review = ttk.LabelFrame(self.content, text=badge, padding=10)
+                review.pack(fill='x', padx=12, pady=8)
+                ttk.Label(review, text=proposal['review_reason'], wraplength=560).pack(fill='x')
+            for key, label in (('precondition', '사전조건'), ('steps', '테스트 절차'), ('expected', '예상 결과')):
+                frame = ttk.LabelFrame(self.content, text=label, padding=6)
+                frame.pack(fill='x', padx=12, pady=5)
+                for title, text in (('변경 전', before[key]), ('기본 교정' if basic else 'AI 제안', proposal[key])):
+                    ttk.Label(frame, text=title).pack(anchor='w')
+                    widget = tk.Text(frame, height=5, wrap='word', width=65)
+                    widget.insert('1.0', text)
+                    widget.configure(state='disabled')
+                    widget.pack(fill='x')
+            install_clipboard_support(self.window)
+            self.apply_button.configure(state='normal')
+
+        def worker():
+            try:
+                proposal = parse_detail_proposal(json.dumps(work(), ensure_ascii=False))
+                callback = lambda: complete(proposal=proposal)
+            except Exception as error:
+                callback = lambda message=str(error): complete(error=message)
+            try:
+                # 부모 팝업이 닫혀도 네트워크 작업의 늦은 응답으로 새 창을 만들지 않는다.
+                parent.after(0, callback)
+            except (RuntimeError, tk.TclError):
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply(self):
+        if not self.closed and self.proposal is not None:
+            self._close(self.proposal)
+
+    def cancel(self):
+        if not self.closed:
+            self._close(None)
+
+    def _close(self, proposal):
+        self.closed = True
+        self.progress.stop()
+        self.window.destroy()
+        self.finished(proposal)
 
 
 class TCReviewDialog:
