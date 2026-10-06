@@ -446,14 +446,16 @@ def create_app(db_path=None):
         if not url:
             return redirect(url_for("tcs", err="구글 시트 주소를 입력해주세요"))
         try:
-            tcs, warnings = tc_excel.parse_gsheet(url)
+            # [v0.32.0] 시트 이름까지 같이 받아 세션 이름으로 쓴다.
+            # 이름을 못 읽어도 가져오기는 그대로 되고, 그때만 "구글 시트"로 적는다.
+            tcs, warnings, sheet_title = tc_excel.parse_gsheet_named(url)
         except tc_excel.TCExcelError as e:
             return redirect(url_for("tcs", err=str(e)))
         except Exception as e:
             return redirect(url_for("tcs", err=f"시트를 읽지 못했습니다: {str(e)[:150]}"))
 
         msg, ok, sid = _bulk_add_tcs(app.config["DB_PATH"], tcs, warnings,
-                                     "구글 시트", "구글 시트에서")
+                                     sheet_title or "구글 시트", "구글 시트에서")
         if not ok:
             return redirect(url_for("tcs", err=msg))
         return redirect(url_for("tcs", session=sid, msg=msg))
@@ -490,6 +492,18 @@ def _esc(s):
     return (str(s if s is not None else "")
             .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;"))
+
+
+def _confirm_text(s):
+    """작은따옴표로 감싼 JS 확인창 문구에 넣어도 깨지지 않게 다듬는다. [NEW v0.32.0]
+
+    onsubmit="return confirm('...')" 안에 이름이 들어가는데, 이름에 작은따옴표가 있으면
+    문자열이 중간에서 끊겨 확인창이 뜨지 않고 그대로 제출되어 버린다(삭제 사고).
+    이 파일은 역슬래시를 쓰지 않는 규칙이라 이스케이프 대신 비슷하게 생긴 따옴표로 바꾼다.
+    확인창 문구에만 쓰는 함수라 저장된 이름 자체는 바뀌지 않는다.
+    """
+    return (_esc(s).replace("'", chr(0x2019))
+            .replace(chr(10), " ").replace(chr(13), " "))
 
 
 def _badge(result):
@@ -827,7 +841,13 @@ def _bulk_add_tcs(db_path, tcs, warnings, source_name, source_phrase):
         if s and s not in sheets:
             sheets.append(s)
 
-    label = f"{source_name} · {time.strftime('%m-%d %H:%M')}"
+    # [v0.32.0] 세션 이름은 **가져온 곳의 이름 그대로** 둔다.
+    #   엑셀 업로드  -> 파일명 (예: LabConnect_QA_TestCases_환자관리.xlsx)
+    #   구글 시트    -> 시트 이름 (예: [WEB] 랩커넥트_ 자동화용 TC)
+    # 불러온 시각은 목록에서 이름 바로 아래 줄에 created_at 으로 따로 보여주므로,
+    # 이름에 또 붙이면 같은 정보가 두 번 나온다. 그래서 여기서 뗐다.
+    # 이름을 못 구한 경우에만(둘 다 빈 값) 예전처럼 시각을 이름으로 쓴다.
+    label = str(source_name or "").strip() or time.strftime("%m-%d %H:%M")
     session_id = results_store.create_tc_session(
         label, source=source_name, sheets=", ".join(sheets), select=True, db_path=db_path)
 
@@ -956,7 +976,7 @@ def _render_runs(runs, msg, sheets=None, current_sheet=None, rename_id=None):
             actions = f"""
     <a class="btnlike" href="{detail}">결과 보기</a>
     <form method="post" action="{_u('/runs/delete/')}{rid}"
-          style="display:inline" onsubmit="return confirm('{_esc(r.get('label') or _when(r['started_at']))} 실행 내역(결과 {r['total']}건)을 삭제할까요? 스크린샷도 함께 지워지며 되돌릴 수 없습니다.');">
+          style="display:inline" onsubmit="return confirm('{_confirm_text(r.get('label') or _when(r['started_at']))} 실행 내역(결과 {r['total']}건)을 삭제할까요? 스크린샷도 함께 지워지며 되돌릴 수 없습니다.');">
       <button type="submit" class="danger">삭제</button>
     </form>
     <a class="btnlike" href="{_runs_url(current_sheet, rename=r['run_id'])}">프로젝트명 수정</a>"""
@@ -1054,7 +1074,7 @@ def _render_tc_sessions(sessions, msg, err, rename_id=None):
     <a class="btnlike" href="{detail}">TC 보기</a>
     <a class="btnlike" href="{_u('/tcs?rename=')}{sid}">이름 수정</a>
     <form method="post" action="{_u('/tcs/session/delete/')}{sid}" style="display:inline"
-          onsubmit="return confirm('{_esc(s.get('label'))} 세션과 그 안의 TC {s['tc_count']}건을 삭제할까요? 되돌릴 수 없습니다.');">
+          onsubmit="return confirm('{_confirm_text(s.get('label'))} 세션과 그 안의 TC {s['tc_count']}건을 삭제할까요? 되돌릴 수 없습니다.');">
       <button type="submit" class="danger">삭제</button>
     </form>"""
         rows.append(f"""<tr{' class="picked"' if picked else ''}>

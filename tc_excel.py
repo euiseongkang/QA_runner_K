@@ -174,8 +174,55 @@ def gsheet_export_url(url) -> str:
     raise TCExcelError("구글 시트 주소에서 문서 ID를 찾지 못했습니다. 주소창의 링크를 그대로 붙여넣어 주세요")
 
 
-def fetch_gsheet(url, timeout=20):
-    """구글 시트를 xlsx 바이트로 받아온다. 실패 사유는 사람이 바로 고칠 수 있게 풀어서 알린다."""
+def _name_from_disposition(value):
+    """Content-Disposition 헤더에서 파일 이름을 꺼낸다. [NEW v0.32.0]
+
+    구글은 보통 두 가지를 같이 준다.
+        filename="LabConnect TC.xlsx"
+        filename*=UTF-8''LabConnect%20TC.xlsx
+    한글 제목은 앞쪽이 깨져 오는 경우가 있어 RFC 5987 형태(filename*)를 먼저 본다.
+    못 읽으면 빈 문자열을 돌려주고, 부르는 쪽에서 기본 이름으로 대체한다.
+    """
+    import urllib.parse as _up
+
+    text = str(value or "")
+    if not text:
+        return ""
+    m = re.search(r"filename\*\s*=\s*([^']*)'[^']*'([^;]+)", text, re.IGNORECASE)
+    if m:
+        charset = (m.group(1) or "utf-8").strip() or "utf-8"
+        raw = m.group(2).strip().strip('"')
+        try:
+            name = _up.unquote(raw, encoding=charset, errors="replace")
+        except (LookupError, ValueError):
+            name = _up.unquote(raw)
+        if name.strip():
+            return name.strip()
+    m = re.search(r'filename\s*=\s*"([^"]*)"', text, re.IGNORECASE)
+    if not m:
+        m = re.search(r"filename\s*=\s*([^;]+)", text, re.IGNORECASE)
+    return m.group(1).strip().strip('"') if m else ""
+
+
+def strip_excel_ext(name):
+    """파일 이름 끝의 엑셀 확장자를 떼어낸다. [NEW v0.32.0]
+
+    구글 시트는 '<시트 이름>.xlsx' 로 내려오므로, 시트 이름만 남기려면 떼야 한다.
+    """
+    text = str(name or "").strip()
+    for ext in (".xlsx", ".xlsm", ".xls"):
+        if text.lower().endswith(ext):
+            return text[: -len(ext)].strip()
+    return text
+
+
+def fetch_gsheet_named(url, timeout=20):
+    """구글 시트를 (xlsx 바이트, 시트 이름) 으로 받아온다. [NEW v0.32.0]
+
+    시트 이름은 구글이 내려주는 Content-Disposition 에서 꺼낸다. 헤더가 없거나 못 읽으면
+    빈 문자열을 돌려주므로, 부르는 쪽에서 기본값으로 대체하면 된다.
+    **이름을 못 읽는다고 가져오기 자체가 실패하지는 않는다.**
+    """
     import io as _io
     import urllib.request as _ur
     import urllib.error as _ue
@@ -185,6 +232,7 @@ def fetch_gsheet(url, timeout=20):
     try:
         with _ur.urlopen(req, timeout=timeout) as resp:
             ctype = (resp.headers.get("Content-Type") or "").lower()
+            disposition = resp.headers.get("Content-Disposition") or ""
             data = resp.read(GSHEET_MAX_BYTES + 1)
     except _ue.HTTPError as e:
         if e.code in (401, 403):
@@ -204,12 +252,37 @@ def fetch_gsheet(url, timeout=20):
             raise TCExcelError("시트가 공개되어 있지 않습니다. 구글 시트에서 [공유] → "
                                "'링크가 있는 모든 사용자'(뷰어)로 바꾼 뒤 다시 시도해주세요")
         raise TCExcelError("구글 시트에서 받은 내용이 엑셀 형식이 아닙니다")
-    return _io.BytesIO(data)
+
+    name = ""
+    try:
+        name = strip_excel_ext(_name_from_disposition(disposition))
+    except Exception:
+        name = ""       # 이름은 덤이다. 못 읽어도 TC 가져오기는 그대로 진행한다.
+    return _io.BytesIO(data), name
+
+
+def fetch_gsheet(url, timeout=20):
+    """구글 시트를 xlsx 바이트로 받아온다. 실패 사유는 사람이 바로 고칠 수 있게 풀어서 알린다.
+
+    [v0.32.0] 본체는 fetch_gsheet_named 로 옮겼다. 이름이 필요 없는 기존 호출을 위해 남겨둔다.
+    """
+    stream, _name = fetch_gsheet_named(url, timeout=timeout)
+    return stream
 
 
 def parse_gsheet(url, timeout=20):
     """구글 시트 주소 -> (tcs, warnings). 파싱은 엑셀 업로드와 완전히 같은 경로를 탄다."""
     return parse_tc_excel(fetch_gsheet(url, timeout=timeout))
+
+
+def parse_gsheet_named(url, timeout=20):
+    """구글 시트 주소 -> (tcs, warnings, 시트 이름). [NEW v0.32.0]
+
+    세션 이름을 시트 이름으로 달기 위해 추가했다. 파싱 경로는 parse_gsheet 와 완전히 같다.
+    """
+    stream, name = fetch_gsheet_named(url, timeout=timeout)
+    tcs, warnings = parse_tc_excel(stream)
+    return tcs, warnings, name
 
 
 def parse_tc_excel(source):
