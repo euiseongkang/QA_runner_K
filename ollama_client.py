@@ -160,7 +160,9 @@ class OllamaClient:
         if getattr(self, 'system_prompt', None):
             messages.insert(0, {'role': 'system', 'content': self.system_prompt})
         payload = {'model': model, 'messages': messages, 'stream': False, 'keep_alive': 0,
-                   'options': {'num_predict': max_tokens, 'num_ctx': getattr(self, 'context_size', 4096)}}
+                   'options': {'num_predict': max_tokens}}
+        if getattr(self, 'context_size', None) is not None:
+            payload['options']['num_ctx'] = self.context_size
         schema = getattr(self, 'response_schema', None)
         if schema is not None and not model.endswith(':cloud'):
             payload['format'] = schema

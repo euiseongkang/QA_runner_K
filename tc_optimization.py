@@ -71,6 +71,76 @@ def basic_correction(tc, reason=''):
     return result
 
 
+def numbered_lines(text):
+    """붙은 연속 번호만 분리한다. 따옴표·대괄호 안의 값은 건드리지 않는다."""
+    import re
+    protected = []
+    def protect(m):
+        protected.append(m.group())
+        return f'\x00{len(protected)-1}\x00'
+    text = re.sub(r'''\[[^\]\n]*\]|"[^"\n]*"|'[^'\n]*'|“[^”\n]*”|‘[^’\n]*’''', protect, str(text or ''))
+    result = []
+    for line in text.splitlines():
+        start = re.match(r'^\s*(\d+)[.)]\s+', line)
+        next_number = int(start.group(1)) + 1 if start else None
+        def split(m):
+            nonlocal next_number
+            if next_number is not None and int(m.group(1)) == next_number:
+                next_number += 1
+                return '\n' + m.group(1) + '. '
+            return m.group()
+        line = re.sub(r'\s+(\d+)[.)]\s+', split, line)
+        result.extend(line.splitlines())
+    return [re.sub(r'\x00(\d+)\x00', lambda m: protected[int(m.group(1))], line).strip()
+            for line in result if line.strip()]
+
+
+def phone_search_draft(tc):
+    """원문에 Enter 검색 방식이 명시된 복수 전화번호 검색만 보완한다."""
+    import re
+    if not re.search(r'휴대전화|휴대폰|전화번호', str(tc.get('title') or '')):
+        return None
+    lines = numbered_lines(tc.get('steps'))
+    phone = r'0\d[\d\s\-–—−]{7,}'
+    def input_value(line):
+        values = re.findall(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]''', line)
+        return values[0] if values and re.fullmatch(phone, values[0]) and '입력' in line else None
+    values = [input_value(line) for line in lines if input_value(line)]
+    if len(values) < 2 or not any(re.search(r'Enter|엔터', line, re.I) for line in lines):
+        return None  # 자동 검색인지 알 수 없으면 Enter를 새로 추측하지 않는다.
+    output, pending = [], False
+    for line in lines:
+        if pending:
+            if not re.search(r'Enter|엔터', line, re.I):
+                output.append('Enter 키를 누르고 환자 목록 조회 완료를 기다린다.')
+            pending = False
+        value = input_value(line)
+        body = re.sub(r'^\d+[.)]\s*', '', line)
+        if value:
+            # 실제 placeholder는 추측하지 않고 실행기의 검색 입력창 탐색을 사용한다.
+            if re.match(r'^(?:환자명|휴대전화번호)\s*입력창에', body):
+                body = f'[검색 입력창]에 "{value}"을 입력한다.'
+            pending = not bool(re.search(r'Enter|엔터', line, re.I))
+        if re.search(r'Enter|엔터', line, re.I) and not value:
+            body = 'Enter 키를 누르고 환자 목록 조회 완료를 기다린다.'
+        output.append(body)
+    if pending:
+        output.append('Enter 키를 누르고 환자 목록 조회 완료를 기다린다.')
+    return dict(precondition=str(tc.get('precondition') or ''),
+                steps='\n'.join(f'{i}. {line}' for i, line in enumerate(output, 1)),
+                expected='\n'.join(numbered_lines(tc.get('expected'))))
+
+
+def optimization_fallback(tc, reason=''):
+    draft = phone_search_draft(tc)
+    if draft and not details_unchanged(tc, draft):
+        draft.update(change_required=True, rule_completion=True,
+                     review_reason=(reason + ' ' if reason else '') +
+                     '원문에 명시된 Enter 검색 방식에 맞춰 각 입력 뒤 조회 단계를 보완하고 검색 대상·예상 결과의 줄 구분을 정리했습니다. 입력값과 기대 상태는 유지합니다.')
+        return draft
+    return basic_correction(tc, reason)
+
+
 def has_repetition(text):
     """반복 생성으로 의미가 훼손된 문장은 미리보기에 올리지 않는다."""
     import re
@@ -97,6 +167,12 @@ def load_execution_rules():
 
 def task_example(tc):
     text = str(tc.get('title') or '') + str(tc.get('steps') or '') + str(tc.get('expected') or '')
+    if phone_search_draft(tc):
+        return ('복수 전화번호 검색: 각 입력값 다음에 Enter와 조회 완료 대기가 있어야 한다. '
+                '두 번째 검색의 Enter가 빠지거나 검색값별 예상 결과가 한 줄에 붙어 있으면 변경 필요다. '
+                '입력값의 하이픈과 환자명, 각 노출/미노출 조건은 그대로 유지한다. '
+                '실제 검색창 이름은 제공된 웹 근거로 확인하고 근거가 없으면 [검색 입력창]을 사용한다. '
+                '없는 데이터나 [내 환자만 보기] 상태를 임의로 추가하지 않는다.')
     if '긴 환자명' in text or ('환자명' in text and '말줄임' in text):
         return '''긴 환자명 목록 표시 검증:
 사전조건: 환자 관리 목록 화면에 진입해 있다. 이름 표시 영역을 초과하는 긴 이름의 테스트 환자와 비교할 일반 이름의 환자가 같은 목록에 준비되어 있어야 한다.
@@ -185,6 +261,30 @@ def validate_detail_quality(tc, proposal, original_actions=(), proposed_actions=
             and not re.search(negative, proposal['expected'])):
         errors.append('미노출 검증이 누락됨. 원래 노출/미노출 기대 상태를 유지할 것')
     source = str(tc.get('steps') or '') + str(tc.get('expected') or '')
+    draft = phone_search_draft(tc)
+    if draft:
+        candidate = dict(tc, **{k: proposal[k] for k in DETAIL_SCHEMA['required']})
+        pending, missing = False, False
+        for line in numbered_lines(candidate['steps']):
+            values = re.findall(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]''', line)
+            is_input = bool(values and re.fullmatch(r'0\d[\d\s\-–—−]{7,}', values[0]) and '입력' in line)
+            enter = bool(re.search(r'Enter|엔터', line, re.I))
+            if pending and not enter:
+                missing = True
+            pending = is_input and not enter
+        if pending or missing:
+            errors.append('각 전화번호 입력 뒤 Enter와 조회 완료 단계를 보완하고 검색 입력 대상을 명시할 것')
+        if len(numbered_lines(proposal['expected'])) != len(proposal['expected'].splitlines()):
+            errors.append('검색값별 예상 결과를 별도 줄로 분리할 것')
+        # 미노출이라는 단어만 남겨 두고 환자명이나 특정 검색값의 조건을 삭제하지 못하게 한다.
+        def expectations(value):
+            return [re.findall(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]|\[([^\[\]]+)\]''', line)
+                    for line in numbered_lines(value)]
+        original_conditions = expectations(tc.get('expected'))
+        new_conditions = expectations(proposal['expected'])
+        negative_states = lambda value: [bool(re.search(negative, l)) for l in numbered_lines(value)]
+        if original_conditions != new_conditions or negative_states(tc.get('expected')) != negative_states(proposal['expected']):
+            errors.append('전화번호·환자명별 노출/미노출 조건과 순서를 보존할 것')
     if ('내 환자만 보기' in source and '해제' in str(tc.get('expected') or '')
             and not re.search(r'해제\s*상태로\s*설정', str(tc.get('steps') or ''))):
         if not re.search(r'선택되어|선택된|체크되어|체크된|(?:선택|체크)\s*상태', proposal['precondition']):
@@ -214,7 +314,7 @@ def detail_draft(tc):
                 line = line.replace('목록 건수 변화 확인', '조회 완료 후 환자 목록과 건수를 확인한다.')
             lines.append(line)
         draft['steps'] = '\n'.join(lines)
-    return draft
+    return phone_search_draft(tc) or draft
 
 
 def detail_repair_prompt(tc, reason, proposal, problems, include_rules=True):

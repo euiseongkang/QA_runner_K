@@ -14,10 +14,17 @@ def clauses(tc):
             return []  # 다른 검증 기준을 무시하고 일부 조건만으로 PASS를 주지 않는다.
         targets = re.findall(r'''["'“”‘’]([^"'“”‘’]+)["'“”‘’]|\[([^\[\]]+)\]''', line)
         targets = [a or b for a, b in targets]
-        if len(targets) != 1:
+        patient = None
+        if (len(targets) == 2 and re.fullmatch(r'0\d[\d\s\-–—−]{7,}', targets[0])
+                and ('검색' in line or '경우' in line)):
+            patient = targets[1]
+        elif len(targets) != 1:
             return []
-        result.append({'target': targets[0], 'visible': not bool(re.search(NEGATIVE, line)),
-                       'conditional': '경우' in line})
+        rule = {'target': targets[0], 'visible': not bool(re.search(NEGATIVE, line)),
+                'conditional': '경우' in line or bool(patient)}
+        if patient:
+            rule['patient'] = patient
+        result.append(rule)
     return result
 
 
@@ -49,8 +56,8 @@ def response_matches(response, query):
         return False
 
 
-def phone_rows(page):
-    return page.evaluate(r'''() => {
+def phone_rows(page, include_names=False):
+    rows = page.evaluate(r'''() => {
       const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
       const tables = [...document.querySelectorAll('table, [role="table"], [role="grid"]')]
         .filter(visible).filter(t => /환자명/.test(t.innerText) && /휴대전화번호|휴대폰번호/.test(t.innerText));
@@ -62,8 +69,21 @@ def phone_rows(page):
       const rows = [...table.querySelectorAll('tbody tr, [role="row"]')].filter(visible)
         .map(r => [...r.querySelectorAll('td, [role="cell"], [role="gridcell"]')])
         .filter(c => c.length === headers.length);
-      return rows.map(c => c[col].innerText);
+      const nameCol = headers.findIndex(h => /^환자명$/.test(h.innerText.replace(/\s/g,'')));
+      const patientName = cell => {
+        const copy = cell.cloneNode(true);
+        // 이름 셀에 함께 표시된 소유 배지는 환자명이 아니다. 부분 문자열은 지우지 않는다.
+        const labels = [...copy.querySelectorAll('*')].reverse();
+        for (const e of labels) {
+          if (/^내\s*환자$/.test(e.textContent.trim()) && !e.children.length) e.remove();
+        }
+        return copy.textContent.trim();
+      };
+      return rows.map(c => ({phone: c[col].innerText, name: nameCol < 0 ? null : patientName(c[nameCol])}));
     }''')
+    if rows is None:
+        return None
+    return rows if include_names else [r['phone'] for r in rows]
 
 
 def capture_search(page, query, submit):
@@ -74,7 +94,9 @@ def capture_search(page, query, submit):
     page.on('response', on_response)
     try:
         submit()
-        state['phones'] = phone_rows(page)
+        state['patients'] = phone_rows(page, include_names=True)
+        state['phones'] = ([r['phone'] for r in state['patients']]
+                           if state['patients'] is not None else None)
         return state
     finally:
         page.remove_listener('response', on_response)
@@ -86,6 +108,16 @@ def judge_phone(tc, searches):
         if not matches or not matches[-1]['loaded'] or matches[-1]['phones'] is None:
             return '확인 필요', f'검색 조건 {index}의 조회 완료/환자 목록 근거가 부족함'
         phones = matches[-1]['phones']
+        if rule.get('patient'):
+            patients = matches[-1].get('patients')
+            if patients is None or any(p.get('name') is None for p in patients):
+                return '확인 필요', f'검색 조건 {index}의 환자명 컬럼 근거가 부족함'
+            named = [p for p in patients if p['name'].strip() == rule['patient']]
+            valid = (bool(named) and all(re.sub(r'\D', '', p['phone']) == re.sub(r'\D', '', rule['target'])
+                                       for p in named)) if rule['visible'] else not named
+            if not valid:
+                return 'FAIL', f'검색 조건 {index}의 대상 환자 행이 예상 {"노출" if rule["visible"] else "미노출"} 상태와 다름'
+            continue
         target = re.sub(r'\D', '', rule['target'])
         found = [re.sub(r'\D', '', p) == target for p in phones]
         valid = bool(found) and all(found) if rule['visible'] else not phones

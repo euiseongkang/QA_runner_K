@@ -95,7 +95,7 @@ class OpenWebUIClient:
         payload = {'model': model, 'messages': messages, 'stream': False,
                    'files': [{'type': 'collection', 'id': x} for x in self.knowledge_ids],
                    'params': {'function_calling': 'legacy', 'temperature': 0,
-                              'num_ctx': 8192, 'keep_alive': 0},
+                              'keep_alive': 0},
                    'max_tokens': max_tokens}
         if getattr(self, 'response_schema', None):
             payload['response_format'] = {'type': 'json_schema', 'json_schema': {

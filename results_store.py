@@ -121,6 +121,11 @@ def get_screenshot_dir(run_id: str):
     return d
 
 
+def get_execution_package_root():
+    return (os.environ.get('QA_RUNNER_K_EXECUTION_PACKAGE_DIR')
+            or os.path.join(_base_dir(), 'qa_runner_k_execution_packages'))
+
+
 def _connect(db_path=None):
     # [v0.6.0] 대시보드를 별도 프로그램으로도 띄울 수 있게 되면서, 같은 DB 파일을 두 프로세스가
     # 함께 열 수 있다. 잠깐 겹칠 때 "database is locked"로 죽지 않도록 대기 시간을 준다.

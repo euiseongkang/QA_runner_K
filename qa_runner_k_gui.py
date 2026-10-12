@@ -33,6 +33,7 @@ import urllib.parse
 import requests
 
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
+import execution_package
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
 from tk_clipboard import install_clipboard_support
@@ -50,13 +51,14 @@ import visibility_verification
 import search_clear_verification
 import pagination_verification
 from openwebui_client import OpenWebUIClient
+import webui_credentials
 from ollama_client import OllamaClient, base_url as ollama_base_url
 from ollama_client import available_models, recommendation, preferred_model
 
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.33.0"
+APP_VERSION = "0.34.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -720,6 +722,8 @@ class TCExecutionEngine:
     def execute(self, actions: list, tc: dict) -> list:
         """액션 리스트를 순서대로 실행하고, 실제 실행된 액션 설명 리스트를 반환."""
         actions_done = []
+        self.actions_done = actions_done
+        self.action_trace = []
         self.failed_actions = []
         self.patient_filter_evidence = None
         self.patient_type_evidence = None
@@ -734,11 +738,16 @@ class TCExecutionEngine:
         self.modal_seen = is_modal_visible(self.page)
         tc_steps_text = tc.get("steps", "")
 
-        for action in actions:
+        for index, action in enumerate(actions, 1):
+            record = execution_package.action_record(action, index)
+            self.action_trace.append(record)
+            started = time.monotonic()
+            previous_count = len(actions_done)
             atype = action.get("type")
             desc = action.get("description", atype)
 
             if self._is_dangerous(action, tc_steps_text):
+                record.update(status='blocked', error='위험 액션 차단', finished_at=execution_package.now(), duration_ms=0)
                 self.log_fn(f"  ⚠ 위험 액션 차단: {desc}")
                 continue
 
@@ -766,12 +775,20 @@ class TCExecutionEngine:
                 elif atype == "wait":
                     self.page.wait_for_timeout(int(action.get("ms", 500)))
                 else:
+                    record.update(status='unsupported', error=f'알 수 없는 액션 타입: {atype}')
                     self.log_fn(f"  ⚠ 알 수 없는 액션 타입: {atype}")
+                if record['status'] == 'pending':
+                    record['status'] = 'completed'
             except Exception as e:
+                record.update(status='failed', error=str(e))
                 # [v0.21.0] 실패를 기록해 둔다. 예전에는 로그만 찍고 넘어가서,
                 # 검색어 입력이 실패했는데도 화면 어딘가에 그 글자가 있으면 PASS가 났었다.
                 self.failed_actions.append(f"{desc}: {str(e)[:80]}")
                 self.log_fn(f"  ⚠ 액션 실행 실패 ({desc}): {str(e)[:80]}")
+            finally:
+                record.update(finished_at=execution_package.now(),
+                              duration_ms=round((time.monotonic() - started) * 1000),
+                              observations=actions_done[previous_count:])
 
             self.modal_seen = self.modal_seen or is_modal_visible(self.page)
 
@@ -856,6 +873,7 @@ class TCExecutionEngine:
             is_disabled = el.is_disabled(timeout=500)
         except Exception:
             pass
+
         if is_disabled:
             self.log_fn(f"  ⓘ 버튼 비활성화 상태 확인: {desc}")
             actions_done.append(f"비활성화 확인: {desc}")
@@ -1198,6 +1216,12 @@ class QAWorkerApp:
         except Exception:
             pass
 
+        if not os.environ.get('OPENWEBUI_API_KEY'):
+            try:
+                self.webui_key_var.set(webui_credentials.load_key(self.webui_url_var.get()))
+            except ValueError as error:
+                self.webui_status_var.set(str(error))
+
     def _save_local_config(self):
         cfg = {
             "ec2_api": self.ec2_var.get(),
@@ -1225,6 +1249,16 @@ class QAWorkerApp:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.log_msg(f"⚠ 설정 저장 실패: {e}")
+            return
+        if self.provider_var.get() == 'Open WebUI (RAG)':
+            try:
+                webui_credentials.save_key(self.webui_url_var.get(), self.webui_key_var.get())
+                self.webui_status_var.set('설정 저장됨 · API Key는 OS 자격 증명 저장소에 보관됩니다.'
+                                          if self.webui_key_var.get().strip() else
+                                          '설정 저장됨 · 저장된 API Key를 삭제했습니다.')
+            except ValueError as error:
+                self.webui_status_var.set(str(error))
+                self.log_msg('⚠ ' + str(error))
 
     def _on_provider_change(self, event=None):
         is_ollama = self.provider_var.get() == 'Ollama'
@@ -1492,6 +1526,9 @@ class QAWorkerApp:
         ttk.Label(self.ollama_frame, textvariable=self.ollama_recommend_var, wraplength=650).grid(row=4, column=0, columnspan=5, sticky='w')
         ttk.Label(self.ollama_frame, text='텍스트 TC 정리: qwen2.5:1.5b 우선 권장 · 초경량 모델도 품질 검토 필요 · 이미지 판정은 지원하지 않음', wraplength=650).grid(row=5, column=0, columnspan=5, sticky='w')
         ttk.Button(self.ollama_frame, text='설정 저장', command=self._save_local_config).grid(row=6, column=4, padx=6)
+        from finetuning_setup import show_model_guidance
+        ttk.Label(self.ollama_frame, text='시험 학습 권장: Qwen/Qwen2.5-1.5B-Instruct (MLX용 원본 · Ollama 설치와 별도)', wraplength=650).grid(row=7, column=0, columnspan=5, sticky='w')
+        ttk.Button(self.ollama_frame, text='권장 학습 모델 / 설치 안내', command=lambda: show_model_guidance(self.root)).grid(row=8, column=0, columnspan=5, sticky='w')
 
         self.webui_frame = ttk.LabelFrame(top, text='Open WebUI · 프로젝트 지식 검색 (RAG)', padding=6)
         self.webui_frame.grid(row=1, column=0, columnspan=4, sticky='ew')
@@ -1510,8 +1547,10 @@ class QAWorkerApp:
         self.webui_web_combo = ttk.Combobox(self.webui_frame, textvariable=self.webui_web_var, width=70)
         self.webui_web_combo.grid(row=4, column=1, columnspan=2, sticky='w')
         ttk.Label(self.webui_frame, textvariable=self.webui_status_var, wraplength=650).grid(row=5, column=0, columnspan=3, sticky='w')
-        ttk.Label(self.webui_frame, text='연결 확인 후 두 지식 기반을 선택하세요. ID 직접 입력도 가능합니다. API Key는 파일에 저장하지 않습니다.', wraplength=650).grid(row=6, column=0, columnspan=3, sticky='w')
+        ttk.Label(self.webui_frame, text='설정 저장 시 API Key를 OS 자격 증명 저장소(macOS 키체인 등)에 보관하고 다음 실행에 불러옵니다. 키를 비우고 저장하면 삭제합니다. 지식 기반 ID 직접 입력도 가능합니다.', wraplength=650).grid(row=6, column=0, columnspan=3, sticky='w')
         ttk.Button(self.webui_frame, text='설정 저장', command=self._save_local_config).grid(row=7, column=2, sticky='e')
+        ttk.Label(self.webui_frame, text='로컬 실행 권장: qwen2.5:1.5b · 시험 학습 권장: Qwen/Qwen2.5-1.5B-Instruct (MLX용 원본)', wraplength=650).grid(row=8, column=0, columnspan=3, sticky='w')
+        ttk.Button(self.webui_frame, text='권장 학습 모델 / 설치 안내', command=lambda: show_model_guidance(self.root)).grid(row=9, column=0, columnspan=3, sticky='w')
 
         # [NEW] AI 없이 규칙 기반으로만 실행 (API 키 없이 동작 검증할 때)
         ttk.Checkbutton(
@@ -1623,6 +1662,7 @@ class QAWorkerApp:
         ttk.Label(ctrl_frame, textvariable=self.status_var).pack(side="left", padx=8)
         # [NEW] 실행 결과(PASS/FAIL/확인 필요 + 스크린샷)를 보여주는 로컬 웹 페이지를 브라우저로 염
         ttk.Button(ctrl_frame, text="결과 보기", command=self.open_results_dashboard).pack(side="left", padx=8)
+        ttk.Button(ctrl_frame, text='학습 승인 관리', command=self.open_package_reviews).pack(side='left')
         ttk.Button(ctrl_frame, text="업데이트 확인", command=self.manual_check_update).pack(side="right")
 
         # [NEW v0.11.0] 대시보드 바로가기 줄. 버튼 하나로 브라우저 새 창이 열리고,
@@ -1743,6 +1783,15 @@ class QAWorkerApp:
             self.log_msg(f"  ⓘ {w}")
 
     # ---- 대시보드 ----                                            [NEW]
+    def open_package_reviews(self):
+        from execution_package_dialog import ExecutionPackageDialog
+        previous = getattr(self, '_package_review_dialog', None)
+        if previous and previous.window.winfo_exists():
+            previous.window.lift()
+            previous.window.focus_force()
+            return
+        self._package_review_dialog = ExecutionPackageDialog(self.root, results_store.get_execution_package_root())
+
     def _ensure_dashboard(self):
         """대시보드 서버를 (한 번만) 띄우고 주소를 돌려준다.
         [NEW v0.4.0] TC를 대시보드에서 작성할 수 있게 되었으므로 프로그램을 켜는 시점에
@@ -2378,8 +2427,7 @@ class QAWorkerApp:
         elif provider == 'Ollama':
             client = OllamaClient(key)
             client.response_schema = tc_optimization.REVIEW_SCHEMA
-            # TC와 판정 규칙 전문을 전달하므로 일반 실행보다 긴 컨텍스트가 필요하다.
-            client.context_size = 8192
+            # 컨텍스트는 Ollama 서버/모델 설정을 따른다.
         elif provider == 'Claude':
             import anthropic
             client = anthropic.Anthropic(api_key=key, timeout=60)
@@ -2399,17 +2447,17 @@ class QAWorkerApp:
                 try:
                     proposal = tc_optimization.parse_detail_proposal(response or '')
                 except ValueError:
-                    return tc_optimization.basic_correction(tc, 'AI 응답 형식이 적절하지 않아 내용 개선안은 채택하지 않았습니다.')
+                    return tc_optimization.optimization_fallback(tc, 'AI 응답 형식이 적절하지 않아 내용 개선안은 채택하지 않았습니다.')
                 problems = tc_optimization.validate_detail_quality(
                     tc, proposal, build_rule_actions(tc), build_rule_actions(proposal))
                 if not problems:
                     if tc_optimization.details_unchanged(tc, proposal):
-                        return tc_optimization.basic_correction(tc)
+                        return tc_optimization.optimization_fallback(tc)
                     return proposal
                 if attempt == 0:
                     prompt = tc_optimization.detail_repair_prompt(tc, reason, proposal, problems,
                                                                  include_rules=provider != 'Ollama')
-            return tc_optimization.basic_correction(tc, 'AI 내용 개선안이 품질 기준을 충족하지 않아 채택하지 않았습니다.')
+            return tc_optimization.optimization_fallback(tc, 'AI 내용 개선안이 품질 기준을 충족하지 않아 채택하지 않았습니다.')
         finally:
             client.close()
 
@@ -2702,10 +2750,20 @@ class QAWorkerApp:
                 self.status_var.set(f"{i}/{len(tcs)} 완료")
 
                 after_b64 = before_b64 = None
+                package_context = execution_package.begin(
+                    tc, version=APP_VERSION, provider=provider, rule_only=rule_only,
+                    target_url=self.start_url_var.get())
+                engine.action_trace, engine.actions_done, engine.failed_actions = [], [], []
+                if not rule_only:
+                    package_context['environment']['models'] = {
+                        'provider_model': getattr(client, 'model', None),
+                        'action_model': self.action_model_var.get(), 'judgment_model': self.judge_model_var.get()}
                 try:
                     judgment, reason, after_b64, before_b64 = self._run_single_tc(
-                        page, tc, client, provider, engine, rule_only=rule_only)
+                        page, tc, client, provider, engine, rule_only=rule_only,
+                        execution_context=package_context)
                 except Exception as e:
+                    package_context['errors'].append(str(e))
                     # [NEW] 원본은 이런 경우를 그냥 "ERROR" 카운트로만 남겼는데, 그러면 사람이
                     # 화면을 안 보면 뭐가 왜 안 됐는지 알 수 없었음. "확인 필요"로 명확히 남기고
                     # 이유(예외 메시지)까지 기록해서 대시보드에서 바로 확인할 수 있게 한다.
@@ -2716,10 +2774,20 @@ class QAWorkerApp:
                     except Exception:
                         pass
 
+                package_context.update(finished_at=execution_package.now(),
+                                       action_trace=getattr(engine, 'action_trace', []),
+                                       actions_done=getattr(engine, 'actions_done', []),
+                                       failed_actions=getattr(engine, 'failed_actions', []))
+                try:
+                    package_context['environment']['final_url'] = execution_package.safe_url(page.url)
+                except Exception:
+                    pass
+
                 results[judgment] = results.get(judgment, 0) + 1
                 self._publish_tc_result(tc, judgment, reason)
                 self._save_result(tc, judgment, reason, after_b64, before_b64,
-                                   run_id=run_id, source=tc_source, source_ref=source_ref, ec2=ec2)
+                                   run_id=run_id, source=tc_source, source_ref=source_ref, ec2=ec2,
+                                   execution_context=package_context)
 
                 # [NEW v0.23.0] TC 5건마다 중간 보고. 멈추지 않고 그대로 이어서 실행한다.
                 # 24건짜리를 돌릴 때 끝날 때까지 상황을 모르는 게 불편해서 넣은 규칙.
@@ -2931,7 +2999,7 @@ class QAWorkerApp:
             self.log_msg(f"✅ {start_url} 접속 (로그인 없음)")
             return True
 
-    def _run_single_tc(self, page, tc, client, provider, engine, rule_only=False):
+    def _run_single_tc(self, page, tc, client, provider, engine, rule_only=False, execution_context=None):
         """TC 1건 처리: 홈 이동 → 절차 기반 액션 생성/실행 → 스크린샷 → 판정.
 
         원본은 이 로직이 run_worker 안에 12000자 넘게 한 함수로 들어있어 유지보수가
@@ -2946,6 +3014,8 @@ class QAWorkerApp:
         start_url = self.start_url_var.get().rstrip("/")
 
         # 홈으로 이동해 사이드바/상태 초기화 (원본과 동일 패턴)
+        if execution_context is not None:
+            execution_context.update(phase='화면 초기화', preparation=[])
         try:
             page.goto(start_url + "/", timeout=20000, wait_until="domcontentloaded")
         except Exception:
@@ -2953,6 +3023,10 @@ class QAWorkerApp:
             page.goto(start_url + "/", timeout=20000)
         page.wait_for_load_state("networkidle", timeout=15000)
         page.wait_for_timeout(1500)
+        if execution_context is not None:
+            execution_context['preparation'].append({'operation': '시작 화면 이동 및 로딩 대기',
+                                                      'status': 'completed', 'finished_at': execution_package.now()})
+            execution_context['phase'] = '세션 확인'
 
         # 세션 만료 감지 -> 재로그인 (원본과 동일 안전장치)
         # [FIX v0.3.1] URL만 보면 SPA에서 세션이 끊겨 로그인 폼이 떠 있어도(URL은 그대로)
@@ -2967,6 +3041,9 @@ class QAWorkerApp:
             self.log_msg("  ⚠ 세션 만료 감지 → 재로그인 시도")
             if not self._login(page):
                 raise RuntimeError("재로그인 실패")
+            if execution_context is not None:
+                execution_context['preparation'].append({'operation': '세션 만료 후 재로그인',
+                                                          'status': 'completed', 'finished_at': execution_package.now()})
 
         # [NEW] 메뉴 키워드 매칭(navigate_by_menu) 제거 - "테스트 절차" 문장 안에
         # 이미 이동 단계가 포함되어 있다고 가정하고, 액션 생성 AI가 전부 처리한다.
@@ -2979,6 +3056,19 @@ class QAWorkerApp:
             page.wait_for_load_state("networkidle", timeout=10000)
             page.wait_for_timeout(1000)
             before_b64 = self._screenshot_b64(page)
+
+        if execution_context is not None:
+            execution_context['phase'] = '액션 생성'
+            execution_context['environment']['before_actions_url'] = execution_package.safe_url(page.url)
+            execution_context['environment']['viewport'] = page.viewport_size
+            try:
+                execution_context['environment']['browser_version'] = page.context.browser.version
+            except Exception:
+                pass
+            try:
+                execution_context['before_screenshot_b64'] = before_b64 or self._screenshot_b64(page)
+            except Exception as error:
+                execution_context['errors'].append(f'실행 전 스크린샷 수집 실패: {error}')
 
         # ① 규칙 기반 액션 우선 [NEW]
         verify_type = infer_verify_type(tc)
@@ -3016,7 +3106,15 @@ class QAWorkerApp:
             self.log_msg(f"  ⓘ 실행할 액션 없음 (검증유형: {verify_type}) - 현재 화면 상태로 판정")
 
         url_before_actions = page.url
+        if execution_context is not None:
+            execution_context['phase'] = '액션 실행'
+            execution_context['planned_actions'] = [execution_package.action_record(action, i)['action']
+                                                     for i, action in enumerate(actions, 1)]
+            execution_context['action_generation'] = ('rule' if build_rule_actions(tc) else
+                                                     'none' if not actions else 'ai')
         actions_done = engine.execute(actions, tc)
+        if execution_context is not None:
+            execution_context['phase'] = '스크린샷 및 판정'
 
         # [NEW] 판정용 "액션 후" 스크린샷을 찍기 전 조건부 대기 한 번 더.
         # 원본에서 TC14가 FAIL로 오판정된 지점이 정확히 "마지막 액션 직후 대기 없이
@@ -3091,6 +3189,8 @@ class QAWorkerApp:
 
         icon = {"PASS": "✅", "FAIL": "❌"}.get(judgment, "⚠")
         self.log_msg(f"  {icon} {judgment} - {reason[:80]}")
+        if execution_context is not None:
+            execution_context['phase'] = '완료'
         return judgment, reason, after_b64, before_b64
 
     @staticmethod
@@ -3106,10 +3206,20 @@ class QAWorkerApp:
             pass
         return b64
 
-    def _save_result(self, tc, judgment, reason, after_b64, before_b64, run_id, source, source_ref, ec2):
+    def _save_result(self, tc, judgment, reason, after_b64, before_b64, run_id, source, source_ref, ec2,
+                     execution_context=None):
         """실행 결과 저장. [NEW] 소스에 상관없이 항상 로컬 DB+스크린샷 파일로 남겨서
         "결과 보기" 대시보드에서 바로 볼 수 있게 하고, EC2가 소스인 TC는 추가로
         원본과 동일하게 EC2에도 PUT 제출한다 (로컬 파일 TC는 EC2 tc id가 없어 제출 대상이 아님)."""
+        try:
+            package_path = execution_package.write(
+                results_store.get_execution_package_root(), tc=tc, result=judgment, reason=reason,
+                run_id=run_id, source=source, source_ref=source_ref, context=execution_context,
+                before_b64=(execution_context or {}).get('before_screenshot_b64') or before_b64,
+                after_b64=after_b64)
+            self.log_msg(f'  📦 실행 패키지 저장: {package_path}')
+        except Exception as error:
+            self.log_msg(f'  ⚠ 실행 패키지 저장 실패: {error}')
         shot_dir = results_store.get_screenshot_dir(run_id)
         before_path = after_path = None
         try:

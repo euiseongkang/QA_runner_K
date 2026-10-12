@@ -232,7 +232,8 @@ class TCOptimizationDialog:
             self.proposal = proposal
             self.no_changes = details_unchanged(before, proposal)
             basic = proposal.get('correction_only', False)
-            badge = '✓ 기본 교정' if basic else '✓ 품질 검증'
+            rule_completion = proposal.get('rule_completion', False)
+            badge = '✓ 실행 규칙 보완' if rule_completion else ('✓ 기본 교정' if basic else '✓ 품질 검증')
             if self.no_changes:
                 self.status.configure(text=badge + ' · 변경이 필요 없습니다. 입력 내용은 유지됩니다.')
                 review = ttk.LabelFrame(self.content, text=badge, padding=10)
@@ -241,7 +242,8 @@ class TCOptimizationDialog:
                           wraplength=560).pack(fill='x')
                 self.cancel_button.configure(text='닫기')
                 return
-            self.status.configure(text=(badge + ' · 기본 교정 결과를 확인한 뒤 [적용]을 누르세요.' if basic else
+            self.status.configure(text=(badge + ' · 변경 전후를 확인한 뒤 [적용]을 누르세요.' if rule_completion else
+                                       badge + ' · 기본 교정 결과를 확인한 뒤 [적용]을 누르세요.' if basic else
                                        '✓ 품질 검증 · AI 최적화가 완료되었습니다. 변경 전후를 확인한 뒤 [적용]을 누르세요.'))
             if proposal.get('review_reason'):
                 review = ttk.LabelFrame(self.content, text=badge, padding=10)
@@ -250,7 +252,8 @@ class TCOptimizationDialog:
             for key, label in (('precondition', '사전조건'), ('steps', '테스트 절차'), ('expected', '예상 결과')):
                 frame = ttk.LabelFrame(self.content, text=label, padding=6)
                 frame.pack(fill='x', padx=12, pady=5)
-                for title, text in (('변경 전', before[key]), ('기본 교정' if basic else 'AI 제안', proposal[key])):
+                for title, text in (('변경 전', before[key]),
+                                    ('실행 규칙 보완' if rule_completion else '기본 교정' if basic else 'AI 제안', proposal[key])):
                     ttk.Label(frame, text=title).pack(anchor='w')
                     widget = tk.Text(frame, height=5, wrap='word', width=65)
                     widget.insert('1.0', text)

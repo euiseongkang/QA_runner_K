@@ -1,6 +1,7 @@
 # QA_runner_K 실행/빌드 의존성 (뼈대 단계 - 실제 버전 고정은 빌드 전에 확정)
 playwright
 requests
+keyring   # Open WebUI API Key를 OS 자격 증명 저장소에 보관
 Pillow
 anthropic
 openai
