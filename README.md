@@ -414,6 +414,27 @@ v0.33.0의 값이 없는 항목 표시 TC는 휴대전화번호·병동·병실�
 
 # Open WebUI Provider 설정
 
+### Bitbucket Runner의 QA 지식 기반 동기화
+
+`main` 푸시 후 GitHub 미러가 완료되면 macOS 자체 호스팅 Runner에서 `rag_sync.py`를 실행합니다. Bitbucket **Repository settings → Pipelines → Repository variables**에 다음 값을 설정하세요.
+
+- `OPENWEBUI_URL`: Runner에서 접근 가능한 Open WebUI 기본 주소. 같은 Mac에서 실행하면 `http://localhost:8080`.
+- `OPENWEBUI_API_KEY`: 해당 지식 기반을 만들고 파일을 관리할 권한이 있는 계정의 API Key. **Secured**로 등록하며 코드·로그·artifact에 기록하지 않습니다. QA 앱의 키체인 저장값을 CI가 자동으로 사용하는 것은 아닙니다.
+
+지식 기반 이름은 `QA_runner_K_<커밋 앞 12자리>_v<APP_VERSION>`입니다. 전체 커밋과 자료 해시를 함께 기록합니다. 작업 트리 대신 해당 커밋의 규칙 문서, 최적화 소스, 판정·컨트롤 소스 및 GUI의 규칙·실행 엔진·최적화 함수를 선별합니다. 모델 가중치·환경 설정·실행 패키지는 업로드하지 않습니다. 예전 버전 지식 기반과 웹 소스 지식 기반은 보존합니다.
+
+업로드 → 처리 완료 확인 → 지식 기반 연결 → 연결 확인 후 성공합니다. 같은 이름의 기존 지식 기반은 원본 커밋·내용 해시가 일치할 때만 재사용하고, 연결된 동일 파일을 다시 업로드하지 않습니다. 실패한 작업의 file ID는 `sync_state.json`에 기록합니다. 같은 작업 폴더에서 재실행하면 미연결 업로드를 이어서 처리합니다. Runner의 새 체크아웃에는 이 상태가 없을 수 있어 실패 작업의 artifact를 복원해야 할 수 있습니다. 완료된 지식 기반은 서버 조회로 재사용합니다.
+
+`rag_sync_output/**`가 파이프라인 artifact로 저장됩니다. manifest에는 커밋·버전·자료 해시, sync_state에는 지식 기반 ID·파일 ID·완료 상태를 기록합니다. 버전별 이름은 자료 구분용이며, 실행 프로그램 버전에 맞는 커밋을 QA의 QA 지식 기반 선택란에서 선택하세요. 새로운 지식 기반 ID로 자동 전환하거나 모델을 재학습하는 기능은 아닙니다. 색인·연결 완료는 검색 품질 검증과 구분하며 최적화 응답의 검색 근거를 확인해야 합니다.
+
+업로드 없이 추출 자료를 확인하려면 다음을 실행합니다.
+
+```bash
+python3 rag_sync.py --commit HEAD --dry-run
+```
+
+API Key에 엔드포인트 제한을 사용한다면 `/api/v1/knowledge`와 `/api/v1/files` 접근이 필요합니다. API 실패·색인 실패·시간 초과 시 동기화 단계가 실패로 표시됩니다. 기존 GitHub 미러·빌드가 성공해도 동기화 실패는 별도로 해결해야 합니다.
+
 AI Provider에서 `Open WebUI (RAG)`를 선택한다. API 주소 기본값은 `http://localhost:8080`이며 다른 서버 또는 프록시의 기본 경로로 변경할 수 있다.
 
 1. Open WebUI의 프로필 → 설정 → 계정 → API Keys에서 키를 발급한다. 항목이 없으면 관리자 인증 설정의 API Keys 활성화 및 계정 권한을 확인한다. 기존 키가 있으면 재발급하지 않고 그 키를 사용한다.

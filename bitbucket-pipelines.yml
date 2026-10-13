@@ -1,2 +1,21 @@
-image: alpine/git:latest
-pipelines: {branches: {main: [{step: {name: "GitHub mirror push (triggers GitHub Actions build/release)", script: ["git remote add github https://${GH_PAT}@github.com/euiseongkang/QA_runner_K.git", "git push github HEAD:main", "echo mirror push done - GitHub Actions will start the build"]}}]}}
+pipelines:
+  branches:
+    main:
+      - step:
+          name: GitHub mirror push (triggers GitHub Actions build/release)
+          runs-on:
+            - self.hosted
+            - macos
+          script:
+            - git remote add github https://${GH_PAT}@github.com/euiseongkang/QA_runner_K.git
+            - git push github HEAD:main
+            - echo mirror push done - GitHub Actions will start the build
+      - step:
+          name: Sync QA rules to Open WebUI knowledge
+          runs-on:
+            - self.hosted
+            - macos
+          script:
+            - python3 rag_sync.py --commit "$BITBUCKET_COMMIT"
+          artifacts:
+            - rag_sync_output/**
