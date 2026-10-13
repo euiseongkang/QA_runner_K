@@ -30,9 +30,11 @@ def build_bundle(root, commit):
     version = match.group(1)
     name = f'QA_runner_K_{sha[:12]}_v{version}'
     tracked = git(root, 'ls-tree', '-r', '--name-only', sha).splitlines()
-    paths = sorted(p for p in tracked if '/' not in p and
-                   (p in ('TC_EXECUTION_RULES.md', 'tc_optimization.py')
-                    or p.endswith('_verification.py') or p == 'checkbox_controls.py'))
+    paths = sorted(p for p in tracked if
+                   ('/' not in p and (p in ('TC_EXECUTION_RULES.md', 'tc_optimization.py', 'checkbox_controls.py')
+                                      or p.endswith('_verification.py')))
+                   or (p.startswith('verifications/') and p.count('/') == 1
+                       and (p.endswith('_verification.py') or p == 'verifications/__init__.py')))
     if 'TC_EXECUTION_RULES.md' not in paths or 'tc_optimization.py' not in paths:
         raise ValueError('필수 QA 규칙·최적화 소스가 없습니다.')
     sections, manifest = [], []

@@ -85,3 +85,8 @@ qa_runner_k_execution_packages/
 qa_tc_dataset_*/
 # Bitbucket Runner가 생성하는 버전별 RAG 자료·동기화 상태
 rag_sync_output/
+
+# Commit/version distribution artifacts and local import checkpoints
+distribution_output/
+.import_state.json
+finetuning/.runner/

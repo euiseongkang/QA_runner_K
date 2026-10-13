@@ -19,3 +19,25 @@ pipelines:
             - python3 rag_sync.py --commit "$BITBUCKET_COMMIT"
           artifacts:
             - rag_sync_output/**
+      - step:
+          name: Train model, publish knowledge and model to Drive, register Ollama
+          runs-on:
+            - self.hosted
+            - macos
+          script:
+            - bash scripts/publish_distribution.sh
+          artifacts:
+            - distribution_output/**/report.json
+  custom:
+    publish-distribution:
+      - step:
+          name: Sync knowledge and publish distribution
+          runs-on:
+            - self.hosted
+            - macos
+          script:
+            - python3 rag_sync.py --commit "$BITBUCKET_COMMIT"
+            - QA_DRIVE_PUBLISH_ENABLED=1 bash scripts/publish_distribution.sh
+          artifacts:
+            - rag_sync_output/**
+            - distribution_output/**/report.json

@@ -12,6 +12,8 @@ def target(tc):
         return None
     numbers = []
     for line in str(tc.get('steps') or '').splitlines():
+        if re.search(r'클릭\s*가능.*확인|클릭할\s*수\s*있.*확인', line):
+            continue
         if re.search(r'클릭|누르|눌러', line):
             numbers += re.findall(r'\[(\d+)\]', line)
     return numbers[-1] if numbers else None
@@ -32,7 +34,7 @@ def snapshot(page):
           if(cs.length>20)break;
         }
       }
-      if(groups.size!==1)return {selected:null,targets:{},rows:null};
+      if(groups.size!==1)return {selected:null,targets:{},rows:null,error:'페이지네이션 그룹을 하나로 식별하지 못함'};
       const cs=[...[...groups][0].querySelectorAll('button,a,[role="button"],[role="link"]')]
         .filter(visible).filter(e=>/^\d+$/.test(e.innerText.trim()));
       const active=cs.filter(e=>(e.hasAttribute('aria-current') && e.getAttribute('aria-current')!=='false') ||
@@ -44,8 +46,16 @@ def snapshot(page):
         colors.filter(c=>c===colors[i]).length===1 && colors.some(c=>colors.filter(x=>x===c).length===cs.length-1));
       const chosen=active.length===1?active:active.length===0?highlighted:[];
       const tables=[...document.querySelectorAll('table,[role="table"],[role="grid"]')].filter(visible).filter(t=>/환자명/.test(t.innerText));
-      const rows=tables.length===1?[...tables[0].querySelectorAll('tbody tr,[role="row"]')].filter(visible)
-        .filter(r=>r.querySelectorAll('td,[role="cell"],[role="gridcell"]').length>=2).map(r=>r.innerText.trim()):null;
+      const table=tables.length===1?tables[0]:null;
+      const busy=!!table && (table.matches('[aria-busy="true"]') ||
+        !!table.querySelector('[aria-busy="true"],[role="progressbar"],[data-state="loading"]') ||
+        /로딩\s*중|조회\s*중|불러오는\s*중/.test(table.innerText));
+      const rows=table?[...table.querySelectorAll('tbody tr,[role="row"]')].filter(visible)
+        .filter(r=>!r.querySelector('th,[role="columnheader"]'))
+        .filter(r=>!r.matches('[aria-busy="true"],[role="status"]'))
+        .filter(r=>r.querySelectorAll('td:not([colspan]),[role="cell"],[role="gridcell"]').length>=2)
+        .filter(r=>r.innerText.trim() && !/^(?:로딩\s*중|조회\s*중|불러오는\s*중|데이터가?\s*없|검색\s*결과가?\s*없|조회\s*결과가?\s*없)/.test(r.innerText.trim()))
+        .map(r=>r.innerText.trim()):null;
       const labels=cs.map(e=>e.innerText.trim());
       const linkPages={};
       for(const el of cs) {
@@ -56,7 +66,7 @@ def snapshot(page):
         if(url.origin===location.origin && /(?:^|\/)patients\/?$/.test(url.pathname) && /^\d+$/.test(value||''))
           linkPages[el.innerText.trim()]=Number(value);
       }
-      return {selected:chosen.length===1?chosen[0].innerText.trim():null,rows,
+      return {selected:chosen.length===1?chosen[0].innerText.trim():null,rows,busy,
         link_pages:linkPages,
         targets:Object.fromEntries(labels.filter(s=>labels.filter(x=>x===s).length===1).map(s=>[s,all.indexOf(cs.find(e=>e.innerText.trim()===s))]))};
     }''')
@@ -81,6 +91,11 @@ def click_and_collect(page, number):
     if len(offsets) == 1 and next(iter(offsets)) in (0, 1):
         base = next(iter(offsets))
     evidence = {'before': before, 'target': number, 'loaded': False}
+    pending = set()
+    successful = set()
+    def on_request(request):
+        if request.resource_type in ('xhr', 'fetch'):
+            pending.add(request)
     def on_response(response):
         try:
             url = urlsplit(response.url)
@@ -89,29 +104,64 @@ def click_and_collect(page, number):
                     and response.request.resource_type in ('xhr', 'fetch')
                     and re.search(r'(?:^|/)patients?/?$', url.path, re.I)
                     and query.get('page') == [str(int(number) - base)]):
-                evidence['loaded'] = True
+                successful.add(response.request)
         except Exception:
             pass
+    def on_finished(request):
+        pending.discard(request)
+        if request in successful:
+            evidence['loaded'] = True
+            evidence['completion_source'] = '환자 조회 응답 완료'
+    def on_failed(request):
+        pending.discard(request)
+        successful.discard(request)
+    page.on('request', on_request)
     page.on('response', on_response)
+    page.on('requestfinished', on_finished)
+    page.on('requestfailed', on_failed)
     try:
         page.locator(CONTROLS).nth(before['targets'][number]).click(timeout=5000)
         deadline = time.monotonic() + 5
+        stable_since = None
+        last_state = None
         while True:
             evidence['after'] = snapshot(page)
-            if verify(evidence)[0] == 'PASS' or time.monotonic() >= deadline:
+            after = evidence['after']
+            state = (after.get('selected'), after.get('rows'), after.get('busy'))
+            if state != last_state or pending or after.get('busy'):
+                stable_since = time.monotonic()
+                last_state = state
+            stable = stable_since is not None and time.monotonic() - stable_since >= 0.5
+            # 다른 API 경로나 캐시 렌더링에서도 실제 목록 갱신과 안정화를 근거로 사용한다.
+            if (stable and not pending and not after.get('busy')
+                    and after.get('selected') == number and after.get('rows') is not None
+                    and before.get('rows') != after['rows']):
+                evidence['loaded'] = True
+                evidence.setdefault('completion_source', '환자 목록 갱신 후 안정화')
+            evidence['settled'] = stable and not pending and not after.get('busy')
+            if (evidence['settled'] and verify(evidence)[0] in ('PASS', 'FAIL')) or time.monotonic() >= deadline:
                 return evidence
             page.wait_for_timeout(100)
     finally:
         page.remove_listener('response', on_response)
+        page.remove_listener('request', on_request)
+        page.remove_listener('requestfinished', on_finished)
+        page.remove_listener('requestfailed', on_failed)
 
 
 def verify(evidence):
     if not evidence:
-        return '확인 필요', '페이지 선택과 환자 목록 조회 근거를 수집하지 못함'
+        return '확인 필요', '페이지 클릭 실행 근거가 없음: 실행 액션과 클릭 실패 기록을 확인하세요'
+    if evidence.get('error'):
+        return '확인 필요', '페이지 버튼 식별·클릭 실패: ' + evidence['error']
     before, after = evidence.get('before', {}), evidence.get('after', {})
     if after.get('selected') != evidence.get('target'):
         return '확인 필요', '대상 페이지 버튼의 선택 상태를 확인하지 못함'
-    if (not evidence.get('loaded') or not before.get('rows') or not after.get('rows')
-            or before['rows'] == after['rows']):
-        return '확인 필요', '페이지 선택은 확인했으나 해당 페이지 조회 성공·목록 갱신 근거가 부족함'
-    return 'PASS', '대상 페이지 선택 + 해당 페이지 조회 성공 + 환자 목록 갱신 확인'
+    if after.get('rows') is None:
+        return '확인 필요', '대상 페이지 선택은 확인했으나 환자 데이터 목록을 하나로 식별하지 못함'
+    if not evidence.get('loaded') or after.get('busy') or evidence.get('settled') is False:
+        return '확인 필요', '대상 페이지 선택은 확인했으나 환자 목록 조회 완료 근거가 부족함'
+    count = len(after['rows'])
+    if count == 0:
+        return 'FAIL', '대상 페이지 조회 완료 후 실제 환자 데이터 행이 0개임'
+    return 'PASS', f"[{evidence['target']}] 페이지 선택 + 조회 완료 + 실제 환자 데이터 행 {count}개 확인"

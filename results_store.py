@@ -100,6 +100,11 @@ def _base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_finetuning_export_root():
+    """학습 자료는 소스 프로젝트 또는 배포 실행 파일 옆 finetuning에 저장한다."""
+    return os.path.join(_base_dir(), 'finetuning')
+
+
 def get_db_path():
     return os.environ.get("QA_RUNNER_K_DB_PATH") or os.path.join(_base_dir(), DB_FILENAME)
 

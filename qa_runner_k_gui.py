@@ -41,15 +41,18 @@ from tk_scrollable import ScrollableFrame
 from tk_tc_table import TCTable
 from tc_review_dialog import TCReviewDialog, TCDetailDialog
 import tc_optimization
-import patient_filter_verification
+from verifications import patient_filter_verification
 import checkbox_controls
-import patient_type_verification
-import login_extension_verification
-import patient_name_layout_verification
-import empty_value_verification
-import visibility_verification
-import search_clear_verification
-import pagination_verification
+from verifications import patient_type_verification
+from verifications import login_extension_verification
+from verifications import patient_name_layout_verification
+from verifications import empty_value_verification
+from verifications import visibility_verification
+from verifications import search_clear_verification
+from verifications import pagination_verification
+from verifications import reception_defaults_verification
+from verifications import table_columns_verification
+from verifications import unsupported_verification
 from openwebui_client import OpenWebUIClient
 import webui_credentials
 from ollama_client import OllamaClient, base_url as ollama_base_url
@@ -58,7 +61,7 @@ from ollama_client import available_models, recommendation, preferred_model
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.34.0"
+APP_VERSION = "0.35.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -413,6 +416,8 @@ def build_rule_actions(tc: dict) -> list:
                             'checked': checkbox_state, 'description': brackets[0]})
             continue
         has_click = bool(re.search(r"클릭|선택|누르|눌러|탭", line))
+        if re.search(r'클릭\s*가능.*확인|클릭할\s*수\s*있.*확인', line):
+            has_click = False
         # 선택 상태를 확인하는 문장은 선택/클릭 동작이 아니다.
         if (re.search(r'확인', line)
                 and not re.search(r'클릭|누르|눌러|선택한다|선택하세요', line)):
@@ -597,7 +602,8 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
                   modal_seen=False, patient_filter_evidence=None, patient_type_evidence=None,
                   search_evidence=None, visibility_evidence=None, search_clear_evidence=None,
                   pagination_evidence=None, login_extension_evidence=None, patient_name_layout_evidence=None,
-                  empty_value_evidence=None):
+                  empty_value_evidence=None, reception_defaults_evidence=None,
+                  table_columns_evidence=None):
     """AI 없이 코드로만 하는 보수적 판정. (judgment, reason) 반환.
 
     확실한 근거가 있을 때만 PASS를 주고, 근거를 못 찾으면 FAIL이 아니라 "확인 필요"로 둔다.
@@ -613,6 +619,15 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
     expected = str(tc.get("expected") or "")
     if not expected.strip():
         return RESULT_NEEDS_REVIEW, "예상 결과가 비어 있어 코드 판정 불가"
+
+    unsupported = unsupported_verification.failure(tc)
+    if unsupported:
+        return unsupported
+
+    if table_columns_verification.applies(tc):
+        return table_columns_verification.verify(table_columns_evidence, tc)
+    if reception_defaults_verification.applies(tc):
+        return reception_defaults_verification.verify(reception_defaults_evidence, tc)
 
     if pagination_verification.target(tc):
         return pagination_verification.verify(pagination_evidence)
@@ -847,7 +862,11 @@ class TCExecutionEngine:
             actions_done.append('환자 행 클릭: ' + name)
             return
         if pagination_verification.target(getattr(self, '_current_tc', {})) == desc.strip():
-            self.pagination_evidence = pagination_verification.click_and_collect(self.page, desc.strip())
+            try:
+                self.pagination_evidence = pagination_verification.click_and_collect(self.page, desc.strip())
+            except Exception as exc:
+                self.pagination_evidence = {'target': desc.strip(), 'error': str(exc)}
+                raise
             self.log_fn(f'  ✓ 페이지네이션 클릭: {desc}')
             actions_done.append(f'클릭: {desc}')
             return
@@ -3150,6 +3169,10 @@ class QAWorkerApp:
                     if patient_name_layout_verification.applies(tc) else None),
                 empty_value_evidence=(empty_value_verification.capture(page, tc)
                     if empty_value_verification.applies(tc) else None),
+                reception_defaults_evidence=(reception_defaults_verification.capture(page, tc)
+                    if reception_defaults_verification.applies(tc) else None),
+                table_columns_evidence=(table_columns_verification.capture(page, tc)
+                    if table_columns_verification.applies(tc) else None),
                 search_evidence=getattr(engine, 'search_evidence', None),
                 visibility_evidence=visibility_verification.capture_visibility(page, tc),
                 search_clear_evidence=getattr(engine, 'clear_search_evidence', None),

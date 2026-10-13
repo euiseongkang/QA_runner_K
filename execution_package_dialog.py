@@ -2,10 +2,11 @@
 import math
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 import execution_package
+import results_store
 
 
 class ExecutionPackageDialog:
@@ -37,7 +38,7 @@ class ExecutionPackageDialog:
         export_controls.pack(fill='x')
         self.export_button = ttk.Button(export_controls, text='학습 데이터 내보내기', command=self.export_training)
         self.export_button.pack(side='left')
-        ttk.Label(export_controls, text='전체 승인 패키지 → JSONL · 현재 필터/선택과 무관 · 편집 내용은 먼저 저장하세요.').pack(side='left', padx=8)
+        ttk.Label(export_controls, text='전체 승인 패키지 → finetuning/JSONL · 현재 필터/선택과 무관 · 편집 내용은 먼저 저장하세요.').pack(side='left', padx=8)
         from finetuning_setup import show_model_guidance
         ttk.Button(export_controls, text='권장 학습 모델 / 설치 안내',
                    command=lambda: show_model_guidance(self.window)).pack(side='left')
@@ -98,10 +99,7 @@ class ExecutionPackageDialog:
 
     def export_training(self):
         from finetuning_export import export_packages
-        destination = filedialog.askdirectory(title='전체 승인 패키지의 학습 데이터 저장 위치',
-                                             initialdir=str(Path(self.root).parent), parent=self.window)
-        if not destination:
-            return
+        destination = results_store.get_finetuning_export_root()
         self.export_button.configure(state='disabled')
         self.window.configure(cursor='watch')
         self.window.update_idletasks()

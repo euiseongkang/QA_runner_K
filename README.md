@@ -446,3 +446,23 @@ AI Provider에서 `Open WebUI (RAG)`를 선택한다. API 주소 기본값은 `h
 TC 상세 최적화 요청은 선택한 지식 기반을 Open WebUI의 `/api/chat/completions`에 collection으로 첨부한다. 검색 근거가 없는 응답, 잘린 응답 및 기존 품질 검증을 통과하지 못한 제안은 적용하지 않는다. 원본 TC는 적용/저장 전까지 유지된다. Open WebUI 폴더 설정은 이 API 요청으로 자동 상속되지 않으므로 프로그램에서도 지식 기반을 선택해야 한다.
 
 API Key 엔드포인트 제한을 사용한다면 `/api/models`, `/api/v1/knowledge`, `/api/chat/completions` 접근이 필요하다. 실제 서버 인증과 최적화 품질은 발급한 키를 입력한 뒤 연결 확인 및 TC 시범 실행으로 확인해야 한다.
+
+### 최신 모델 기록을 이용한 단계별 배포
+
+Bitbucket Runner 전체 자동화는 `scripts/publish_distribution.sh` → `runner_model_pipeline.py`로 연결됩니다. 같은 Mac의 `finetuning`에 검토·승인한 JSONL을 내보내고 main에 푸시하면 최신 병합 모델에서 추가 학습 → 평가·병합 → GGUF 변환 → 지식·runtime.zip·training.zip Drive 업로드 → Mac Ollama 등록을 수행합니다. 성공한 모델은 `finetuning/.runner/model_registry.json`에 보존하여 다음 학습의 시작점으로 사용합니다. 같은 데이터는 중복 학습하지 않습니다. 경로·인증·활성화 변수와 운영 방법은 [DISTRIBUTION_GUIDE.md](DISTRIBUTION_GUIDE.md)를 참고하세요.
+
+`finetuning/model_registry.json`에 최신 모델 이름과 병합 모델·어댑터·GGUF·Modelfile 경로를 기록합니다. 현재 초기 기록은 기존 `qa-tc-optimizer-v33`의 `fused_model_v33_r2`입니다. 프로그램 버전과 모델 이름은 별도입니다.
+
+프로젝트 루트에서 `bash finetuning/run_model_release.sh show`로 기록을 확인합니다. 새로 내보낸 train.jsonl·valid.jsonl·test.jsonl 폴더를 `--dataset`에 지정하고 다음 순서로 진행합니다.
+
+1. `train --dataset <새 데이터 폴더> --name qa-tc-optimizer-v35 --iters 20 --dry-run`: 시작 모델·명령 확인만 수행합니다.
+2. 같은 명령에서 `--dry-run`을 제거하여 추가 학습합니다. 20회는 시험 학습 설정이며 실제 품질에 맞춰 조정합니다.
+3. `post --dataset <새 데이터 폴더>`: 새 어댑터 평가·병합·파일 검사.
+4. `gguf --dataset <새 데이터 폴더>`: F16 GGUF 변환·구조 검사.
+5. `deploy --dataset <새 데이터 폴더>`: 이전 Modelfile의 템플릿·파라미터를 유지하고 새 GGUF를 참조해 Ollama에 등록·조회합니다.
+6. Open WebUI에서 후보 모델로 기존·신규 TC 답변을 비교합니다.
+7. `promote --dataset <새 데이터 폴더>`: 기술 검사를 다시 수행하고 최신 기록을 갱신합니다. 이전 모델 기록은 history에 보존합니다. QA 프로그램/Open WebUI 모델 선택은 별도로 변경합니다.
+
+각 단계는 `bash finetuning/run_model_release.sh <단계> ...`로 실행합니다. 경로는 현재 터미널 폴더가 아니라 프로젝트 루트를 기준으로 해석합니다. 실행 기록은 데이터 폴더의 `model_release.json`에 저장하며 실패한 단계는 완료로 기록하지 않습니다. 새 모델 등록 전까지 기존 모델을 최신으로 유지합니다. `--dry-run`은 명령만 표시하며 학습·배포·기록 변경을 수행하지 않습니다.
+
+학습은 최신 **병합 가중치**를 시작 모델로 사용하고 새 어댑터를 그 모델에 병합합니다. 이미 병합된 v33에 기존 v33 어댑터를 다시 적용하지 않습니다. 데이터는 승인·교정한 정답과 독립 평가 자료로 준비해야 하며, 스크립트의 파일 검사·평가 완료만으로 답변 품질 개선을 보장하지 않습니다.
