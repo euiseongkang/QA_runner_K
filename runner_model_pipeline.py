@@ -49,6 +49,18 @@ def run(command):
     subprocess.run([str(item) for item in command], check=True)
 
 
+def training_interpreter(value):
+    # venv/bin/python의 심볼릭 링크를 풀면 시스템 Python으로 실행되어 venv를 잃는다.
+    return Path(os.path.abspath(Path(value).expanduser()))
+
+
+def check_training_environment(python):
+    subprocess.run([str(python), '-c',
+                    'import importlib.util,sys; print("학습 Python:",sys.executable,flush=True); '
+                    'sys.exit(0 if importlib.util.find_spec("mlx_lm") else '
+                    '"학습 가상환경에 mlx_lm이 없습니다. QA_TRAINING_PYTHON을 확인하세요.")'], check=True)
+
+
 def pipeline(args):
     artifact_root = Path(args.artifact_root).expanduser().resolve()
     meta, _ = build_bundle(ROOT, args.commit)
@@ -59,10 +71,11 @@ def pipeline(args):
     registry = (release.read(registry_path) if registry_path.exists() else
                 absolute_registry(json.loads(git(ROOT, 'show', meta['commit'] + ':finetuning/model_registry.json')), artifact_root))
     verify_model(registry['latest']['fused_model'])
-    python = Path(args.training_python or artifact_root / 'finetuning/.venv/bin/python').expanduser().resolve()
+    python = training_interpreter(args.training_python or artifact_root / 'finetuning/.venv/bin/python')
     llama_cpp = Path(args.llama_cpp).expanduser().resolve()
     if not python.is_file():
         raise ValueError('MLX 학습 Python이 없습니다: ' + str(python))
+    check_training_environment(python)
     if not (llama_cpp / 'convert_hf_to_gguf.py').is_file():
         raise ValueError('llama.cpp 변환 도구가 없습니다: ' + str(llama_cpp))
     needs_training = registry['latest'].get('dataset_sha256') != fingerprint
@@ -108,7 +121,10 @@ def pipeline(args):
                 run([python,ROOT/'model_release.py','train',*common,'--name',name,'--iters',args.iters])
             plan = release.read(state)
             if plan['stage'] == 'prepared':
-                raise ValueError('학습이 중단된 실행입니다. 해당 실행 로그와 어댑터를 확인해야 합니다: ' + str(snapshot))
+                # 시작 전 환경 오류처럼 산출물이 없는 실패만 재시도한다.
+                run([python,ROOT/'model_release.py','train',*common,'--name',name,
+                     '--iters',args.iters,'--retry-prepared'])
+                plan = release.read(state)
             if plan['stage'] == 'train':
                 run([python,ROOT/'model_release.py','post',*common])
                 plan = release.read(state)

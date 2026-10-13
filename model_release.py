@@ -89,6 +89,7 @@ def main(argv=None):
     parser.add_argument('--llama-cpp', default='~/Projects/llama.cpp')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--registry', default=str(REGISTRY), help='Runner 등에서 사용할 모델 레지스트리 경로')
+    parser.add_argument('--retry-prepared', action='store_true', help='산출물 없이 준비 상태에서 실패한 동일 학습만 재시도')
     args = parser.parse_args(argv)
     try:
         registry_path = Path(args.registry).expanduser().resolve()
@@ -103,9 +104,10 @@ def main(argv=None):
         if args.stage == 'train':
             if not args.name or args.iters < 1:
                 raise ValueError('--name과 양수 --iters가 필요합니다.')
-            if state.exists():
-                raise ValueError('이 데이터 폴더에 실행 기록이 있습니다. 기존 단계부터 이어가거나 새 데이터 폴더를 사용하세요.')
             plan = create_plan(dataset, args.name, registry['latest'])
+            if state.exists():
+                if not args.retry_prepared or read(state) != plan:
+                    raise ValueError('기존 실행과 준비 상태·데이터·시작 모델이 일치하지 않아 재학습하지 않습니다.')
             if any(Path(plan[k]).exists() for k in ('adapter', 'fused_model', 'gguf', 'modelfile')):
                 raise ValueError('기존 모델 산출물은 덮어쓰지 않습니다. 새 모델 이름을 지정하세요.')
             if not args.dry_run:
