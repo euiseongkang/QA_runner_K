@@ -330,3 +330,210 @@ def parse_tc_excel(source):
             wb.close()
         except Exception:
             pass
+
+
+# ============================================================
+# TC 엑셀로 내보내기                                            [NEW v0.36.0]
+# ============================================================
+# 읽기와 쓰기를 같은 파일에 두는 이유는 이 모듈이 존재하는 이유와 같다 - 포맷 규칙이
+# 두 곳으로 갈라지면 "내보낸 파일을 자기가 못 읽는" 상황이 생긴다.
+# 그래서 내보내기의 목표는 "보기 좋은 엑셀"이 아니라 **parse_tc_excel 이 그대로 다시
+# 읽을 수 있는 파일**이다. 아래 규칙은 전부 그 왕복을 위해 있다.
+#
+# 시트 이름을 TC 로 알아볼 수 있게 맞추는 이유 (중요):
+#   parse_tc_excel 은 이름에 TC/테스트케이스가 든 시트가 **하나라도** 있으면
+#   그 시트들만 읽는다. 그래서 한 세션에 "TC_검사"와 "환자관리"가 섞여 있으면
+#   다시 가져올 때 "환자관리" 쪽 TC가 통째로 사라진다.
+#   이 사고를 막으려고, 내보낼 때 TC로 안 보이는 이름에는 TC_ 를 붙인다.
+#   이름이 바뀌는 건 눈에 보이지만, TC가 조용히 없어지는 것보다 낫다.
+
+EXPORT_COLUMNS = ["No", "테스트 항목", "사전조건", "테스트 절차", "예상 결과",
+                  "우선순위", "결과(Pass/Fail)", "비고"]
+OVERVIEW_SHEET = "개요"
+DEFAULT_TC_SHEET = "테스트케이스"
+
+# 엑셀 시트 이름에 못 쓰는 문자. 넣으면 openpyxl 이 아니라 엑셀이 파일을 거부한다.
+_SHEET_BAD = r'[]:*?/\\'
+_SHEET_MAX = 31
+
+# 윈도우 파일명에 못 쓰는 문자.
+_FILE_BAD = r'\/:*?"<>|'
+_FILE_MAX = 120
+
+
+def safe_sheet_title(name, used=None):
+    """시트 이름을 엑셀이 받아주고 parse_tc_excel 이 TC 시트로 알아보는 형태로 다듬는다.
+
+    used 에 이미 쓴 이름을 넣어주면 중복을 피해 숫자를 붙인다(엑셀은 대소문자를 구분하지 않는다).
+    """
+    used = used if used is not None else set()
+    title = str(name or "").strip()
+    for ch in _SHEET_BAD:
+        title = title.replace(ch, " ")
+    title = re.sub(r"\s+", " ", title).strip().strip("'")
+    if not title:
+        title = DEFAULT_TC_SHEET
+    if not is_tc_sheet(title):
+        title = "TC_" + title           # 다시 읽힐 수 있게. 위 주석 참고
+    title = title[:_SHEET_MAX].strip() or DEFAULT_TC_SHEET
+
+    base, n = title, 2
+    while title.lower() in used:
+        suffix = f"_{n}"
+        title = base[:_SHEET_MAX - len(suffix)] + suffix
+        n += 1
+    used.add(title.lower())
+    return title
+
+
+def safe_file_part(name):
+    """파일명에 넣어도 되는 형태로 다듬는다. 빈 문자열이 나올 수 있다(그때는 호출한 쪽이 뺀다)."""
+    part = str(name or "")
+    for ch in _FILE_BAD:
+        part = part.replace(ch, "_")
+    part = "".join(c for c in part if ord(c) >= 32)
+    part = re.sub(r"\s+", " ", part).strip().strip(".")
+    return part
+
+
+def export_filename(label="", today=None):
+    """내보내기 파일명: TC_<날짜>_<세션 이름>.xlsx
+
+    세션 이름을 붙이는 건 같은 날 여러 세션을 받을 때 브라우저가 "(1)"을 붙여
+    어느 세션인지 알 수 없게 되는 걸 막기 위한 것이다.
+    """
+    import time as _time
+    stamp = today or _time.strftime("%Y-%m-%d")
+    part = safe_file_part(label)
+    name = f"TC_{stamp}_{part}" if part else f"TC_{stamp}"
+    return name[:_FILE_MAX].strip().strip(".") + ".xlsx"
+
+
+def _overview_rows(session, tcs, sheet_renames=None):
+    """개요 시트에 넣을 (항목, 내용) 줄들. 표준 포맷의 항목명을 그대로 쓴다."""
+    import time as _time
+    session = session or {}
+
+    def when(ts):
+        try:
+            return _time.strftime("%Y-%m-%d %H:%M", _time.localtime(float(ts)))
+        except (TypeError, ValueError):
+            return ""
+
+    sheets = sorted({str(t.get("sheet") or "") for t in tcs} - {""})
+    rows = [
+        ("문서명", str(session.get("label") or "QA 테스트케이스")),
+        ("대상 화면", ", ".join(sheets) or "-"),
+        ("작성일", when(session.get("created_at")) or "-"),
+        ("작성 근거",
+         "QA_runner_K 대시보드에 등록된 TC를 그대로 내보낸 파일입니다. "
+         "이 파일은 대시보드의 [TC 엑셀 올리기]로 다시 가져올 수 있습니다."),
+        ("범위 안내",
+         "결과(Pass/Fail) 칸은 비어 있습니다. 실행 결과는 대시보드의 실행 내역에서 봅니다. "
+         "실행 포함/제외 상태는 이 파일에 담기지 않으므로, 다시 가져오면 전부 '포함'으로 들어옵니다."),
+        ("", ""),
+        ("세션 ID", str(session.get("session_id") or "-")),
+        ("출처", str(session.get("source") or "-")),
+        ("불러온 시각", when(session.get("created_at")) or "-"),
+        ("내보낸 시각", _time.strftime("%Y-%m-%d %H:%M")),
+        ("TC 건수", f"{len(tcs)}건"),
+    ]
+    if sheet_renames:
+        rows.append(
+            ("시트 이름 변경",
+             "다시 가져올 때 TC가 빠지지 않도록 아래 시트 이름 앞에 TC_ 를 붙였습니다: "
+             + ", ".join(f"{a} -> {b}" for a, b in sheet_renames)))
+    return rows
+
+
+def build_tc_workbook(tcs, session=None):
+    """TC 목록을 표준 포맷(개요 + TC 시트들) 엑셀로 만들어 BytesIO 로 돌려준다.
+
+    tcs: list_custom_tcs() 가 주는 dict 목록 (title/steps/expected/... 키를 쓴다)
+    원본 시트별로 시트를 나누고, 세션 안에서의 순서를 그대로 유지한다.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:  # pragma: no cover - 빌드 환경에는 항상 포함된다
+        raise TCExcelError("엑셀을 만드는 데 필요한 openpyxl이 설치되어 있지 않습니다")
+
+    tcs = list(tcs or [])
+
+    head_font = Font(bold=True)
+    head_fill = PatternFill("solid", fgColor="EEEEEE")
+    top_wrap = Alignment(vertical="top", wrap_text=True)
+    top_plain = Alignment(vertical="top")
+
+    # ---- 시트별로 묶기 (세션 안 순서 유지) ----
+    groups, order = {}, []
+    for tc in tcs:
+        key = str(tc.get("sheet") or "")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(tc)
+    if not order:                      # TC가 하나도 없어도 빈 표는 만들어준다
+        groups[""], order = [], [""]
+
+    used = {OVERVIEW_SHEET.lower()}
+    titles, renames = {}, []
+    for key in order:
+        title = safe_sheet_title(key or DEFAULT_TC_SHEET, used)
+        titles[key] = title
+        if key and title != key:
+            renames.append((key, title))
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # ---- 개요 ----
+    ov = wb.create_sheet(OVERVIEW_SHEET)
+    ov.append(["항목", "내용"])
+    for cell in ov[1]:
+        cell.font, cell.fill = head_font, head_fill
+    for item, value in _overview_rows(session, tcs, renames):
+        ov.append([item, value])
+    for row in ov.iter_rows(min_row=2):
+        row[0].font = head_font
+        row[0].alignment = top_plain
+        row[1].alignment = top_wrap
+    ov.column_dimensions["A"].width = 16
+    ov.column_dimensions["B"].width = 100
+    ov.freeze_panes = "A2"
+
+    # ---- TC 시트들 ----
+    widths = [8, 34, 24, 52, 44, 10, 14, 24]
+    for key in order:
+        ws = wb.create_sheet(titles[key])
+        ws.append(EXPORT_COLUMNS)
+        for cell in ws[1]:
+            cell.font, cell.fill = head_font, head_fill
+            cell.alignment = top_plain
+        for tc in groups[key]:
+            ws.append([
+                str(tc.get("tc_no") or ""),
+                str(tc.get("title") or ""),
+                str(tc.get("precondition") or ""),
+                str(tc.get("steps") or ""),
+                str(tc.get("expected") or ""),
+                str(tc.get("priority") or ""),
+                "",                                  # 결과(Pass/Fail) - 실행 후 채우는 칸
+                str(tc.get("note") or ""),
+            ])
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = top_wrap
+            # No 는 숫자로 해석돼 "1"이 "1.0"으로 돌아오는 일이 있어 글자로 고정한다
+            row[0].number_format = "@"
+            row[0].alignment = top_plain
+        for idx, width in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = width
+        ws.freeze_panes = "A2"
+
+    import io as _io
+    stream = _io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return stream

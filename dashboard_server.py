@@ -460,6 +460,39 @@ def create_app(db_path=None):
             return redirect(url_for("tcs", err=msg))
         return redirect(url_for("tcs", session=sid, msg=msg))
 
+    @app.route("/tcs/export/<path:session_id>")
+    def tcs_export(session_id):
+        """세션 하나의 TC를 표준 포맷 엑셀로 내려준다. 가져오기의 반대. [NEW v0.36.0]
+
+        tc_excel 이 읽는 것과 같은 포맷으로 쓰므로, 내려받아 고친 뒤 [TC 엑셀 올리기]로
+        그대로 다시 넣을 수 있다. 세션 단위인 이유는 화면에서 보고 있는 묶음이 세션이고,
+        여러 세션을 한 파일에 섞으면 다시 가져올 때 하나로 합쳐져 버리기 때문이다.
+
+        GET 이라 _reject_cross_site() 를 부르지 않는다 - 그건 POST 로 상태를 바꾸는
+        요청을 막는 장치이고, 여기는 읽기만 한다. 로그인은 before_request 가 본다."""
+        dbp = app.config["DB_PATH"]
+        session = results_store.get_tc_session(session_id, db_path=dbp)
+        if not session:
+            abort(404)
+        tc_list = results_store.list_custom_tcs(session_id=session_id, db_path=dbp)
+        if not tc_list:
+            return redirect(url_for("tcs", session=session_id,
+                                    err="이 세션에는 내보낼 TC가 없습니다"))
+        try:
+            stream = tc_excel.build_tc_workbook(tc_list, session=session)
+        except tc_excel.TCExcelError as e:
+            return redirect(url_for("tcs", session=session_id, err=str(e)))
+        except Exception as e:
+            return redirect(url_for("tcs", session=session_id,
+                                    err=f"엑셀을 만들지 못했습니다: {str(e)[:150]}"))
+        # download_name 의 한글은 flask(werkzeug)가 RFC 5987 로 인코딩해서 보낸다.
+        # 구글 시트에서 이름을 읽어올 때(v0.32.0) 우리가 파싱하는 그 헤더와 같은 규격이다.
+        return send_file(
+            stream, as_attachment=True,
+            download_name=tc_excel.export_filename(session.get("label")),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     @app.route("/tcs/toggle/<int:row_id>", methods=["POST"])
     def tcs_toggle(row_id):
         _reject_cross_site()
@@ -614,6 +647,13 @@ STYLE = """
   td.right, th.right { text-align: right; white-space: nowrap; }
   a.btnlike { font-size: 13px; color: #2d6cdf; text-decoration: none; padding: 2px 6px; }
   a.btnlike:hover { text-decoration: underline; }
+  /* [v0.36.0] 글자 링크(btnlike)가 아니라 눌러서 파일을 받는 버튼. 제목 아래 혼자 놓이면
+     글자 링크는 눈에 안 띄어서, 폼 버튼과 같은 모양으로 둔다. */
+  a.btnfile { font-size: 13px; padding: 7px 14px; border-radius: 6px; border: 1px solid #ccd0d6;
+              background: #fff; color: #2a3444; text-decoration: none; display: inline-block; }
+  a.btnfile:hover { border-color: #2d6cdf; color: #2d6cdf; text-decoration: none; }
+  /* [v0.36.0] 업로드 버튼 옆 경고. 눌러버린 뒤에는 되돌리기가 번거로우므로 누르기 전에 보이게 둔다. */
+  .warnred { color: #a3271c; font-weight: 700; font-size: 13px; }
   @media (max-width: 900px) { a.shot img { width: 150px; height: 110px; } }
   .off { opacity: 0.45; }
   .actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: nowrap; }
@@ -1019,9 +1059,11 @@ def _render_tc_import_forms():
         예전 세션의 TC는 지워지지 않고 그대로 남아 있지만 실행되지는 않습니다 —
         어느 시점의 TC로 돌렸는지 나중에 되짚어볼 수 있습니다.
       </div>
-      <div class="actions">
+      <div class="actions" style="flex-wrap:wrap">
         <input type="file" id="file" name="file" accept=".xlsx,.xlsm" required>
         <button type="submit" class="primary">엑셀에서 TC 가져오기</button>
+        <span class="warnred">대쉬보드 [내보내기] 버튼으로 추출한 엑셀 파일로 업로드 금지,
+        TC 불러오기 시 구글 시트로 불러올 것</span>
       </div>
     </form>
   </div>
@@ -1296,6 +1338,23 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None, ses
     else:
         session_state = ""
 
+    # [NEW v0.36.0] 이 세션의 TC를 표준 포맷 엑셀로 내려받기. 목록 바로 위에 둔다.
+    # 세션이 없거나(잘못된 주소) TC가 없으면 버튼을 아예 안 보여준다 - 눌러도 할 일이 없다.
+    if sid and tc_list:
+        export_note = ""
+        if current_sheet is not None:
+            # 지금 화면은 시트 하나만 걸러 보고 있지만 파일에는 세션 전체가 담긴다.
+            # 버튼 옆에 적어두지 않으면 "보이는 것만 받아졌겠거니" 하고 오해하게 된다.
+            export_note = (f'<span class="sub2small">받는 파일에는 이 세션의 TC '
+                           f'전체가 들어갑니다 (지금 화면은 시트 하나만 보는 중)</span>')
+        export_html = f"""
+  <div class="actions" style="margin:-4px 0 10px">
+    <a class="btnfile" href="{_u('/tcs/export/')}{sid}">TC 내보내기</a>
+    {export_note}
+  </div>"""
+    else:
+        export_html = ""
+
     body = f"""
   <p class="sub"><a href="{_u('/tcs')}">&#8592; TC 세션 목록</a></p>
   <h2>{_esc(session.get('label') or 'TC 관리')}{title_suffix}</h2>
@@ -1371,6 +1430,7 @@ def _render_tcs(tc_list, editing, msg, err, sheets=None, current_sheet=None, ses
   </div>
 
   <h2>추가된 TC{title_suffix} ({len(tc_list)}건 · 실행 대상 {enabled_count}건)</h2>
+  {export_html}
   <div class="sub">프로그램에서 <b>TC 소스 → "대시보드 추가 TC" → [TC 불러오기] → [시작]</b> 순서로 실행하세요.</div>
   {_render_sheet_filter(sheets, current_sheet, session.get('session_id',''))}
   <table>
