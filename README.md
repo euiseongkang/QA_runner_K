@@ -449,7 +449,7 @@ API Key 엔드포인트 제한을 사용한다면 `/api/models`, `/api/v1/knowle
 
 ### 최신 모델 기록을 이용한 단계별 배포
 
-Bitbucket Runner 전체 자동화는 `scripts/publish_distribution.sh` → `runner_model_pipeline.py`로 연결됩니다. 같은 Mac의 `finetuning`에 검토·승인한 JSONL을 내보내고 main에 푸시하면 최신 병합 모델에서 추가 학습 → 평가·병합 → GGUF 변환 → 지식·runtime.zip·training.zip Drive 업로드 → Mac Ollama 등록을 수행합니다. 성공한 모델은 `finetuning/.runner/model_registry.json`에 보존하여 다음 학습의 시작점으로 사용합니다. 같은 데이터는 중복 학습하지 않습니다. 경로·인증·활성화 변수와 운영 방법은 [DISTRIBUTION_GUIDE.md](DISTRIBUTION_GUIDE.md)를 참고하세요.
+일반 main 푸시는 QA 지식 동기화와 Drive KNOWLEDGE 게시만 수행합니다. 모델 학습을 원할 때 같은 Mac의 `finetuning`에 검토·승인한 JSONL을 내보내고 `model-v35-20261014-01` 형식의 태그를 별도로 푸시하세요. 태그 파이프라인에서만 `scripts/publish_distribution.sh --model` → `runner_model_pipeline.py`를 통해 추가 학습 → 평가·병합 → GGUF 변환 → Drive 업로드 → Mac Ollama 등록을 수행합니다. 성공한 모델은 `finetuning/.runner/model_registry.json`에 보존하여 다음 학습의 시작점으로 사용합니다. 같은 데이터는 중복 학습하지 않습니다. 허용 계정 UUID, 경로·인증·실행 방법은 [DISTRIBUTION_GUIDE.md](DISTRIBUTION_GUIDE.md)를 참고하세요.
 
 `finetuning/model_registry.json`에 최신 모델 이름과 병합 모델·어댑터·GGUF·Modelfile 경로를 기록합니다. 현재 초기 기록은 기존 `qa-tc-optimizer-v33`의 `fused_model_v33_r2`입니다. 프로그램 버전과 모델 이름은 별도입니다.
 

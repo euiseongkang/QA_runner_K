@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -61,7 +62,21 @@ def check_training_environment(python):
                     '"학습 가상환경에 mlx_lm이 없습니다. QA_TRAINING_PYTHON을 확인하세요.")'], check=True)
 
 
+def check_model_trigger():
+    tag = os.environ.get('BITBUCKET_TAG', '')
+    in_pipeline = bool(os.environ.get('BITBUCKET_BUILD_NUMBER') or os.environ.get('BITBUCKET_PIPELINE_UUID'))
+    if in_pipeline or tag:
+        if not re.fullmatch(r'model-v[0-9]+(?:\.[0-9]+){0,2}-[0-9]{8}-[0-9]{2}', tag):
+            raise ValueError('모델 학습은 model-v35-20261014-01 형식의 태그에서만 실행합니다.')
+        allowed = os.environ.get('QA_MODEL_BUILD_ALLOWED_ACTOR_UUID', '').strip().strip('{}')
+        actor = os.environ.get('BITBUCKET_STEP_TRIGGERER_UUID', '').strip().strip('{}')
+        if allowed and actor != allowed:
+            raise ValueError('허용된 계정이 실행한 모델 학습 요청이 아닙니다.')
+    return tag
+
+
 def pipeline(args):
+    tag = check_model_trigger()
     artifact_root = Path(args.artifact_root).expanduser().resolve()
     meta, _ = build_bundle(ROOT, args.commit)
     dataset = select_dataset(artifact_root)
@@ -81,7 +96,7 @@ def pipeline(args):
     needs_training = registry['latest'].get('dataset_sha256') != fingerprint
     version = meta['version'].split('.')
     name = 'qa-tc-optimizer-v' + (version[1] if len(version) >= 2 and version[0] == '0' else meta['version'])
-    print(json.dumps({'commit':meta['commit'], 'dataset':str(dataset), 'dataset_sha256':fingerprint,
+    print(json.dumps({'commit':meta['commit'], 'tag':tag, 'dataset':str(dataset), 'dataset_sha256':fingerprint,
                       'base_model':registry['latest']['fused_model'], 'new_training':needs_training,
                       'model_name':name if needs_training else registry['latest']['name'],
                       'steps':['train','evaluate_and_fuse','gguf','drive_upload','ollama_register']}, ensure_ascii=False, indent=2), flush=True)
@@ -137,12 +152,13 @@ def pipeline(args):
             # GGUF 구조 검사는 직전 gguf 단계에서 MLX 가상환경으로 완료했다.
             Path(plan['modelfile']).write_text(release.modelfile(plan))
             candidate = {'schema_version':1, 'distribution_commit':meta['commit'], 'export_sha256':fingerprint,
+                         'build_tag':tag,
                          'latest':{**plan,'dataset_sha256':fingerprint,'training_commit':meta['commit'],
                                    'verification':'MLX 평가·병합 파일·GGUF 검사 완료; 실제 TC 답변 품질은 별도 평가'},
                          'history':registry.get('history',[]) + [registry['latest']]}
             release.save(candidate_path,candidate)
         else:
-            candidate = {**registry,'distribution_commit':meta['commit'],'export_sha256':fingerprint}
+            candidate = {**registry,'distribution_commit':meta['commit'],'export_sha256':fingerprint,'build_tag':tag}
             release.save(candidate_path,candidate)
         run([args.distribution_python, ROOT/'distribution_package.py','--commit',meta['commit'],
              '--artifact-root',str(artifact_root),'--model-registry',str(candidate_path),

@@ -1,6 +1,6 @@
 # QA_runner_K 커밋별 지식 기반 Drive 배포
 
-목표: QA 프로그램에서 검토·승인 후 내보내기 → main 푸시 → Open WebUI QA 지식 갱신 → 최신 내보내기로 추가 학습·평가·병합·GGUF 변환 → 지식·모델을 Drive에 게시 → Runner Mac Ollama 등록. 지식 ID와 최신 내보내기 폴더는 스크립트가 찾는다. 웹 프로젝트는 처리하지 않는다.
+일반 main 푸시는 GitHub 미러 → Open WebUI QA 지식 갱신 → Drive KNOWLEDGE 게시만 실행한다. 모델 추가 학습은 검토·승인 및 내보내기 후 `model-v35-20261014-01` 형식의 태그를 별도로 푸시한 경우에만 실행한다. 웹 프로젝트는 처리하지 않는다.
 
 ## 게시 폴더
 
@@ -31,6 +31,7 @@ Bitbucket 저장소 변수:
 - `QA_TRAINING_PYTHON`: MLX-LM과 llama.cpp 변환 의존성이 설치된 Python 경로. 기본값은 `<QA_MODEL_ARTIFACT_ROOT>/finetuning/.venv/bin/python`이다.
 - `QA_LLAMA_CPP`: llama.cpp 경로. 기본값은 `$HOME/Projects/llama.cpp`이다.
 - `QA_TRAIN_ITERS`: 추가 학습 반복 횟수. 기본값은 시험 학습용 `20`이다. 학습 효과는 독립 TC로 비교하고 필요하면 조정한다.
+- `QA_MODEL_BUILD_ALLOWED_ACTOR_UUID`: 선택 설정. 허용할 Bitbucket 계정 UUID. 설정하면 모델 태그 실행자의 `BITBUCKET_STEP_TRIGGERER_UUID`와 일치할 때만 학습한다. 미설정이면 태그 형식만 검사하므로 다른 사용자도 해당 태그로 실행할 수 있다. 이 변수는 보안 값이 아니므로 Secured 체크 없이 등록한다.
 
 해당 경로에 레지스트리가 지정한 병합 모델·GGUF·Modelfile이 있어야 한다. Runner 사용자의 PATH에 Ollama가 있고 서버가 실행 중이어야 한다. Drive 권한은 KNOWLEDGE와 MODEL 모두에 필요하다.
 
@@ -38,15 +39,28 @@ Cloud IAM 역할과 Drive 폴더 권한은 별개다. 키를 만든 것만으로
 
 ## Pipeline 순서
 
-main 푸시 시 GitHub 미러 → QA 지식 기반 동기화·색인 확인 → 추가 학습·평가·병합·GGUF 생성 → 지식·runtime.zip·training.zip Drive 게시 → Runner Mac Ollama 등록 순으로 진행한다. 첫 실전 검증은 Bitbucket의 custom `publish-distribution` 파이프라인으로 수행한다. Drive 단계 활성화 전에는 기존 미러·RAG 동기화가 유지된다.
+main 푸시는 GitHub 미러 → QA 지식 기반 동기화·색인 확인 → KNOWLEDGE Drive 게시만 수행한다. custom `publish-distribution`도 지식 동기화·게시 전용이다. 둘 다 학습 데이터·MLX·모델 레지스트리·Ollama를 요구하지 않는다.
+
+`model-v*` 태그 파이프라인에서는 해당 커밋의 QA 지식 동기화를 확인한 뒤 추가 학습·평가·병합·GGUF 생성 → 지식·runtime.zip·training.zip Drive 게시 → Runner Mac Ollama 등록 순으로 진행한다. main 파이프라인과 태그 파이프라인 사이의 임시 artifact 공유에 의존하지 않는다.
+
+학습 요청 예시(먼저 변경 내용을 main에 커밋·푸시하고 학습 데이터를 내보낸 뒤 실행):
+
+```bash
+git tag -a model-v35-20261014-01 -m "v35 모델 추가 학습 요청"
+git push origin model-v35-20261014-01
+```
+
+태그 형식은 `model-v<버전>-<날짜8자리>-<순번2자리>`다. 일반 프로그램 버전 태그와 구분하고 요청마다 새로운 태그를 사용한다. 태그 자체는 사용자 권한 제한이 아니므로 본인만 학습하도록 운영하려면 허용 계정 UUID도 설정한다. 이전 커밋의 파이프라인을 재실행하면 이전 설정으로 실행되므로 이 분리 변경이 포함된 커밋부터 사용한다.
 
 게시 스크립트는 동일 커밋의 QA 동기화 완료 기록에서 지식 ID를 읽고 Open WebUI의 색인 완료 상태·원문을 확인한다. 다른 커밋의 기록이거나 원문 해시가 다르면 게시를 중단한다.
 
+지식 자료의 실행 장소는 현재 macOS 자체 호스팅 Runner다. 자료의 원본은 Bitbucket이 임시 작업 폴더에 체크아웃한 `$BITBUCKET_COMMIT`이며 `git show <커밋>:<파일>`로 읽는다. 개발용 `$HOME/Projects/QA_runner_K`의 커밋하지 않은 작업 파일은 지식에 포함하지 않는다. `QA_MODEL_ARTIFACT_ROOT`는 모델 산출물·학습 JSONL 경로에만 사용하고 QA 지식 원본을 지정하지 않는다.
+
 파일명은 `QA_runner_K_<커밋12자리>_v<앱버전>_KNOWLEDGE_QA_runner_K.zip`이다. ZIP에 추출 원문, manifest, 파일별 SHA-256, 설치 스크립트를 넣는다. API Key와 서비스 계정 JSON은 포함하지 않는다.
 
-main/custom 게시 스크립트는 `runner_model_pipeline.py`를 실행한다. 이 스크립트가 생성한 후보 레지스트리를 배포 스크립트에 전달하고 `--include-model --upload --register-local-model`을 지정한다. 모든 업로드의 크기·체크섬 검사가 성공한 뒤 후보 이름으로 `ollama create`와 `ollama show`를 실행한다. 동일 이름이 이미 있으면 해당 모델을 갱신한다. Open WebUI가 이 Mac의 Ollama에 연결되어 있어야 모델을 사용할 수 있다.
+게시 스크립트는 기본값으로 지식 전용 `distribution_package.py --upload`를 실행한다. 태그 단계만 `--model`을 명시하여 `runner_model_pipeline.py`를 실행한다. Runner 코드도 일반 브랜치·수동 파이프라인에서 태그 없이 직접 호출되는 학습을 차단한다. 생성한 후보 레지스트리를 배포 스크립트에 전달하고 `--include-model --upload --register-local-model`을 지정한다. 모든 업로드의 크기·체크섬 검사가 성공한 뒤 후보 이름으로 `ollama create`와 `ollama show`를 실행한다. 동일 이름이 이미 있으면 해당 모델을 갱신한다.
 
-Runner는 `<QA_MODEL_ARTIFACT_ROOT>/finetuning/qa_tc_dataset_*` 중 가장 최근 완료된 내보내기를 읽는다. JSONL은 Git에서 제외되어 있으므로 **내보내기와 Runner가 같은 Mac의 같은 프로젝트 경로를 사용해야 한다**. 다른 Mac에서 내보낸 데이터는 이 경로로 전달해야 한다. 새 내보내기만 만들고 푸시하지 않으면 자동 실행되지 않는다.
+모델 태그 실행에서만 Runner는 `<QA_MODEL_ARTIFACT_ROOT>/finetuning/qa_tc_dataset_*` 중 가장 최근 완료된 내보내기를 읽는다. JSONL은 Git에서 제외되어 있으므로 **내보내기와 Runner가 같은 Mac의 같은 프로젝트 경로를 사용해야 한다**. 다른 Mac에서 내보낸 데이터는 이 경로로 전달해야 한다. main에 소스를 푸시하거나 내보내기만 수행해도 학습은 실행되지 않는다. 사용한 태그와 데이터 해시는 실행 기록에 보존한다.
 
 초기 시작 모델은 해당 커밋의 `finetuning/model_registry.json`을 사용한다. 이후에는 지속 저장되는 `finetuning/.runner/model_registry.json`의 직전 성공한 병합 모델을 사용한다. v0.35.0 커밋의 새 후보 이름은 `qa-tc-optimizer-v35`이다. 같은 JSONL 내용은 다시 학습하지 않고 기존 성공 모델을 배포한다.
 
