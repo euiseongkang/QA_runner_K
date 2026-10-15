@@ -61,7 +61,7 @@ from ollama_client import available_models, recommendation, preferred_model
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.36.0"
+APP_VERSION = "0.37.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -1122,6 +1122,9 @@ class QAWorkerApp:
         self.running = False
         self.tc_data = []
         self.session_map = {}
+        # [NEW v0.37.0] 마지막으로 불러온 TC 의 출처. _render_tc_table 에서 채운다.
+        self._tc_source = ("", "")
+        self._tc_loaded_at = 0.0
 
         self.ec2_var = tk.StringVar(value=DEFAULT_EC2_API)
         self.key_var = tk.StringVar()
@@ -1645,6 +1648,10 @@ class QAWorkerApp:
         # 세션/시트/TC 선택 영역
         sel_frame = ttk.LabelFrame(content, text="TC 목록", padding=8)
         sel_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        # [NEW v0.37.0] 목록 맨 위. 대시보드의 [TC 내보내기] 와 같은 파일을 만든다.
+        ttk.Button(sel_frame, text="TC 내보내기",
+                   command=self.export_tc_excel).grid(row=0, column=0, sticky="w")
 
         self.priority_combo = ttk.Combobox(sel_frame, textvariable=self.priority_var,
                      values=["전체", "P1", "P2", "P3", "P4", "P1+P2", "P1+P2+P3"],
@@ -2310,6 +2317,11 @@ class QAWorkerApp:
             self.log_msg(f"⚠ 세션 '{label}'에 '실행 포함' 상태인 TC가 없습니다")
 
     def _render_tc_table(self, source, source_ref):
+        # [NEW v0.37.0] 지금 화면에 올라온 TC 가 어디서 왔는지 기억해 둔다.
+        # [TC 내보내기] 의 파일 이름과 개요 시트에 쓴다. 세 소스(로컬 엑셀/대시보드/서버)가
+        # 모두 이 함수를 거치므로 여기 한 곳에만 두면 된다.
+        self._tc_source = (source, source_ref)
+        self._tc_loaded_at = time.time()
         try:
             latest = results_store.latest_tc_details(source, source_ref)
         except Exception as e:
@@ -2349,6 +2361,95 @@ class QAWorkerApp:
             else:
                 self.tc_listbox.selection_remove(item)
                 self.tc_listbox.detach(item)
+
+    # ---- TC 내보내기 ----                                        [NEW v0.37.0]
+    # 대시보드의 [TC 내보내기] 와 **같은 함수**(tc_excel.build_tc_workbook)를 쓴다.
+    # 여기서 따로 엑셀을 만들면 "프로그램에서 받은 파일과 대시보드에서 받은 파일이
+    # 다르다"는 상황이 생기므로, 포맷을 아는 곳은 끝까지 tc_excel 한 곳으로 둔다.
+
+    @staticmethod
+    def _tc_for_export(tc):
+        """화면용 TC dict 를 tc_excel 이 쓰는 표준 키로 바꾼다.
+
+        화면에 보여주려고 채워 넣은 기본값은 빼고 원래 값을 쓴다.
+        - 우선순위 '미지정' -> 빈 칸. 엑셀의 우선순위는 P1~P4 아니면 비워두는 칸이다.
+        - 시트 '대시보드'/'서버' -> 저장된 시트값(_stored_sheet). 그쪽이 진짜 값이다.
+        """
+        priority = tc.get("_stored_priority", tc.get("priority", "")) or ""
+        if priority == "미지정":
+            priority = ""
+        sheet = tc.get("_stored_sheet", tc.get("sheet_name", "")) or ""
+        return {
+            "tc_no": tc.get("tc_id", ""),
+            "title": tc.get("title", ""),
+            "precondition": tc.get("precondition", ""),
+            "steps": tc.get("steps", ""),
+            "expected": tc.get("expected", ""),
+            "priority": priority,
+            "note": tc.get("note", ""),
+            "sheet": sheet,
+        }
+
+    def _tc_export_session(self):
+        """내보낼 파일의 이름과 개요 시트에 넣을 정보. (label, session dict)"""
+        source, source_ref = getattr(self, "_tc_source", ("", ""))
+        ref = str(source_ref or "")
+        if source == "local":
+            # os.path.basename 은 돌고 있는 OS 의 구분자만 본다. 윈도우에서 만든 경로를
+            # 다른 OS 에서 읽으면 경로 전체가 이름이 되므로 양쪽 구분자를 모두 자른다.
+            base = ref.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            label = tc_excel.strip_excel_ext(base) or "로컬 엑셀"
+            origin = ref or "로컬 엑셀"
+        elif source == "custom":
+            label = ref or "대시보드 추가 TC"
+            origin = "대시보드 추가 TC"
+        elif source == "ec2":
+            label = ref or "서버 세션"
+            origin = f"서버 세션: {ref}" if ref else "서버 세션"
+        else:
+            label = "TC"
+            origin = "프로그램"
+        return label, {
+            "label": label,
+            "source": origin,
+            "session_id": "",          # 프로그램에는 세션 id 가 없다. 개요에 - 로 나온다.
+            "created_at": getattr(self, "_tc_loaded_at", 0) or time.time(),
+        }
+
+    def export_tc_excel(self):
+        """지금 불러온 TC 목록을 표준 포맷 엑셀로 저장한다.
+
+        화면의 필터(우선순위·실행결과)나 선택과 무관하게 **불러온 TC 전체**가 들어간다.
+        대시보드가 세션 전체를 내보내는 것과 맞춘 것이고, 거르고 싶으면 거르기 전에
+        받으시라고 로그에 적어 둔다 - 파일에 뭐가 빠졌는지는 열어보기 전엔 안 보인다.
+        """
+        if not self.tc_data:
+            messagebox.showinfo("TC 내보내기",
+                                "내보낼 TC가 없습니다. 먼저 [TC 불러오기]를 눌러주세요.")
+            return
+
+        label, session = self._tc_export_session()
+        path = filedialog.asksaveasfilename(
+            title="TC 내보내기",
+            defaultextension=".xlsx",
+            initialfile=tc_excel.export_filename(label),
+            filetypes=[("Excel 파일", "*.xlsx")],
+        )
+        if not path:
+            return
+
+        try:
+            rows = [self._tc_for_export(tc) for tc in self.tc_data]
+            stream = tc_excel.build_tc_workbook(rows, session=session)
+            with open(path, "wb") as f:
+                f.write(stream.getvalue())
+        except Exception as e:
+            self.log_msg(f"⚠ TC 내보내기 실패: {str(e)[:150]}")
+            messagebox.showerror("TC 내보내기 실패", str(e)[:300])
+            return
+
+        self.log_msg(f"TC {len(rows)}건을 내보냈습니다 → {path}")
+        self.log_msg("  ※ 화면 필터·선택과 무관하게 불러온 TC 전체가 들어갑니다")
 
     def _publish_tc_result(self, tc, result, reason):
         """각 TC 판정 직후 UI를 갱신한다. 저장·서버 전송 완료를 기다리지 않는다."""
