@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import tc_excel
+from verifications import search_no_enter_verification
 
 DETAIL_SCHEMA = {
     'type': 'object', 'additionalProperties': False,
@@ -19,6 +20,31 @@ DETAIL_SCHEMA['properties'].update(
     review_reason={'type': 'string', 'minLength': 1, 'maxLength': 1000})
 # 구조화 출력에서 검토 판단·이유를 생략하지 못하도록 요구한다.
 REVIEW_SCHEMA = dict(DETAIL_SCHEMA, required=DETAIL_SCHEMA['required'] + ['change_required', 'review_reason'])
+
+
+def optimization_timeout(provider):
+    """로컬 모델의 TC 최적화 응답 대기 시간. 토큰 한도와는 별개다."""
+    if provider not in ('Open WebUI (RAG)', 'Ollama'):
+        return 60
+    value = os.environ.get('QA_TC_OPTIMIZATION_TIMEOUT_SECONDS', '600')
+    try:
+        seconds = int(value)
+        if seconds < 180:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError('QA_TC_OPTIMIZATION_TIMEOUT_SECONDS는 180 이상의 정수(초)로 설정하세요.') from None
+    return seconds
+
+
+def optimization_total_timeout():
+    value = os.environ.get('QA_TC_OPTIMIZATION_TOTAL_TIMEOUT_SECONDS', '1800')
+    try:
+        seconds = int(value)
+        if seconds <= 0:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError('QA_TC_OPTIMIZATION_TOTAL_TIMEOUT_SECONDS는 양의 정수(초)로 설정하세요.') from None
+    return seconds
 
 
 def quality_failure_message(problems):
@@ -98,6 +124,8 @@ def numbered_lines(text):
 def phone_search_draft(tc):
     """원문에 Enter 검색 방식이 명시된 복수 전화번호 검색만 보완한다."""
     import re
+    if search_no_enter_verification.applies(tc):
+        return None
     if not re.search(r'휴대전화|휴대폰|전화번호', str(tc.get('title') or '')):
         return None
     lines = numbered_lines(tc.get('steps'))
@@ -268,6 +296,19 @@ precondition에 '환자 관리 목록 화면 진입 상태'만 반환하면 불�
 def validate_detail_quality(tc, proposal, original_actions=(), proposed_actions=()):
     import re
     errors = []
+    if search_no_enter_verification.applies(tc):
+        candidate = dict(tc, **proposal)
+        if not search_no_enter_verification.applies(dict(candidate, title='')):
+            errors.append('Enter 미입력 조건이 누락됨. Enter 없이 관찰하는 목적을 유지할 것')
+        for line in str(proposal.get('steps') or '').splitlines():
+            if (re.search(r'Enter|엔터', line, re.I)
+                    and re.search(r'누른다|누릅니다|누르세요|눌러|Enter\s*입력', line, re.I)):
+                errors.append('Enter 미입력 검증에 Enter 실행이 추가됨. 키를 누르지 않고 관찰할 것')
+                break
+        original_observation = search_no_enter_verification.action(tc)
+        proposed_observation = search_no_enter_verification.action(candidate)
+        if original_observation['seconds'] != proposed_observation['seconds']:
+            errors.append('Enter 미입력 관찰 시간이 변경됨. 원문에 명시된 관찰 시간을 보존할 것')
     def content(value):
         return re.sub(r'\s+', '', '\n'.join(re.sub(r'^\s*\d+[.)]\s*', '', line)
                                             for line in str(value).splitlines()))
@@ -312,7 +353,7 @@ def validate_detail_quality(tc, proposal, original_actions=(), proposed_actions=
                 break
             offset = index + len(values[0])
     # 실행 가능한 입력·Enter·지우기 동작이 문장 정리 과정에서 사라지는 것을 막는다.
-    required = [a['type'] for a in original_actions if a['type'] in ('fill', 'press', 'clear_search')]
+    required = [a['type'] for a in original_actions if a['type'] in ('fill', 'press', 'clear_search', 'empty_search')]
     actual = iter(a['type'] for a in proposed_actions)
     if any(not any(kind == wanted for kind in actual) for wanted in required):
         errors.append('입력/Enter/지우기 실행 동작이 누락됨. 실행 문법과 동작 순서를 유지할 것')
@@ -453,6 +494,7 @@ def detail_optimization_prompt(tc, reason, include_rules=True):
 - 규칙 실행을 위해 클릭 표현도 유지한다. 예: '[체크박스]를 클릭하여 해제한다'. 사전조건은 자동 실행되지 않으므로 준비 동작이 필요하면 절차에도 넣는다.
 - '목록 건수 변화 확인'만으로 모든 데이터 포함을 증명하지 않는다. 원래 목적을 확인할 관찰 동작을 작성한다.
 - 임의의 고정 대기 시간이나 중복 클릭을 추가하지 않는다. 조회/갱신 완료 후 확인하도록 작성한다.
+- Enter 없이 검색을 검증하는 TC는 Enter를 추가하거나 조회를 실행하지 않는다. 원문의 관찰 시간과 검색어를 보존한다. 실제 검색어가 없으면 임의로 만들지 말고 확인 필요로 안내한다.
 
 예상 결과(expected):
 - 테스트 절차를 복사하거나 입력·클릭·Enter 명령을 작성하지 않는다. 검색 TC는 조회 완료 후 결과 목록의 상태를 작성하며, 원문의 "입력어가 포함된 결과만 조회" 같은 전체 결과 제한 조건을 보존한다.

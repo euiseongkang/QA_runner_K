@@ -7,6 +7,28 @@ from tkinter import ttk, messagebox
 from tk_clipboard import install_clipboard_support
 from tk_scrollable import ScrollableFrame
 from tc_optimization import parse_detail_proposal, details_unchanged
+from ai_stream import OptimizationProgress
+
+
+def format_tc_for_copy(tc, unsaved=False):
+    """대화에 붙여넣을 수 있도록 현재 TC의 값과 실행 기록만 선별한다."""
+    lines = ['[QA 테스트케이스 검토 요청]',
+             '아래 TC에서 문구 개선이 필요한 부분과 프로그램 실행·판정 로직의 문제를 구분해 분석해주세요.', '',
+             '[TC 정보]']
+    for key, label in (('tc_id', 'TC 번호'), ('title', 'TC 제목'),
+                       ('priority', '우선순위'), ('sheet_name', '시트')):
+        lines.append(f'{label}: {str(tc.get(key) or "").strip() or "없음"}')
+    lines.append('편집 상태: ' + ('미저장 변경사항 포함' if unsaved else '변경사항 없음'))
+    if unsaved:
+        lines.append('최근 실행결과·사유는 현재 수정 내용으로 재실행한 결과가 아닐 수 있습니다.')
+    for key, label in (('precondition', '사전조건'), ('steps', '테스트 절차'),
+                       ('expected', '예상 결과'), ('note', '비고'),
+                       ('last_result', '최근 실행결과'), ('last_reason', '최근 실행 사유'),
+                       ('optimization_error', '최근 최적화 오류'),
+                       ('optimization_diagnostics', '최근 최적화 수신 상태'),
+                       ('optimization_partial', '중간 응답 일부 — 최종 결과 아님')):
+        lines.extend(['', f'[{label}]', str(tc.get(key) or '').strip() or '없음'])
+    return '\n'.join(lines)
 
 
 class TCDetailDialog:
@@ -66,6 +88,10 @@ class TCDetailDialog:
         self.optimize_button = ttk.Button(buttons, text='최적화', command=self.optimize,
                                           state='normal' if optimize else 'disabled')
         self.optimize_button.pack(side='left')
+        self.copy_button = ttk.Button(buttons, text='복사', command=self.copy)
+        self.copy_button.pack(side='left', padx=(6, 0))
+        self.copy_status = ttk.Label(buttons, text='')
+        self.copy_status.pack(side='left', padx=6)
         self.close_button = ttk.Button(buttons, text='닫기', command=self.window.destroy)
         self.close_button.pack(side='right')
         self.save_button = ttk.Button(buttons, text='저장', command=self.save, state='disabled')
@@ -98,6 +124,30 @@ class TCDetailDialog:
         changed = self.values() != self.original
         self.save_button.configure(state='normal' if changed and self.save_callback and not self.saving and not self.optimizing else 'disabled')
 
+    def copy(self):
+        if self.saving or self.optimizing:
+            return
+        values = self.values()
+        for key in ('tc_id', 'note', 'last_result', 'last_reason'):
+            widget = self.fields[key]
+            values[key] = (widget.get('1.0', 'end-1c') if isinstance(widget, tk.Text) else widget.get()).strip()
+        values['optimization_error'] = getattr(self.optimization_dialog, 'last_error', '')
+        progress = getattr(self.optimization_dialog, 'stream_progress', None)
+        if isinstance(progress, OptimizationProgress):
+            state = progress.snapshot()
+            values['optimization_partial'] = state.pop('preview', '')
+            values['optimization_diagnostics'] = json.dumps(state,ensure_ascii=False,indent=2)
+        text = format_tc_for_copy(values, unsaved=self.values() != self.original)
+        try:
+            # 상세 창을 닫아도 실행 중인 메인 창이 클립보드 소유권을 유지한다.
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            self.copy_status.configure(text='복사 실패')
+            messagebox.showerror('TC 복사', '클립보드에 복사하지 못했습니다. 다시 시도하세요.', parent=self.window)
+            return
+        self.copy_status.configure(text='복사 완료')
+
     def optimize(self):
         if self.saving or self.optimizing or not self.optimize_callback:
             return
@@ -113,6 +163,7 @@ class TCDetailDialog:
         self.optimizing = True
         self._refresh_save()
         self.optimize_button.configure(state='disabled')
+        self.copy_button.configure(state='disabled')
         self.close_button.configure(state='disabled')
         self.window.configure(cursor='watch')
         for key in self.EDITABLE:
@@ -134,6 +185,7 @@ class TCDetailDialog:
             else:
                 self.status.configure(text='최적화를 취소했습니다. 입력 내용은 유지됩니다.')
             self.optimize_button.configure(state='normal')
+            self.copy_button.configure(state='normal')
             self.close_button.configure(state='normal')
             self._refresh_save()
             self.window.grab_set()
@@ -151,6 +203,7 @@ class TCDetailDialog:
         self._refresh_save()
         self.close_button.configure(state='disabled')
         self.optimize_button.configure(state='disabled')
+        self.copy_button.configure(state='disabled')
         self.status.configure(text='저장 중...')
         for key in self.EDITABLE:
             self.fields[key].configure(state='disabled')
@@ -160,6 +213,7 @@ class TCDetailDialog:
                 self.fields[key].configure(state='readonly' if key in ('priority', 'sheet_name') else 'normal')
             self.close_button.configure(state='normal')
             self.optimize_button.configure(state='normal' if self.optimize_callback else 'disabled')
+            self.copy_button.configure(state='normal')
             if error:
                 self.status.configure(text='저장 요청을 완료하지 못했습니다.')
                 messagebox.showerror('TC 저장', error, parent=self.window)
@@ -188,6 +242,12 @@ class TCOptimizationDialog:
     def __init__(self, parent, before, work, finished):
         self.parent, self.finished = parent, finished
         self.before, self.proposal = before, None
+        self.last_error = ''
+        self.stream_progress = getattr(work, 'progress', None)
+        if not isinstance(self.stream_progress, OptimizationProgress):
+            self.stream_progress = None
+        self.stream_poll = None
+        self.stream_finished = False
         self.closed = False
         self.window = tk.Toplevel(parent)
         self.window.title('AI TC 최적화')
@@ -200,6 +260,10 @@ class TCOptimizationDialog:
         self.status = ttk.Label(self.window, text='현재 AI최적화 진행 중 입니다...', padding=12,
                                 wraplength=740)
         self.status.grid(row=0, column=0, sticky='ew')
+        response_timeout = getattr(work, 'response_timeout', None)
+        if isinstance(response_timeout, (int, float)):
+            self.status.configure(text='현재 AI최적화 진행 중 입니다...\n'
+                                  f'응답 대기: 요청당 {response_timeout}초 · 품질 보완 요청 시 추가 대기합니다.')
         self.status.bind('<Configure>', lambda event: self.status.configure(wraplength=max(1, event.width - 24)))
         self.progress = ttk.Progressbar(self.window, mode='indeterminate')
         self.progress.grid(row=1, column=0, sticky='ew', padx=12, pady=6)
@@ -207,6 +271,14 @@ class TCOptimizationDialog:
         area = ScrollableFrame(self.window)
         area.grid(row=2, column=0, sticky='nsew')
         self.content = area.content
+        if self.stream_progress is not None:
+            stream_frame = ttk.LabelFrame(self.content, text='수신 중 응답 · 진단용 (최종 결과 아님)', padding=8)
+            stream_frame.pack(fill='x',padx=12,pady=6)
+            self.stream_status = ttk.Label(stream_frame,text='모델 응답을 기다리는 중입니다.',wraplength=700)
+            self.stream_status.pack(fill='x')
+            self.stream_text = tk.Text(stream_frame,height=10,width=65,wrap='word',state='disabled')
+            self.stream_text.pack(fill='x')
+            ttk.Button(stream_frame,text='중간 응답·진단 복사',command=self.copy_stream).pack(anchor='w',pady=4)
         self.buttons = ttk.Frame(self.window, padding=12)
         # 창이 작아지면 스크롤 영역만 줄이고 적용·취소 버튼 행은 확보한다.
         self.buttons.grid(row=3, column=0, sticky='ew')
@@ -221,11 +293,14 @@ class TCOptimizationDialog:
         def complete(proposal=None, error=None):
             if self.closed:
                 return
+            self.stream_finished = True
+            self._show_stream_progress()
             self.progress.stop()
             self.progress.grid_remove()
             self.window.configure(cursor='')
             self.parent.configure(cursor='')
             if error:
+                self.last_error = str(error)
                 self.status.configure(text='⚠ 품질 검증 · 최적화 결과를 적용할 수 없습니다. 입력 내용은 유지됩니다.')
                 messagebox.showerror('TC 최적화', error, parent=self.window)
                 return
@@ -273,7 +348,44 @@ class TCOptimizationDialog:
                 parent.after(0, callback)
             except (RuntimeError, tk.TclError):
                 pass
+        self._poll_stream_progress()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_stream_progress(self):
+        if self.stream_progress is None or self.closed:
+            return
+        state = self.stream_progress.snapshot()
+        sources = ('RAG 미사용' if state.get('provider') == 'Ollama' else f"검색 근거 {state['sources']}개")
+        self.stream_status.configure(text=f"{state['phase']} · 경과 {state['elapsed']}초 / 전체 제한 {state['total_timeout']}초\n"
+                                     f"요청 {state['request']}회 · 응답 {state['chars']}자 · 추론 {state['reasoning_chars']}자 · "
+                                     f"{sources} · 종료 신호: {state['finish_reason'] or '아직 없음'}")
+        text = state['preview']
+        if self.stream_text.get('1.0','end-1c') != text:
+            self.stream_text.configure(state='normal')
+            self.stream_text.delete('1.0','end')
+            self.stream_text.insert('1.0',text)
+            self.stream_text.configure(state='disabled')
+            self.stream_text.see('end')
+
+    def _poll_stream_progress(self):
+        if self.closed or self.stream_progress is None:
+            return
+        self._show_stream_progress()
+        if not self.stream_finished:
+            self.stream_poll = self.window.after(250,self._poll_stream_progress)
+
+    def copy_stream(self):
+        if self.stream_progress is None:
+            return
+        state = self.stream_progress.snapshot()
+        preview = state.pop('preview','')
+        text = ('[최적화 스트림 진단]\n' + json.dumps(state,ensure_ascii=False,indent=2) +
+                '\n\n[중간 응답 — 최종 결과 아님]\n' + (preview or '없음'))
+        try:
+            self.parent.clipboard_clear()
+            self.parent.clipboard_append(text)
+        except tk.TclError:
+            messagebox.showerror('진단 복사','클립보드에 복사하지 못했습니다.',parent=self.window)
 
     def apply(self):
         if not self.closed and self.proposal is not None:
@@ -285,6 +397,10 @@ class TCOptimizationDialog:
 
     def _close(self, proposal):
         self.closed = True
+        if self.stream_poll is not None:
+            self.window.after_cancel(self.stream_poll)
+        if self.stream_progress is not None and not self.stream_finished:
+            self.stream_progress.cancelled.set()
         self.progress.stop()
         self.window.destroy()
         self.finished(proposal)
