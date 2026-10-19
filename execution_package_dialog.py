@@ -18,7 +18,7 @@ class ExecutionPackageDialog:
         self.records, self.images = {}, []
         header = ttk.Frame(self.window, padding=8)
         header.pack(fill='x')
-        ttk.Label(header, text='새 실행은 기본 승인됩니다. 특이 사례는 선택 후 미승인으로 변경하세요.').pack(anchor='w')
+        ttk.Label(header, text='최초 원문 → TC별 최신 PASS를 내보냅니다. 제외할 최신 PASS는 미승인으로 변경하세요.').pack(anchor='w')
         ttk.Label(header, text=f'저장 위치: {root}', wraplength=1000).pack(anchor='w')
         controls = ttk.Frame(self.window, padding=8)
         controls.pack(fill='x')
@@ -38,7 +38,7 @@ class ExecutionPackageDialog:
         export_controls.pack(fill='x')
         self.export_button = ttk.Button(export_controls, text='학습 데이터 내보내기', command=self.export_training)
         self.export_button.pack(side='left')
-        ttk.Label(export_controls, text='전체 승인 패키지 → finetuning/JSONL · 현재 필터/선택과 무관 · 편집 내용은 먼저 저장하세요.').pack(side='left', padx=8)
+        ttk.Label(export_controls, text='TC별 최신 PASS → finetuning/JSONL · 필터/선택과 무관 · 정답은 실제 실행 문구입니다.').pack(side='left', padx=8)
         from finetuning_setup import show_model_guidance
         ttk.Button(export_controls, text='권장 학습 모델 / 설치 안내',
                    command=lambda: show_model_guidance(self.window)).pack(side='left')
@@ -66,7 +66,7 @@ class ExecutionPackageDialog:
         self.original = ScrolledText(tabs, height=12, wrap='word')
         tabs.add(self.original, text='실행 당시 TC 원문')
         editor = ttk.Frame(tabs, padding=6)
-        tabs.add(editor, text='학습 정답 편집')
+        tabs.add(editor, text='검토 메모용 정답 편집')
         self.fields = {}
         for key, title in (('precondition', '사전조건'), ('steps', '테스트 절차'), ('expected', '예상 결과')):
             ttk.Label(editor, text=title).pack(anchor='w')
@@ -109,9 +109,10 @@ class ExecutionPackageDialog:
             messagebox.showerror('학습 데이터 내보내기', str(error), parent=self.window)
         else:
             counts = report['splits']
-            text = (f"승인 자료 {report['exported']}건 저장\n"
+            text = (f"최신 PASS 학습 쌍 {report['exported']}건 저장\n"
                     f"train {counts['train']} · valid {counts['valid']} · test {counts['test']}\n"
-                    f"중복 제외 {report['duplicates']} · 미승인 제외 {report['unapproved']}\n"
+                    f"이전 실행 제외 {report['duplicates']} · 최신 PASS 미승인 {report['unapproved']}\n"
+                    f"PASS 없는 TC {report['no_pass']} · 기존 실행 원문 사용 {report['legacy_originals']}\n"
                     f"정답 형식 오류 {len(report['invalid'])} · 읽기 실패 {len(report['read_errors'])}\n\n{path}\n\n"
                     + '\n'.join(report['notes']))
             self.status.configure(text=f'학습 데이터 저장 완료: {path}')
@@ -219,4 +220,4 @@ class ExecutionPackageDialog:
             messagebox.showerror('학습 정답 저장', str(error), parent=self.window)
             return
         self.refresh()
-        self.status.configure(text='학습 정답·검토 사유·승인 상태를 저장했습니다. 실행 당시 TC와 판정은 유지됩니다.')
+        self.status.configure(text='검토 문구·사유·승인 상태를 저장했습니다. 내보내기 정답은 최신 PASS 실행 당시 문구입니다.')

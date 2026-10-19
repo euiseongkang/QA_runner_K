@@ -10,10 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-TC_KEYS = ('tc_id', 'tc_no', 'title', 'priority', 'sheet', 'sheet_name',
+import training_history
+
+TC_KEYS = ('id', 'tc_id', 'tc_no', 'title', 'priority', 'sheet', 'sheet_name',
            'precondition', 'steps', 'expected', 'note')
 ACTION_KEYS = ('type', 'description', 'selector', 'text', 'value', 'key',
-               'checked', 'ms', 'label', 'source', 'target', 'patient_row', 'page_number', 'wait', 'from', 'to')
+               'checked', 'ms', 'label', 'source', 'target', 'patient_row', 'page_number', 'wait', 'from', 'to', 'plan')
 
 
 def now():
@@ -89,6 +91,7 @@ def write(root, *, tc, result, reason, run_id, source, source_ref, context=None,
                     'result': result, 'reason': reason, 'errors': errors,
                     'screenshots': shots,
                     'precondition_execution': 'TC 사전조건 원문을 보관하며 자동 충족 여부는 별도로 확인해야 함'}
+        manifest['training_identity'] = training_history.identity(tc, source, source_ref)
         review = {'status': 'approved', 'approved_for_training': True,
                   'review_reason': '실행 당시 TC를 기본 승인했습니다.',
                   'corrected_tc': {**{key: str(snapshot.get(key) or '') for key in ('precondition', 'steps', 'expected')},

@@ -34,7 +34,10 @@ def build_bundle(root, commit):
                    ('/' not in p and (p in ('TC_EXECUTION_RULES.md', 'tc_optimization.py', 'checkbox_controls.py')
                                       or p.endswith('_verification.py')))
                    or (p.startswith('verifications/') and p.count('/') == 1
-                       and (p.endswith('_verification.py') or p == 'verifications/__init__.py')))
+                       and (p.endswith('_verification.py') or p in (
+                           'verifications/__init__.py', 'verifications/collection_plans.py',
+                           'verifications/column_rules.py', 'verifications/table_collection.py',
+                           'verifications/table_pagination.py'))))
     if 'TC_EXECUTION_RULES.md' not in paths or 'tc_optimization.py' not in paths:
         raise ValueError('필수 QA 규칙·최적화 소스가 없습니다.')
     sections, manifest = [], []
@@ -44,7 +47,7 @@ def build_bundle(root, commit):
         sections.append(f'## {path}\n\n' + (content if path.endswith('.md') else '```python\n' + content + '\n```'))
     # GUI·로그인 설정 전체 대신 TC 해석·실행·최적화 함수만 전달한다.
     selected = []
-    functions = {'build_rule_actions', 'judge_by_text', 'infer_tc_type'}
+    functions = {'build_rule_actions', 'judge_by_text', 'infer_tc_type', 'infer_verify_type'}
     for node in ast.parse(gui).body:
         if isinstance(node, ast.FunctionDef) and node.name in functions:
             selected.append(ast.get_source_segment(gui, node))
