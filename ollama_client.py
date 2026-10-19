@@ -4,6 +4,7 @@ import json
 from urllib.parse import urlsplit
 
 import requests
+from ai_stream import RepetitionGuard, response_packets
 
 # 공식 라이브러리의 설치 가능한 태그. 전체 라이브러리가 아닌 TC용 권장 목록이다.
 RECOMMENDED = {
@@ -131,7 +132,64 @@ class OllamaClient:
         if not success:
             raise ValueError('모델 설치가 완료되지 않았습니다. 인터넷 연결과 디스크 공간을 확인하세요')
 
-    def chat(self, model, content, max_tokens, timeout=None):
+    def _stream_chat(self, payload, timeout, progress):
+        payload['stream'] = True
+        progress.check()
+        progress.update(phase='Ollama 모델 로딩·응답 대기', finish_reason='', provider='Ollama',
+                        request=progress.snapshot()['request'] + 1)
+        parts, finish, completed = [], None, False
+        repetition = RepetitionGuard()
+
+        def consume(data):
+            nonlocal finish, completed
+            if not isinstance(data, dict) or data.get('error'):
+                raise ValueError('Ollama 스트림 응답에 오류가 있습니다. 서버 로그를 확인하세요')
+            message = data.get('message') or {}
+            if not isinstance(message, dict):
+                raise ValueError('Ollama 스트림 메시지 형식이 올바르지 않습니다')
+            text, thinking = message.get('content') or '', message.get('thinking') or ''
+            if not isinstance(text, str) or not isinstance(thinking, str):
+                raise ValueError('Ollama 스트림 본문 형식이 올바르지 않습니다')
+            parts.append(text)
+            progress.append(text, thinking)
+            if repetition.check(text):
+                progress.update(phase='동일 문구 연속 반복 감지 · 수신 중단')
+                raise ValueError('AI가 동일 문구를 연속 반복하여 Ollama 응답 수신을 중단했습니다. '
+                                 '중간 응답은 적용하지 않으며 입력 내용은 유지됩니다. '
+                                 '서버에서 생성이 계속되는지는 Ollama 로그를 확인하세요')
+            progress.update(phase='모델 응답 수신 중' if text else 'Ollama 추론·응답 대기')
+            if data.get('done') is True:
+                completed = True
+                finish = data.get('done_reason')
+                progress.update(phase='모델 종료 신호 수신', finish_reason=finish or 'done')
+
+        packets = response_packets(self.session, self.url + '/api/chat', payload, timeout, progress,
+                                   provider='Ollama')
+        try:
+            for kind, value in packets:
+                if kind == 'headers':
+                    if not value.ok or 300 <= value.status_code < 400:
+                        raise ValueError(f'Ollama API 오류 (HTTP {value.status_code})')
+                    progress.update(phase='Ollama 연결됨 · 모델 응답 대기')
+                elif kind == 'json':
+                    consume(value)
+                elif kind == 'line' and value.strip():
+                    try:
+                        data = json.loads(value)
+                    except ValueError:
+                        raise ValueError('Ollama 스트림 JSON 형식이 잘못되었습니다. 입력 내용은 유지됩니다') from None
+                    consume(data)
+                if completed:
+                    break
+        finally:
+            packets.close()
+        if not completed:
+            raise ValueError('Ollama 스트림이 종료 신호 없이 끊겼습니다. 중간 응답은 적용하지 않습니다')
+        if finish not in (None, 'stop', 'length'):
+            raise ValueError('Ollama가 TC 답변 대신 다른 종료 상태를 반환했습니다: ' + str(finish))
+        return {'done': True, 'done_reason': finish, 'message': {'content': ''.join(parts)}}
+
+    def chat(self, model, content, max_tokens=None, timeout=None):
         if not model.strip():
             raise ValueError('Ollama 모델을 선택하세요. 먼저 Ollama에서 모델을 설치해야 합니다')
         message = {'role': 'user', 'content': ''}
@@ -160,14 +218,20 @@ class OllamaClient:
         if getattr(self, 'system_prompt', None):
             messages.insert(0, {'role': 'system', 'content': self.system_prompt})
         payload = {'model': model, 'messages': messages, 'stream': False, 'keep_alive': 0,
-                   'options': {'num_predict': max_tokens}}
+                   'options': {}}
+        if max_tokens is not None:
+            payload['options']['num_predict'] = max_tokens
         if getattr(self, 'context_size', None) is not None:
             payload['options']['num_ctx'] = self.context_size
         schema = getattr(self, 'response_schema', None)
         if schema is not None and not model.endswith(':cloud'):
             payload['format'] = schema
             payload['options']['temperature'] = 0
-        data = self._request('POST', '/api/chat', timeout=timeout or 120, json=payload)
+        progress = getattr(self, 'progress', None)
+        def request_chat():
+            return (self._stream_chat(payload, timeout or 120, progress) if progress is not None else
+                    self._request('POST', '/api/chat', timeout=timeout or 120, json=payload))
+        data = request_chat()
         if schema is not None and data.get('done_reason') == 'length':
             # 한도 직전에 완전한 JSON이 끝났다면 버리지 않는다. 내용 검증은 호출자가 수행한다.
             def complete_json(response):
@@ -176,14 +240,13 @@ class OllamaClient:
                 except (ValueError, TypeError):
                     return False
             if not complete_json(data):
-                # 최적화 요청만 한 번 재시도한다. 모델/컨텍스트 크기와 메모리 상한은 유지한다.
-                payload['options']['num_predict'] = min(4096, max_tokens * 2)
+                # 서버 설정을 유지한 채 간결한 응답을 한 번 요청한다. 고정 한도를 추가하지 않는다.
                 payload['messages'] = messages[:-1] + [{'role': 'user', 'content': message['content'] +
-                    '\n출력이 길어지지 않도록 반복을 제거하고 세 항목만 간결한 JSON으로 반환하세요.'}]
-                data = self._request('POST', '/api/chat', timeout=timeout or 120, json=payload)
+                    '\n출력이 길어지지 않도록 반복을 제거하고 요청한 스키마에 맞는 간결한 JSON으로 반환하세요.'}]
+                data = request_chat()
                 if data.get('done_reason') == 'length' and not complete_json(data):
-                    raise ValueError('출력 한도를 늘려 한 번 재시도했지만 AI 최적화 응답이 다시 잘렸습니다. '
-                                     '입력 내용은 유지됩니다. 잠시 후 다시 시도하세요')
+                    raise ValueError('간결한 응답으로 한 번 재시도했지만 AI 최적화 응답이 다시 잘렸습니다. '
+                                     'Ollama 모델의 num_predict 및 컨텍스트 설정을 확인하세요. 입력 내용은 유지됩니다')
         value = data.get('message', {}).get('content')
         if not isinstance(value, str) or not value.strip():
             raise ValueError('Ollama가 빈 답변을 반환했습니다. 모델과 응답 제한을 확인하세요')
