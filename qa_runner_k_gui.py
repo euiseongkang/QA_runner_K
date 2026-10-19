@@ -34,6 +34,7 @@ import requests
 
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
 import execution_package
+import training_history
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
 from tk_clipboard import install_clipboard_support
@@ -55,7 +56,15 @@ from verifications import empty_search_verification
 from verifications import reception_filter_panel_verification
 from verifications import exam_filter_verification
 from verifications import reception_cancel_status_verification
+from verifications import reception_all_status_verification
+from verifications import prescription_period_verification
+from verifications import prescription_date_limit_verification
+from verifications import prescription_future_date_verification
+from verifications import reception_my_patient_verification
+from verifications import reception_combined_filter_verification
+from verifications import reception_url_filter_verification
 from verifications import pagination_verification
+from verifications import collection_plans
 from verifications import reception_defaults_verification
 from verifications import table_columns_verification
 from verifications import unsupported_verification
@@ -67,7 +76,7 @@ from ollama_client import available_models, recommendation, preferred_model
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.38.0"
+APP_VERSION = "0.39.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -126,6 +135,11 @@ def clean_text(s: str) -> str:
     if not s:
         return ""
     return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def multiline_text(value) -> str:
+    """TC 본문의 개행·빈 줄·들여쓰기를 보존하고 OS별 개행만 통일한다."""
+    return str(value if value is not None else '').replace('\r\n', '\n').replace('\r', '\n').strip()
 
 
 def get_scoped_locator(page, selector: str):
@@ -492,6 +506,32 @@ def build_rule_actions(tc: dict) -> list:
         if has_enter:
             actions.append({"type": "press", "key": "Enter", "description": "Enter 키 입력"})
 
+    if collection_plans.applies(tc):
+        screen = collection_plans.compile_plan(tc)['screen']
+        menu = {'receptions': '검사 접수', 'patients': '환자 관리'}.get(screen)
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == menu]
+        return navigation + [collection_plans.action(tc)]
+    if reception_url_filter_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [reception_url_filter_verification.action(tc)]
+    if reception_combined_filter_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [reception_combined_filter_verification.action(tc)]
+    if reception_my_patient_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [{'type': 'verify_reception_my_patient', 'description': '추가 필터 패널 내 환자 선택·해제 조회 검증'}]
+    if prescription_future_date_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [prescription_future_date_verification.action(tc)]
+    if prescription_date_limit_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [prescription_date_limit_verification.action(tc)]
+    if prescription_period_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [prescription_period_verification.action(tc)]
+    if reception_all_status_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [{'type': 'verify_all_statuses', 'description': '검사 상태 전체 선택·해제 단계별 체크 상태 수집'}]
     if reception_cancel_status_verification.applies(tc):
         navigation=[item for item in actions if item['type']=='click' and item.get('description')=='검사 접수']
         return navigation+[{'type':'include_cancel_status','description':'기존 상태 유지 및 취소 포함 조회 근거 수집'}]
@@ -644,7 +684,10 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
                   pagination_evidence=None, login_extension_evidence=None, patient_name_layout_evidence=None,
                   empty_value_evidence=None, reception_defaults_evidence=None,
                   table_columns_evidence=None, search_no_enter_evidence=None, empty_search_evidence=None,
-                  reception_filter_panel_evidence=None, exam_filter_evidence=None, cancel_status_evidence=None):
+                  reception_filter_panel_evidence=None, exam_filter_evidence=None, cancel_status_evidence=None,
+                  all_status_evidence=None, prescription_period_evidence=None, prescription_date_limit_evidence=None,
+                  prescription_future_date_evidence=None, reception_my_patient_evidence=None,
+                  reception_combined_filter_evidence=None, reception_url_filter_evidence=None, collection_evidence=None):
     """AI 없이 코드로만 하는 보수적 판정. (judgment, reason) 반환.
 
     확실한 근거가 있을 때만 PASS를 주고, 근거를 못 찾으면 FAIL이 아니라 "확인 필요"로 둔다.
@@ -661,6 +704,22 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
     if not expected.strip():
         return RESULT_NEEDS_REVIEW, "예상 결과가 비어 있어 코드 판정 불가"
 
+    if collection_plans.applies(tc):
+        return collection_plans.verify(collection_evidence)
+    if reception_url_filter_verification.applies(tc):
+        return reception_url_filter_verification.verify(reception_url_filter_evidence)
+    if reception_combined_filter_verification.applies(tc):
+        return reception_combined_filter_verification.verify(reception_combined_filter_evidence)
+    if reception_my_patient_verification.applies(tc):
+        return reception_my_patient_verification.verify(reception_my_patient_evidence)
+    if prescription_future_date_verification.applies(tc):
+        return prescription_future_date_verification.verify(prescription_future_date_evidence)
+    if prescription_date_limit_verification.applies(tc):
+        return prescription_date_limit_verification.verify(prescription_date_limit_evidence)
+    if prescription_period_verification.applies(tc):
+        return prescription_period_verification.verify(prescription_period_evidence)
+    if reception_all_status_verification.applies(tc):
+        return reception_all_status_verification.verify(all_status_evidence)
     if reception_cancel_status_verification.applies(tc):
         return reception_cancel_status_verification.verify(cancel_status_evidence)
 
@@ -812,6 +871,14 @@ class TCExecutionEngine:
         self.reception_filter_panel_evidence = None
         self.exam_filter_evidence = None
         self.cancel_status_evidence = None
+        self.all_status_evidence = None
+        self.prescription_period_evidence = None
+        self.prescription_date_limit_evidence = None
+        self.prescription_future_date_evidence = None
+        self.reception_my_patient_evidence = None
+        self.reception_combined_filter_evidence = None
+        self.reception_url_filter_evidence = None
+        self.collection_evidence = None
         self._last_search_value = None
         self.modal_seen = is_modal_visible(self.page)
         tc_steps_text = tc.get("steps", "")
@@ -860,6 +927,55 @@ class TCExecutionEngine:
                     if self.exam_filter_evidence.get('error'):
                         raise ValueError(self.exam_filter_evidence['error'])
                     actions_done.append('검사명 옵션 순서·선택·조회 목록 근거 수집')
+                elif atype == 'execute_collection_plan':
+                    self.collection_evidence = collection_plans.collect(self.page, action.get('plan') or {})
+                    record['evidence'] = self.collection_evidence
+                    issue = self.collection_evidence.get('error') or self.collection_evidence.get('walk', {}).get('error')
+                    if issue:
+                        raise ValueError(issue)
+                    actions_done.append('목록 수집 계획 실행: 대상 열·최대 페이지·종료 조건에 따른 근거 수집')
+                elif atype == 'verify_reception_url_filters':
+                    self.reception_url_filter_evidence = reception_url_filter_verification.collect(self.page, action)
+                    record['evidence'] = self.reception_url_filter_evidence
+                    if self.reception_url_filter_evidence.get('error'):
+                        raise ValueError(self.reception_url_filter_evidence['error'])
+                    actions_done.append('필터 설정 및 URL·UI·목록 새로고침 복원 근거 수집')
+                elif atype == 'verify_reception_combined_filters':
+                    self.reception_combined_filter_evidence = reception_combined_filter_verification.collect(self.page, action)
+                    record['evidence'] = self.reception_combined_filter_evidence
+                    if self.reception_combined_filter_evidence.get('error'):
+                        raise ValueError(self.reception_combined_filter_evidence['error'])
+                    actions_done.append('검사명·환자 구분·필터 패널 모니터링 선택 및 AND 조회 근거 수집')
+                elif atype == 'verify_reception_my_patient':
+                    self.reception_my_patient_evidence = reception_my_patient_verification.collect(self.page)
+                    record['evidence'] = self.reception_my_patient_evidence
+                    if self.reception_my_patient_evidence.get('error'):
+                        raise ValueError(self.reception_my_patient_evidence['error'])
+                    actions_done.append('검사 접수 필터 패널 내 환자 선택·해제 및 조회 근거 수집')
+                elif atype == 'verify_prescription_future_date':
+                    self.prescription_future_date_evidence = prescription_future_date_verification.collect(self.page, action)
+                    record['evidence'] = self.prescription_future_date_evidence
+                    if self.prescription_future_date_evidence.get('error'):
+                        raise ValueError(self.prescription_future_date_evidence['error'])
+                    actions_done.append('종료일 달력 내일 선택·입력값·조회 응답 근거 수집')
+                elif atype == 'verify_prescription_date_limit':
+                    self.prescription_date_limit_evidence = prescription_date_limit_verification.collect(self.page, action)
+                    record['evidence'] = self.prescription_date_limit_evidence
+                    if self.prescription_date_limit_evidence.get('error'):
+                        raise ValueError(self.prescription_date_limit_evidence['error'])
+                    actions_done.append('종료일 이후 시작일 날짜 셀 비활성 및 적용 기간 근거 수집')
+                elif atype == 'verify_prescription_period':
+                    self.prescription_period_evidence = prescription_period_verification.collect(self.page, action)
+                    record['evidence'] = self.prescription_period_evidence
+                    if self.prescription_period_evidence.get('error'):
+                        raise ValueError(self.prescription_period_evidence['error'])
+                    actions_done.append('처방일 기간 입력·조회·페이지별 처방일 근거 수집')
+                elif atype == 'verify_all_statuses':
+                    self.all_status_evidence = reception_all_status_verification.collect(self.page)
+                    record['evidence'] = self.all_status_evidence
+                    if self.all_status_evidence.get('error'):
+                        raise ValueError(self.all_status_evidence['error'])
+                    actions_done.append('검사 상태 전체 선택·해제 단계별 체크 상태 수집')
                 elif atype == 'include_cancel_status':
                     self.cancel_status_evidence=reception_cancel_status_verification.collect(self.page)
                     record['evidence']=self.cancel_status_evidence
@@ -2359,11 +2475,11 @@ class QAWorkerApp:
                 "tc_id": tc_id,
                 "sheet_name": clean_text(r.get("sheet")) or "대시보드",   # [v0.15.0]
                 "title": clean_text(r.get("title")),
-                "precondition": clean_text(r.get("precondition")),
-                "steps": r.get("steps") or "",
-                "expected": clean_text(r.get("expected")),
+                "precondition": multiline_text(r.get("precondition")),
+                "steps": multiline_text(r.get("steps")),
+                "expected": multiline_text(r.get("expected")),
                 "priority": clean_text(r.get("priority")) or "미지정",
-                "note": clean_text(r.get("note")),
+                "note": multiline_text(r.get("note")),
                 "_stored_sheet": clean_text(r.get("sheet")),
                 "_stored_priority": clean_text(r.get("priority")),
                 "last_result": r.get("last_result", ""),
@@ -2411,11 +2527,11 @@ class QAWorkerApp:
                 "tc_id": tc_id,
                 "sheet_name": clean_text(r.get("sheet")) or "서버",
                 "title": clean_text(r.get("title")),
-                "precondition": clean_text(r.get("precondition")),
-                "steps": r.get("steps") or "",
-                "expected": clean_text(r.get("expected")),
+                "precondition": multiline_text(r.get("precondition")),
+                "steps": multiline_text(r.get("steps")),
+                "expected": multiline_text(r.get("expected")),
                 "priority": clean_text(r.get("priority")) or "미지정",
-                "note": clean_text(r.get("note")),
+                "note": multiline_text(r.get("note")),
                 "_stored_sheet": clean_text(r.get("sheet")),
                 "_stored_priority": clean_text(r.get("priority")),
                 "last_result": r.get("last_result", ""),
@@ -2642,6 +2758,9 @@ class QAWorkerApp:
                 raise ValueError('Ollama 연결 확인 후 설치된 모델을 선택하세요')
             snapshot = dict(original, **values)
             snapshot.update(last_result=tc.get('last_result', ''), last_reason=tc.get('last_reason', ''))
+            training_history.capture(results_store.get_execution_package_root(), snapshot,
+                                     source=context['source'], source_ref=context['source_ref'],
+                                     server_url=context.get('server_url'))
             response_timeout = tc_optimization.optimization_timeout(provider)
             progress = (OptimizationProgress(tc_optimization.optimization_total_timeout())
                         if provider in ('Open WebUI (RAG)', 'Ollama') else None)
@@ -2710,7 +2829,7 @@ class QAWorkerApp:
                 if not problems:
                     if tc_optimization.details_unchanged(tc, proposal):
                         return tc_optimization.optimization_fallback(tc)
-                    return proposal
+                    return tc_optimization.format_detail_preconditions(proposal)
                 if attempt == 0:
                     prompt = tc_optimization.detail_repair_prompt(tc, reason, proposal, problems,
                                                                  include_rules=provider != 'Ollama')
@@ -2815,11 +2934,11 @@ class QAWorkerApp:
             "tc_id": raw.get("tc_id", str(raw.get("no", raw.get("id", "")))),
             "sheet_name": raw.get("sheet_name", raw.get("sheet", "")),
             "title": raw.get("title", raw.get("테스트 항목", raw.get("depth_path", ""))),
-            "precondition": clean_text(raw.get("precondition", raw.get("사전조건", ""))),
-            "steps": raw.get("steps", raw.get("테스트 절차", raw.get("procedure", ""))),
-            "expected": clean_text(raw.get("expected", raw.get("예상 결과", ""))),
+            "precondition": multiline_text(raw.get("precondition", raw.get("사전조건", ""))),
+            "steps": multiline_text(raw.get("steps", raw.get("테스트 절차", raw.get("procedure", "")))),
+            "expected": multiline_text(raw.get("expected", raw.get("예상 결과", ""))),
             "priority": raw.get("priority", raw.get("우선순위", "")),
-            "note": raw.get("note", raw.get("비고", "")),
+            "note": multiline_text(raw.get("note", raw.get("비고", ""))),
             "result": raw.get("result", ""),
         }
 
@@ -3391,7 +3510,11 @@ class QAWorkerApp:
         if (rule_only or search_no_enter_verification.applies(tc)
                 or search_clear_verification.applies(tc) or search_clear_verification.input_only(tc)
                 or empty_search_verification.applies(tc) or reception_filter_panel_verification.applies(tc)
-                or exam_filter_verification.applies(tc) or reception_cancel_status_verification.applies(tc)):
+                or exam_filter_verification.applies(tc) or reception_cancel_status_verification.applies(tc)
+                or reception_all_status_verification.applies(tc) or prescription_period_verification.applies(tc)
+                or prescription_date_limit_verification.applies(tc) or prescription_future_date_verification.applies(tc)
+                or reception_my_patient_verification.applies(tc) or reception_combined_filter_verification.applies(tc)
+                or reception_url_filter_verification.applies(tc) or collection_plans.applies(tc)):
             # [NEW] AI 없이 코드로 판정. 근거를 못 찾으면 FAIL이 아니라 "확인 필요".
             # 팝업확인/화면이동 TC는 텍스트보다 확실한 근거(모달 존재, URL 변경)를 같이 넘긴다.
             try:
@@ -3422,6 +3545,14 @@ class QAWorkerApp:
                 reception_filter_panel_evidence=getattr(engine, 'reception_filter_panel_evidence', None),
                 exam_filter_evidence=getattr(engine, 'exam_filter_evidence', None),
                 cancel_status_evidence=getattr(engine, 'cancel_status_evidence', None),
+                all_status_evidence=getattr(engine, 'all_status_evidence', None),
+                prescription_period_evidence=getattr(engine, 'prescription_period_evidence', None),
+                prescription_date_limit_evidence=getattr(engine, 'prescription_date_limit_evidence', None),
+                prescription_future_date_evidence=getattr(engine, 'prescription_future_date_evidence', None),
+                reception_my_patient_evidence=getattr(engine, 'reception_my_patient_evidence', None),
+                reception_combined_filter_evidence=getattr(engine, 'reception_combined_filter_evidence', None),
+                reception_url_filter_evidence=getattr(engine, 'reception_url_filter_evidence', None),
+                collection_evidence=getattr(engine, 'collection_evidence', None),
             )
             reason = f"[코드 판정] {reason}"
         else:
