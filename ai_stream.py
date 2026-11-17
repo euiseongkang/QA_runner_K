@@ -4,6 +4,10 @@ import threading
 import time
 
 
+class RepetitiveResponseError(ValueError):
+    """반복 생성으로 폐기한 응답. 취소·통신 오류와 구분한다."""
+
+
 class RepetitionGuard:
     """한 요청 안에서 긴 연속 반복만 검사한다. 정상 응답의 길이는 제한하지 않는다."""
     def __init__(self):

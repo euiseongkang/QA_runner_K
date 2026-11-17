@@ -6,7 +6,7 @@ from tkinter import ttk, messagebox
 
 from tk_clipboard import install_clipboard_support
 from tk_scrollable import ScrollableFrame
-from tc_optimization import parse_detail_proposal, details_unchanged
+from tc_optimization import parse_detail_proposal, details_unchanged, preserved_content_errors, quality_failure_message
 from ai_stream import OptimizationProgress
 
 
@@ -340,6 +340,9 @@ class TCOptimizationDialog:
         def worker():
             try:
                 proposal = parse_detail_proposal(json.dumps(work(), ensure_ascii=False))
+                problems = preserved_content_errors(before, proposal)
+                if problems:
+                    raise ValueError(quality_failure_message(problems))
                 callback = lambda: complete(proposal=proposal)
             except Exception as error:
                 callback = lambda message=str(error): complete(error=message)

@@ -27,6 +27,18 @@ def digest(value):
     return hashlib.sha256(encode(value).encode('utf-8')).hexdigest()
 
 
+def target_review_reason(original_tc, target_tc):
+    """학습 정답에는 선택 정책(PASS 등)이 아닌 실제 변경 항목을 설명한다."""
+    labels = dict(precondition='사전조건', steps='테스트 절차', expected='예상 결과')
+    changes = []
+    for key, label in labels.items():
+        if original_tc[key] != target_tc[key]:
+            count = sum(bool(line.strip()) for line in target_tc[key].splitlines())
+            changes.append(f'{label}를 {count}개 항목으로 수정했습니다.' if key != 'precondition'
+                           else f'사전조건을 {count}개 항목으로 수정했습니다.')
+    return ' '.join(changes) if changes else '사전조건·테스트 절차·예상 결과가 원문과 같아 유지합니다.'
+
+
 def example(record, original_tc=None):
     # 정답은 실제 PASS 실행 당시 TC다. 실행하지 않은 수동 정답 편집본은 사용하지 않는다.
     target_tc = record['tc']
@@ -38,8 +50,7 @@ def example(record, original_tc=None):
                 raise ValueError(f'{key}가 비어 있거나 형식/길이가 올바르지 않음')
     target = {key: target_tc[key] for key in FIELDS}
     changed = any(original_tc[key] != target[key] for key in FIELDS)
-    target.update(change_required=changed, review_reason=(
-        '동일 TC의 최신 PASS 실행 문구로 개선합니다.' if changed else '최신 PASS 실행 문구와 같아 원문을 유지합니다.'))
+    target.update(change_required=changed, review_reason=target_review_reason(original_tc, target_tc))
     # 최종 PASS의 동작·실행 사유에는 정답이 포함될 수 있으므로 입력에 넣지 않는다.
     context = {'original_tc': {key: original_tc[key] for key in FIELDS}, 'title': original_tc.get('title', '')}
     return {'messages': [{'role': 'system', 'content': SYSTEM_PROMPT},
@@ -72,7 +83,8 @@ def export_packages(root, destination_parent):
                   '최신 PASS가 미승인이면 해당 TC를 제외하며 이전 PASS로 되돌아가지 않습니다.',
                   'FAIL·확인 필요 및 실행하지 않은 학습 정답 편집 문구는 정답으로 사용하지 않습니다.',
                   '최초 최적화 전 원문이 없는 기존 자료는 가장 오래된 실행 문구를 대체 원문으로 사용합니다.',
-                  '기존 실행 패키지와 이전 내보내기는 보존됩니다. 새 내보내기는 TC별 한 쌍입니다.']}
+                  '기존 실행 패키지와 이전 내보내기는 보존됩니다. 새 내보내기는 TC별 한 쌍입니다.',
+                  'PASS 선택 정책은 메타데이터에 보관하며 학습 정답의 검토 이유에는 실제 변경 항목을 기록합니다.']}
     groups = {}
     # PK가 추가되기 전 패키지는 출처·시트·TC 번호가 단 하나의 새 PK와 연결될 때만 합친다.
     known = {}

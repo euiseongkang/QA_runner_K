@@ -4,7 +4,7 @@ import json
 from urllib.parse import urlsplit
 
 import requests
-from ai_stream import RepetitionGuard, response_packets
+from ai_stream import RepetitionGuard, RepetitiveResponseError, response_packets
 
 # 공식 라이브러리의 설치 가능한 태그. 전체 라이브러리가 아닌 TC용 권장 목록이다.
 RECOMMENDED = {
@@ -154,7 +154,7 @@ class OllamaClient:
             progress.append(text, thinking)
             if repetition.check(text):
                 progress.update(phase='동일 문구 연속 반복 감지 · 수신 중단')
-                raise ValueError('AI가 동일 문구를 연속 반복하여 Ollama 응답 수신을 중단했습니다. '
+                raise RepetitiveResponseError('AI가 동일 문구를 연속 반복하여 Ollama 응답 수신을 중단했습니다. '
                                  '중간 응답은 적용하지 않으며 입력 내용은 유지됩니다. '
                                  '서버에서 생성이 계속되는지는 Ollama 로그를 확인하세요')
             progress.update(phase='모델 응답 수신 중' if text else 'Ollama 추론·응답 대기')

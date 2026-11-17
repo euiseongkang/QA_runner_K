@@ -34,6 +34,7 @@ import requests
 
 import results_store          # [NEW] 로컬 결과 저장(SQLite) - 결과 대시보드용
 import execution_package
+import browser_viewport
 import training_history
 import dashboard_server        # [NEW] 결과를 보여주는 로컬 전용 웹 페이지 (Flask)
 import tc_excel                # [NEW v0.5.0] TC 엑셀 파서 (대시보드 업로드와 공용)
@@ -42,7 +43,7 @@ from tk_scrollable import ScrollableFrame
 from tk_tc_table import TCTable
 from tc_review_dialog import TCReviewDialog, TCDetailDialog
 import tc_optimization
-from ai_stream import OptimizationProgress
+from ai_stream import OptimizationProgress, RepetitiveResponseError
 from verifications import patient_filter_verification
 import checkbox_controls
 from verifications import patient_type_verification
@@ -65,6 +66,19 @@ from verifications import reception_combined_filter_verification
 from verifications import reception_url_filter_verification
 from verifications import pagination_verification
 from verifications import collection_plans
+from verifications import font_verification
+from verifications import page_background_verification
+from verifications import sidebar_brand_verification
+from verifications import sidebar_menu_verification
+from verifications import sidebar_hover_verification
+from verifications import sidebar_cgm_verification
+from verifications import sidebar_selected_verification
+from verifications import sidebar_transition_verification
+from verifications import topbar_style_verification
+from verifications import logout_countdown_verification
+from verifications import login_extension_style_verification
+from verifications import login_extension_interaction_verification
+from verifications import topbar_user_verification
 from verifications import reception_defaults_verification
 from verifications import table_columns_verification
 from verifications import unsupported_verification
@@ -76,7 +90,7 @@ from ollama_client import available_models, recommendation, preferred_model
 # ============================================================
 # 설정 상수                                                    [TODO]
 # ============================================================
-APP_VERSION = "0.39.0"
+APP_VERSION = "0.40.0"
 
 # TODO: QA_runner_K가 원본과 동일한 EC2 백엔드(qa.healthkoob.com)를 그대로 쓸지,
 #       아니면 새 TC 포맷 전용 엔드포인트/네임스페이스가 필요한지 백엔드 쪽과 확인 필요.
@@ -506,6 +520,40 @@ def build_rule_actions(tc: dict) -> list:
         if has_enter:
             actions.append({"type": "press", "key": "Enter", "description": "Enter 키 입력"})
 
+    if topbar_user_verification.applies(tc):
+        return topbar_user_verification.actions(tc, actions)
+    if login_extension_interaction_verification.applies(tc):
+        return login_extension_interaction_verification.actions(tc, actions)
+    if login_extension_style_verification.applies(tc):
+        return login_extension_style_verification.actions(tc, actions)
+    if logout_countdown_verification.applies(tc):
+        return logout_countdown_verification.actions(tc, actions)
+    if topbar_style_verification.applies(tc):
+        return topbar_style_verification.actions(tc, actions)
+    if sidebar_transition_verification.applies(tc):
+        return sidebar_transition_verification.actions(tc, actions)
+    if sidebar_selected_verification.applies(tc):
+        return sidebar_selected_verification.actions(tc, actions)
+    if sidebar_cgm_verification.applies(tc):
+        return sidebar_cgm_verification.actions(tc, actions)
+    if sidebar_hover_verification.applies(tc):
+        try:
+            entry = sidebar_hover_verification.requirements(tc)['entry']
+        except ValueError:
+            entry = None
+        menus = [item for item in actions if item['type'] == 'click' and item.get('description') == entry]
+        return menus[:1] + [sidebar_hover_verification.action(tc)]
+    if sidebar_menu_verification.applies(tc):
+        menus = [item for item in actions if item['type'] == 'click' and item.get('description') in sidebar_menu_verification.ROUTES]
+        return menus + [sidebar_menu_verification.action(tc)]
+    if sidebar_brand_verification.applies(tc):
+        menus = [item for item in actions if item['type'] == 'click' and item.get('description') in sidebar_brand_verification.MENUS]
+        return menus + [sidebar_brand_verification.action(tc)]
+    if page_background_verification.applies(tc):
+        return page_background_verification.actions(tc, actions)
+    if font_verification.applies(tc):
+        navigation = [item for item in actions if item['type'] == 'click' and item.get('description') == '검사 접수']
+        return navigation + [font_verification.action(tc)]
     if collection_plans.applies(tc):
         screen = collection_plans.compile_plan(tc)['screen']
         menu = {'receptions': '검사 접수', 'patients': '환자 관리'}.get(screen)
@@ -687,7 +735,7 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
                   reception_filter_panel_evidence=None, exam_filter_evidence=None, cancel_status_evidence=None,
                   all_status_evidence=None, prescription_period_evidence=None, prescription_date_limit_evidence=None,
                   prescription_future_date_evidence=None, reception_my_patient_evidence=None,
-                  reception_combined_filter_evidence=None, reception_url_filter_evidence=None, collection_evidence=None):
+                  reception_combined_filter_evidence=None, reception_url_filter_evidence=None, collection_evidence=None, font_evidence=None, background_evidence=None, sidebar_brand_evidence=None, sidebar_menu_evidence=None, sidebar_hover_evidence=None, sidebar_cgm_evidence=None, sidebar_selected_evidence=None, sidebar_transition_evidence=None, topbar_style_evidence=None, logout_countdown_evidence=None, login_extension_style_evidence=None, login_extension_interaction_evidence=None, topbar_user_evidence=None):
     """AI 없이 코드로만 하는 보수적 판정. (judgment, reason) 반환.
 
     확실한 근거가 있을 때만 PASS를 주고, 근거를 못 찾으면 FAIL이 아니라 "확인 필요"로 둔다.
@@ -704,6 +752,32 @@ def judge_by_text(tc: dict, body_text: str, modal_visible=None, url_changed=None
     if not expected.strip():
         return RESULT_NEEDS_REVIEW, "예상 결과가 비어 있어 코드 판정 불가"
 
+    if topbar_user_verification.applies(tc):
+        return topbar_user_verification.verify(tc, topbar_user_evidence)
+    if login_extension_interaction_verification.applies(tc):
+        return login_extension_interaction_verification.verify(tc, login_extension_interaction_evidence)
+    if login_extension_style_verification.applies(tc):
+        return login_extension_style_verification.verify(tc, login_extension_style_evidence)
+    if logout_countdown_verification.applies(tc):
+        return logout_countdown_verification.verify(tc, logout_countdown_evidence)
+    if topbar_style_verification.applies(tc):
+        return topbar_style_verification.verify(tc, topbar_style_evidence)
+    if sidebar_transition_verification.applies(tc):
+        return sidebar_transition_verification.verify(tc, sidebar_transition_evidence)
+    if sidebar_selected_verification.applies(tc):
+        return sidebar_selected_verification.verify(tc, sidebar_selected_evidence)
+    if sidebar_cgm_verification.applies(tc):
+        return sidebar_cgm_verification.verify(tc, sidebar_cgm_evidence)
+    if sidebar_hover_verification.applies(tc):
+        return sidebar_hover_verification.verify(sidebar_hover_evidence)
+    if sidebar_menu_verification.applies(tc):
+        return sidebar_menu_verification.verify(sidebar_menu_evidence)
+    if sidebar_brand_verification.applies(tc):
+        return sidebar_brand_verification.verify(sidebar_brand_evidence)
+    if page_background_verification.applies(tc):
+        return page_background_verification.verify(tc, background_evidence)
+    if font_verification.applies(tc):
+        return font_verification.verify(font_evidence)
     if collection_plans.applies(tc):
         return collection_plans.verify(collection_evidence)
     if reception_url_filter_verification.applies(tc):
@@ -836,6 +910,9 @@ class TCExecutionEngine:
         self.patient_type_evidence = None
 
     def _is_dangerous(self, action: dict, tc_steps_text: str) -> bool:
+        # 이 액션은 DOM 표시만 관찰한다. 실제 로그아웃 클릭과 구분한다.
+        if action.get('type') == 'verify_logout_countdown':
+            return False
         sel = (action.get("selector") or "").lower()
         desc = (action.get("description") or "").lower()
 
@@ -879,6 +956,19 @@ class TCExecutionEngine:
         self.reception_combined_filter_evidence = None
         self.reception_url_filter_evidence = None
         self.collection_evidence = None
+        self.font_evidence = None
+        self.background_evidence = []
+        self.sidebar_brand_evidence = None
+        self.sidebar_menu_evidence = None
+        self.sidebar_hover_evidence = None
+        self.sidebar_cgm_evidence = []
+        self.sidebar_selected_evidence = []
+        self.sidebar_transition_evidence = []
+        self.topbar_style_evidence = []
+        self.logout_countdown_evidence = []
+        self.login_extension_style_evidence = []
+        self.login_extension_interaction_evidence = []
+        self.topbar_user_evidence = []
         self._last_search_value = None
         self.modal_seen = is_modal_visible(self.page)
         tc_steps_text = tc.get("steps", "")
@@ -927,6 +1017,93 @@ class TCExecutionEngine:
                     if self.exam_filter_evidence.get('error'):
                         raise ValueError(self.exam_filter_evidence['error'])
                     actions_done.append('검사명 옵션 순서·선택·조회 목록 근거 수집')
+                elif atype == 'verify_topbar_user':
+                    state = topbar_user_verification.collect(self.page, tc, action.get('target'))
+                    self.topbar_user_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 로그인 계정 이름·직군 대조 및 이름 스타일·펼침 아이콘 수집')
+                elif atype == 'verify_login_extension_interaction':
+                    state = login_extension_interaction_verification.collect(self.page, tc, action.get('target'))
+                    self.login_extension_interaction_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 실제 hover·누름 유지·입력 해제 근거 수집')
+                elif atype == 'verify_login_extension_style':
+                    state = login_extension_style_verification.collect(self.page, tc, action.get('target'))
+                    self.login_extension_style_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 로그인 연장 버튼 문구 및 명시된 스타일 수집')
+                elif atype == 'verify_logout_countdown':
+                    state = logout_countdown_verification.collect(self.page, tc, action.get('target'))
+                    self.logout_countdown_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 로그아웃 타이머 스타일·실제 감소 시각 수집')
+                elif atype == 'verify_topbar_style':
+                    state = topbar_style_verification.collect(self.page, tc, action.get('target'))
+                    self.topbar_style_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 상단바 배경·하단 구분선·페이지명 CSS 측정')
+                elif atype == 'verify_sidebar_transition':
+                    state = sidebar_transition_verification.collect(self.page, tc, action.get('target'))
+                    self.sidebar_transition_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 화면의 이전·다음 메뉴 선택 스타일 수집')
+                elif atype == 'verify_sidebar_selected':
+                    state = sidebar_selected_verification.collect(self.page, tc, action.get('target'))
+                    self.sidebar_selected_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' 선택 메뉴 배경·글자·아이콘·폰트 측정')
+                elif atype == 'verify_sidebar_cgm':
+                    state = sidebar_cgm_verification.collect(self.page, tc, action.get('target'))
+                    self.sidebar_cgm_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+' CGM View 배경색·글자색 수집')
+                elif atype == 'verify_sidebar_hover':
+                    self.sidebar_hover_evidence = sidebar_hover_verification.collect(self.page, tc)
+                    record['evidence'] = self.sidebar_hover_evidence
+                    if self.sidebar_hover_evidence.get('error'):
+                        raise ValueError(self.sidebar_hover_evidence['error'])
+                    actions_done.append('사이드바 실제 마우스 오버·글자색·커서 근거 수집')
+                elif atype == 'verify_sidebar_menus':
+                    self.sidebar_menu_evidence = sidebar_menu_verification.collect(self.page, tc)
+                    record['evidence'] = self.sidebar_menu_evidence
+                    if self.sidebar_menu_evidence.get('error'):
+                        raise ValueError(self.sidebar_menu_evidence['error'])
+                    actions_done.append('사이드바 메뉴 순서·아이콘·치수·CSS 근거 수집')
+                elif atype == 'verify_sidebar_brand':
+                    self.sidebar_brand_evidence = sidebar_brand_verification.collect(self.page, tc)
+                    record['evidence'] = self.sidebar_brand_evidence
+                    if self.sidebar_brand_evidence.get('error'):
+                        raise ValueError(self.sidebar_brand_evidence['error'])
+                    actions_done.append('사이드바 폭·상단 아이콘·로고 표시 근거 수집')
+                elif atype == 'verify_page_background':
+                    state = page_background_verification.collect(self.page, tc, action.get('target'))
+                    self.background_evidence.append(state)
+                    record['evidence'] = state
+                    if state.get('error'):
+                        raise ValueError(state['error'])
+                    actions_done.append(str(action.get('target'))+'의 영역별 배경색 수집')
+                elif atype == 'verify_default_font':
+                    self.font_evidence = font_verification.collect(self.page, action)
+                    record['evidence'] = self.font_evidence
+                    if self.font_evidence.get('error'):
+                        raise ValueError(self.font_evidence['error'])
+                    actions_done.append('영역별 CSS·실제 사용 폰트 수집')
                 elif atype == 'execute_collection_plan':
                     self.collection_evidence = collection_plans.collect(self.page, action.get('plan') or {})
                     record['evidence'] = self.collection_evidence
@@ -1049,6 +1226,17 @@ class TCExecutionEngine:
     def _click(self, action, actions_done):
         sel = action.get("selector", "")
         desc = action.get("description", "클릭")
+        if action.get('sidebar_menu'):
+            handle = self.page.evaluate_handle(sidebar_hover_verification.FIND, action['sidebar_menu'])
+            url_before = self.page.url
+            try:
+                handle.as_element().click(timeout=5000)
+            finally:
+                handle.dispose()
+            self._wait_after_click(url_before, action.get('wait'))
+            self.log_fn(f'  ✓ 사이드바 클릭: {desc}')
+            actions_done.append(f'클릭: {desc}')
+            return
         if desc.strip() == '로그인 연장' and login_extension_verification.applies(self._current_tc):
             self.login_extension_evidence = login_extension_verification.click_and_collect(self.page)
             self.log_fn('  ✓ 로그인 연장 클릭 및 타이머 근거 수집')
@@ -2748,6 +2936,13 @@ class QAWorkerApp:
                 raise ValueError('TC 실행이나 모델 설치가 끝난 뒤 최적화하세요')
             if getattr(self, '_ai_optimization_busy', False):
                 raise ValueError('이전 최적화 요청이 아직 종료되지 않았습니다. 잠시 후 다시 시도하세요')
+            snapshot = dict(original, **values)
+            supported = tc_optimization.execution_ready_proposal(snapshot)
+            if supported is not None:
+                training_history.capture(results_store.get_execution_package_root(), snapshot,
+                                         source=context['source'], source_ref=context['source_ref'],
+                                         server_url=context.get('server_url'))
+                return lambda: supported
             key = self._webui_settings() if provider == 'Open WebUI (RAG)' else (self._ollama_url() if provider == 'Ollama' else self.key_var.get().strip())
             model = self.webui_model_var.get() if provider == 'Open WebUI (RAG)' else (self.ollama_model_var.get() if provider == 'Ollama' else self.action_model_var.get())
             if provider not in ('Ollama', 'Open WebUI (RAG)') and not key:
@@ -2780,6 +2975,12 @@ class QAWorkerApp:
                               on_saved=saved, optimize=optimize)
 
     def _optimize_tc_details(self, tc, reason, provider, key, model, response_timeout=None, progress=None):
+        supported = tc_optimization.execution_ready_proposal(tc)
+        if supported is not None:
+            if progress is not None:
+                progress.check()
+                progress.update(phase='원문 수치 보존 · 실행기 지원 문구 재구성')
+            return supported
         if response_timeout is None:
             response_timeout = tc_optimization.optimization_timeout(provider)
         if provider == 'Open WebUI (RAG)':
@@ -2808,7 +3009,7 @@ class QAWorkerApp:
             if provider == 'Ollama':
                 client.system_prompt = ('너는 QA TC를 검토하고 개선하는 도우미다. 개선 필요성을 먼저 판단하고 충분히 명확한 TC는 이유와 함께 유지한다. '
                                         '아래 규칙은 프로그램의 한계를 설명한다. 초기 상태, 동작 목표, 관찰 기준을 구체화하고 원문 입력값과 순서는 보존한다.\n'
-                                        + tc_optimization.load_execution_rules())
+                                        + tc_optimization.load_optimization_rules(tc))
             prompt = tc_optimization.detail_optimization_prompt(tc, reason, include_rules=provider != 'Ollama')
             # 로컬 모델 최적화는 서버 설정을 따른다. Claude/OpenAI의 기존 요청 예산은 유지한다.
             output_limit = None if provider in ('Ollama', 'Open WebUI (RAG)') else 3072
@@ -2816,7 +3017,13 @@ class QAWorkerApp:
                 if progress is not None:
                     progress.check()
                     progress.update(phase='최초 요청' if attempt == 0 else '품질 보완 요청')
-                response = self.call_ai(client, provider, model, prompt, output_limit, timeout=response_timeout)
+                try:
+                    response = self.call_ai(client, provider, model, prompt, output_limit, timeout=response_timeout)
+                except RepetitiveResponseError:
+                    if progress is not None:
+                        progress.check()
+                        progress.update(phase='반복 응답 폐기 · 원문 기반 기본 교정')
+                    return tc_optimization.optimization_fallback(tc, '모델의 반복 응답을 폐기하고 원문을 기준으로 기본 문구를 정리했습니다. AI 내용 개선안은 적용하지 않았습니다.')
                 if progress is not None:
                     progress.check()
                     progress.update(phase='수신 완료 · TC 품질 검증')
@@ -2829,7 +3036,11 @@ class QAWorkerApp:
                 if not problems:
                     if tc_optimization.details_unchanged(tc, proposal):
                         return tc_optimization.optimization_fallback(tc)
-                    return tc_optimization.format_detail_preconditions(proposal)
+                    formatted = tc_optimization.format_detail_preconditions(proposal)
+                    problems = tc_optimization.validate_detail_quality(
+                        tc, formatted, build_rule_actions(tc), build_rule_actions(formatted))
+                    if not problems:
+                        return formatted
                 if attempt == 0:
                     prompt = tc_optimization.detail_repair_prompt(tc, reason, proposal, problems,
                                                                  include_rules=provider != 'Ollama')
@@ -3107,7 +3318,7 @@ class QAWorkerApp:
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=False)
-            ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+            ctx = browser.new_context(viewport=dict(browser_viewport.DEFAULT_VIEWPORT))
             page = ctx.new_page()
             page.on("dialog", lambda d: d.accept())
 
@@ -3392,6 +3603,11 @@ class QAWorkerApp:
         # 홈으로 이동해 사이드바/상태 초기화 (원본과 동일 패턴)
         if execution_context is not None:
             execution_context.update(phase='화면 초기화', preparation=[])
+        viewport = browser_viewport.apply(page, tc, execution_context)
+        self.log_msg(f"  🖥 브라우저 뷰포트 {viewport['actual']['width']}×{viewport['actual']['height']}"
+                     + (' (사전조건)' if viewport['source'] == 'precondition' else ' (기본값)'))
+        if execution_context is not None:
+            execution_context['phase'] = '화면 초기화'
         try:
             page.goto(start_url + "/", timeout=20000, wait_until="domcontentloaded")
         except Exception:
@@ -3514,7 +3730,7 @@ class QAWorkerApp:
                 or reception_all_status_verification.applies(tc) or prescription_period_verification.applies(tc)
                 or prescription_date_limit_verification.applies(tc) or prescription_future_date_verification.applies(tc)
                 or reception_my_patient_verification.applies(tc) or reception_combined_filter_verification.applies(tc)
-                or reception_url_filter_verification.applies(tc) or collection_plans.applies(tc)):
+                or reception_url_filter_verification.applies(tc) or collection_plans.applies(tc) or font_verification.applies(tc) or page_background_verification.applies(tc) or sidebar_brand_verification.applies(tc) or sidebar_menu_verification.applies(tc) or sidebar_hover_verification.applies(tc) or sidebar_cgm_verification.applies(tc) or sidebar_selected_verification.applies(tc) or sidebar_transition_verification.applies(tc) or topbar_style_verification.applies(tc) or logout_countdown_verification.applies(tc) or login_extension_style_verification.applies(tc) or login_extension_interaction_verification.applies(tc) or topbar_user_verification.applies(tc)):
             # [NEW] AI 없이 코드로 판정. 근거를 못 찾으면 FAIL이 아니라 "확인 필요".
             # 팝업확인/화면이동 TC는 텍스트보다 확실한 근거(모달 존재, URL 변경)를 같이 넘긴다.
             try:
@@ -3553,6 +3769,19 @@ class QAWorkerApp:
                 reception_combined_filter_evidence=getattr(engine, 'reception_combined_filter_evidence', None),
                 reception_url_filter_evidence=getattr(engine, 'reception_url_filter_evidence', None),
                 collection_evidence=getattr(engine, 'collection_evidence', None),
+                font_evidence=getattr(engine, 'font_evidence', None),
+                background_evidence=getattr(engine, 'background_evidence', None),
+                sidebar_brand_evidence=getattr(engine, 'sidebar_brand_evidence', None),
+                sidebar_menu_evidence=getattr(engine, 'sidebar_menu_evidence', None),
+                sidebar_hover_evidence=getattr(engine, 'sidebar_hover_evidence', None),
+                sidebar_cgm_evidence=getattr(engine, 'sidebar_cgm_evidence', None),
+                sidebar_selected_evidence=getattr(engine, 'sidebar_selected_evidence', None),
+                sidebar_transition_evidence=getattr(engine, 'sidebar_transition_evidence', None),
+                topbar_style_evidence=getattr(engine, 'topbar_style_evidence', None),
+                logout_countdown_evidence=getattr(engine, 'logout_countdown_evidence', None),
+                login_extension_style_evidence=getattr(engine, 'login_extension_style_evidence', None),
+                login_extension_interaction_evidence=getattr(engine, 'login_extension_interaction_evidence', None),
+                topbar_user_evidence=getattr(engine, 'topbar_user_evidence', None),
             )
             reason = f"[코드 판정] {reason}"
         else:

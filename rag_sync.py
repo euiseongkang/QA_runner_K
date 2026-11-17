@@ -31,7 +31,7 @@ def build_bundle(root, commit):
     name = f'QA_runner_K_{sha[:12]}_v{version}'
     tracked = git(root, 'ls-tree', '-r', '--name-only', sha).splitlines()
     paths = sorted(p for p in tracked if
-                   ('/' not in p and (p in ('TC_EXECUTION_RULES.md', 'tc_optimization.py', 'checkbox_controls.py')
+                   ('/' not in p and (p in ('TC_EXECUTION_RULES.md', 'tc_optimization.py', 'checkbox_controls.py', 'browser_viewport.py')
                                       or p.endswith('_verification.py')))
                    or (p.startswith('verifications/') and p.count('/') == 1
                        and (p.endswith('_verification.py') or p in (
