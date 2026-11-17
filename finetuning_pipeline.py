@@ -7,6 +7,8 @@ import subprocess
 import sys
 import uuid
 
+from finetuning_export import validate_training_export
+
 
 def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
@@ -125,6 +127,7 @@ def main(argv=None):
             print(json.dumps(result, ensure_ascii=False, indent=2))
             print('파일 검사 완료. 재학습·재병합은 실행하지 않았습니다.')
             return 0
+        validate_training_export(dataset)
         adapter = relative(args.adapter)
         config = read_json(adapter / 'adapter_config.json')
         if not (adapter / 'adapters.safetensors').is_file() or (adapter / 'adapters.safetensors').stat().st_size == 0:

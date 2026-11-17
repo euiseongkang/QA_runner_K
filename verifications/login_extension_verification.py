@@ -4,13 +4,38 @@ import time
 from urllib.parse import urlsplit
 
 
+def requests_click(steps):
+    """같은 절의 로그인 연장 대상에 명시된 긍정 클릭만 판별한다."""
+    for line in str(steps or '').splitlines():
+        target=re.search(r'로그인\s*연장\]?(.*)',line)
+        if not target:
+            continue
+        clause=re.split(r'[.;。]|\[[^\]]+\]',target.group(1),maxsplit=1)[0]
+        if re.search(r'클릭하지|클릭\s*(?:없이|금지)|누르지',clause):
+            continue
+        if re.search(r'클릭(?:한다|합니다|하고|하여|해서|해주세요|한\s*(?:후|뒤)|[ \t]*(?:후|뒤)|[!?]?[ \t]*$)|누른다|누릅니다|눌러|누르고|누른\s*(?:후|뒤)',clause):
+            return True
+    return False
+
+
 def applies(tc):
-    return ('로그인 연장' in str(tc.get('steps') or '')
-            and bool(re.search(r'시간|타이머|연장', str(tc.get('expected') or ''))))
+    """버튼 스타일 관찰과 구분해 실제 클릭·시간 갱신을 요구할 때만 적용한다."""
+    expected=str(tc.get('expected') or '')
+    return (requests_click(tc.get('steps')) and bool(re.search(r'시간|타이머',expected))
+            and bool(re.search(r'초기|증가|늘|갱신|복원|(?:시간|타이머)[^\n.]{0,30}연장',expected)))
+
+
+def parse_display_time(value):
+    """화면 hh:mm:ss를 검증해 초로 변환한다. 잘못된 값은 None이다."""
+    match = re.fullmatch(r'(\d{2}):(\d{2}):(\d{2})', str(value or ''))
+    if not match:
+        return None
+    h, m, s = map(int, match.groups())
+    return h*3600+m*60+s if m < 60 and s < 60 else None
 
 
 def snapshot(page):
-    return page.evaluate(r'''() => {
+    text = page.evaluate(r'''() => {
         const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
         const labels = [...document.querySelectorAll('p, span, label')].filter(e =>
             visible(e) && e.innerText.trim() === '로그아웃 남은 시간');
@@ -18,9 +43,9 @@ def snapshot(page):
         const group = labels[0].parentElement;
         const times = group.innerText.match(/\b\d{2}:\d{2}:\d{2}\b/g) || [];
         if (times.length !== 1) return null;
-        const [h, m, s] = times[0].split(':').map(Number);
-        return m < 60 && s < 60 ? h*3600 + m*60 + s : null;
+        return times[0];
     }''')
+    return parse_display_time(text)
 
 
 def verify(evidence):

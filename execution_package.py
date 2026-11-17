@@ -92,13 +92,13 @@ def write(root, *, tc, result, reason, run_id, source, source_ref, context=None,
                     'screenshots': shots,
                     'precondition_execution': 'TC 사전조건 원문을 보관하며 자동 충족 여부는 별도로 확인해야 함'}
         manifest['training_identity'] = training_history.identity(tc, source, source_ref)
-        review = {'status': 'approved', 'approved_for_training': True,
-                  'review_reason': '실행 당시 TC를 기본 승인했습니다.',
+        review = {'status': 'pending', 'approved_for_training': False,
+                  'review_reason': '',
                   'corrected_tc': {**{key: str(snapshot.get(key) or '') for key in ('precondition', 'steps', 'expected')},
                                    'change_required': False, 'review_reason': '실행 당시 TC 원문을 유지합니다.'},
                   'approval_source': 'automatic', 'human_reviewed': False,
                   'updated_at': now(),
-                  'note': '기본 승인은 실행 판정의 정확성이나 사람의 검토 완료를 의미하지 않음'}
+                  'note': 'PASS 실행과 학습 정답 검토는 별도이며 검토 후 승인해야 내보낼 수 있음'}
         actions = {'planned': context.get('planned_actions', []),
                    'trace': context.get('action_trace', []),
                    'completed': context.get('actions_done', []),
@@ -152,11 +152,27 @@ def list_packages(root):
     return rows, errors
 
 
-def update_review(root, path, approved, reason='', corrected_tc=None):
+def update_review(root, path, approved, reason='', corrected_tc=None, requirement_corrections=None):
     if not isinstance(reason, str) or len(reason) > 300:
         raise ValueError('검토 사유는 300자 이하로 입력하세요.')
     record = read(root, path)
     review = dict(record['review'])
+    if requirement_corrections is not None:
+        if not isinstance(requirement_corrections, list):
+            raise ValueError('요구사항 교정 기록은 목록이어야 합니다.')
+        for correction in requirement_corrections:
+            if (not isinstance(correction, dict)
+                    or correction.get('field') not in ('precondition', 'steps', 'expected')
+                    or any(not isinstance(correction.get(key), str) or not correction[key].strip()
+                           for key in ('before', 'after', 'reason'))
+                    or any(len(correction[key]) > 4000 for key in ('before', 'after'))
+                    or len(correction['reason']) > 300):
+                raise ValueError('요구사항 교정의 항목·변경 전후 내용·300자 이하 사유를 확인하세요.')
+            if correction['before'] == correction['after']:
+                raise ValueError('요구사항 교정의 변경 전후 내용이 같습니다.')
+            if correction['after'] not in str(record['tc'].get(correction['field']) or ''):
+                raise ValueError('요구사항 교정값이 실제 실행 당시 TC에 없습니다. 교정한 TC를 먼저 재실행하세요.')
+        review['requirement_corrections'] = requirement_corrections
     if corrected_tc is not None:
         keys = ('precondition', 'steps', 'expected')
         if not all(isinstance(corrected_tc.get(key), str) for key in keys):
