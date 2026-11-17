@@ -20,10 +20,20 @@ training/
 ├── manifest.json
 ├── environment.json
 ├── requirements-training.txt
+├── training_split_registry.json # 기존 학습·평가 분할의 내용 해시 이력 (원문 제외)
 ├── fused_model/                 # 기존 학습이 병합된 모델 전체
 ├── Modelfile.template           # 응답 설정·대화 템플릿, 새 GGUF로 갱신하여 사용
 ├── finetuning_pipeline.py
 ├── gguf_pipeline.py
+├── training_entrypoint.py
+├── training_*.py                # 승인 자료·품질·분할 검사 모듈
+├── finetuning_export.py
+├── execution_package.py
+├── tc_optimization.py
+├── tc_excel.py
+├── checkbox_controls.py
+├── TC_EXECUTION_RULES.md
+├── verifications/
 ├── verify_package.py
 └── scripts/
     ├── run_train.sh
@@ -70,9 +80,9 @@ requirements-training.txt는 확인 가능한 학습 환경의 주요 패키지 
 1. runtime.zip의 모델을 Ollama에 등록하고 Open WebUI/QA 프로그램에서 선택합니다.
 2. 자신의 환경에서 TC를 실행합니다. 실행 기록과 스크린샷은 자신의 PC에 적재됩니다.
 3. QA 프로그램 → 실행 패키지·학습 승인 관리에서 기록을 확인합니다.
-4. **학습 정답 편집**에서 사전조건·절차·예상 결과를 검토합니다. 예상 결과에 입력·Enter 절차가 복사됐거나 검증 기준이 빠진 사례는 교정하거나 미승인합니다.
+4. 실행 당시 사전조건·절차·예상 결과를 검토합니다. 예상 결과에 입력·Enter 절차가 복사됐거나 검증 기준이 빠진 사례는 TC를 교정한 뒤 재실행하거나 미승인합니다. 승인 화면의 메모용 정답 편집본은 실제 실행 정답을 대체하지 않습니다.
 5. 정답 및 사유를 저장한 뒤 승인하고 학습 데이터를 내보냅니다.
-6. QA 프로젝트 또는 배포 실행 파일 옆 finetuning/qa_tc_dataset_... 폴더의 JSONL을 사용합니다.
+6. QA 프로젝트 또는 배포 실행 파일 옆 finetuning/qa_tc_dataset_... 폴더 전체를 사용합니다. `train.jsonl`, `valid.jsonl`, `test.jsonl`과 함께 `export_summary.json`, `lineage.json`이 있어야 합니다.
 
 ```bash
 # 반드시 자신의 실제 내보내기 폴더로 변경하세요.
@@ -80,15 +90,19 @@ QA_TRAIN_DATASET="/Users/사용자/QA_runner_K/finetuning/qa_tc_dataset_실제�
 wc -l "$QA_TRAIN_DATASET/train.jsonl" "$QA_TRAIN_DATASET/valid.jsonl" "$QA_TRAIN_DATASET/test.jsonl"
 ```
 
-파일 이름은 train.jsonl·valid.jsonl·test.jsonl입니다. 학습·검증·시험 자료를 그대로 복제하여 세 파일을 만들지 마세요. 별도 TC 그룹의 평가 자료가 필요합니다. 3개 미만의 TC 그룹만 내보내면 valid/test가 비어 있을 수 있으며 학습 후 평가 스크립트는 시험 자료가 없으면 중단합니다.
+JSONL 세 파일만 복사하거나 직접 수정하지 마세요. 문구를 고치려면 QA 프로그램에서 TC를 수정·재실행·검토하고 다시 내보냅니다. 학습·검증·시험 자료를 그대로 복제하여 세 파일을 만들지 마세요. 독립적인 TC 그룹의 평가 자료가 필요합니다. 이전 학습 TC를 평가용으로 옮기거나 valid/test가 비어 있으면 학습 전에 중단합니다.
 
-이 JSONL은 **TC 문구 편집 모델**의 학습 자료입니다. 스크린샷 이미지 학습 자료가 아니며 실행 PASS만으로 정답 정확성이 보장되지 않습니다. 정답을 편집하지 않은 기본 승인 기록은 원문 유지 사례입니다. 실제 개인정보·인증 정보가 입력이나 원문에 포함됐다면 학습 전에 테스트 값으로 일관되게 치환하세요.
+자신의 `finetuning/split_registry.json`과 기존 내보내기·모델 학습 이력을 함께 보존하세요. 다른 작업 폴더로 이동할 때 새 데이터 폴더만 복사해 과거 학습 이력을 잃지 않도록 합니다. 이 패키지의 `training_split_registry.json`도 검사 도구 옆에 그대로 둡니다. 기존 모델에 반영된 자료의 내용 해시와 분할만 담고 원문이나 원래 저장 경로는 포함하지 않습니다. 검사 도구는 이 이력과 자신의 이력을 함께 확인합니다.
+
+이 JSONL은 **TC 문구 편집 모델**의 학습 자료입니다. 스크린샷 이미지 학습 자료가 아니며 실행 PASS만으로 정답 정확성이 보장되지 않습니다. 사람이 검토·승인한 최신 PASS만 사용합니다. 실제 개인정보·인증 정보가 필요하면 TC 단계에서 테스트 값으로 일관되게 치환한 뒤 재실행·검토·내보내세요.
 
 ## 4. 기존 병합 모델에서 추가 학습
 
 시작 모델은 반드시 이 패키지의 fused_model/입니다. 원본 Qwen 모델을 지정하면 이번 배포 모델에서 이어가는 학습이 아닙니다. **이미 병합된 기존 어댑터를 다시 적용하지 마세요.**
 
 아래는 20회 시험 학습 예시입니다. 품질 개선을 보장하는 학습 횟수가 아닙니다. 평가 결과를 보며 횟수와 학습률을 조정하세요.
+
+`run_train.sh`는 사람 검토·정답 품질·분할 누수를 검사한 뒤 MLX-LM을 실행합니다. 검사 실패 시 학습은 시작되지 않습니다.
 
 ```bash
 bash scripts/run_train.sh \

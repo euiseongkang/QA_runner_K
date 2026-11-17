@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from finetuning_pipeline import verify_model
 from gguf_pipeline import verify_gguf
+from finetuning_export import validate_training_export
 
 ROOT = Path(__file__).resolve().parent
 REGISTRY = ROOT / 'finetuning/model_registry.json'
@@ -100,6 +101,8 @@ def main(argv=None):
         if not args.dataset:
             raise ValueError('--dataset을 지정하세요.')
         dataset = resolve(args.dataset)
+        if args.stage in ('train', 'post'):
+            validate_training_export(dataset, registry)
         state = dataset / 'model_release.json'
         if args.stage == 'train':
             if not args.name or args.iters < 1:

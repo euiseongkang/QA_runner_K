@@ -90,3 +90,5 @@ rag_sync_output/
 distribution_output/
 .import_state.json
 finetuning/.runner/
+finetuning/split_registry.json
+finetuning/.split_registry.lock

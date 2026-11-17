@@ -13,6 +13,7 @@ import sys
 import model_release as release
 from finetuning_pipeline import test_count, verify_model
 from rag_sync import build_bundle, git
+from finetuning_export import validate_training_export
 
 ROOT = Path(__file__).resolve().parent
 DATA_FILES = ('train.jsonl', 'valid.jsonl', 'test.jsonl')
@@ -85,6 +86,9 @@ def pipeline(args):
     registry_path = cache / 'model_registry.json'
     registry = (release.read(registry_path) if registry_path.exists() else
                 absolute_registry(json.loads(git(ROOT, 'show', meta['commit'] + ':finetuning/model_registry.json')), artifact_root))
+    needs_training = registry['latest'].get('dataset_sha256') != fingerprint
+    if needs_training:
+        validate_training_export(dataset, registry)
     verify_model(registry['latest']['fused_model'])
     python = training_interpreter(args.training_python or artifact_root / 'finetuning/.venv/bin/python')
     llama_cpp = Path(args.llama_cpp).expanduser().resolve()
@@ -93,7 +97,6 @@ def pipeline(args):
     check_training_environment(python)
     if not (llama_cpp / 'convert_hf_to_gguf.py').is_file():
         raise ValueError('llama.cpp 변환 도구가 없습니다: ' + str(llama_cpp))
-    needs_training = registry['latest'].get('dataset_sha256') != fingerprint
     version = meta['version'].split('.')
     name = 'qa-tc-optimizer-v' + (version[1] if len(version) >= 2 and version[0] == '0' else meta['version'])
     print(json.dumps({'commit':meta['commit'], 'tag':tag, 'dataset':str(dataset), 'dataset_sha256':fingerprint,

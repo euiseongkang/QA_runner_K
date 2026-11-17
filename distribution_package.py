@@ -120,6 +120,7 @@ print(json.dumps({'python':platform.python_version(),'packages':versions}))'''
 
 def training_package(out, meta, latest, artifact_root):
     from finetuning_pipeline import verify_model
+    from training_partition import portable_history
     model = Path(latest['fused_model']).expanduser()
     if not model.is_absolute():
         model = artifact_root / model
@@ -135,12 +136,20 @@ def training_package(out, meta, latest, artifact_root):
     env, requirements = training_environment(artifact_root)
     files['environment.json'] = json.dumps(env, ensure_ascii=False, indent=2).encode()
     files['requirements-training.txt'] = requirements.encode()
+    files['training_split_registry.json'] = json.dumps(
+        portable_history(artifact_root / 'finetuning', registry={'latest': latest}),
+        ensure_ascii=False, sort_keys=True, indent=2).encode()
     text = (ROOT / 'templates/TRAINING_README.md').read_text()
     for token, value in {'MODEL_NAME': latest['name'], 'APP_VERSION': meta['version'], 'COMMIT': meta['commit']}.items():
         text = text.replace('{{' + token + '}}', value)
     files['README.md'] = text.encode()
-    for name in ('finetuning_pipeline.py', 'gguf_pipeline.py'):
+    for name in ('finetuning_pipeline.py', 'gguf_pipeline.py', 'training_entrypoint.py',
+                 'finetuning_export.py', 'execution_package.py', 'training_history.py',
+                 'training_partition.py', 'training_quality.py', 'tc_optimization.py',
+                 'tc_excel.py', 'checkbox_controls.py', 'TC_EXECUTION_RULES.md'):
         files[name] = (ROOT / name).read_bytes()
+    for source in sorted((ROOT / 'verifications').glob('*.py')):
+        files['verifications/' + source.name] = source.read_bytes()
     files['verify_package.py'] = (ROOT / 'install_distribution.py').read_bytes()
     modelfile = Path(latest['modelfile']).expanduser()
     if not modelfile.is_absolute():
@@ -156,7 +165,7 @@ package_dir="$(cd "$script_dir/.." && pwd)"
 python_path="$package_dir/.venv/bin/python"
 if [ ! -x "$python_path" ]; then echo "README.md에 따라 .venv를 설치하세요." >&2; exit 1; fi
 '''
-    files['scripts/run_train.sh'] = (prefix + 'exec "$python_path" -m mlx_lm.lora --model "$package_dir/fused_model" "$@"\n').encode()
+    files['scripts/run_train.sh'] = (prefix + 'exec "$python_path" "$package_dir/training_entrypoint.py" --model "$package_dir/fused_model" "$@"\n').encode()
     files['scripts/run_post_training.sh'] = (prefix + 'exec "$python_path" "$package_dir/finetuning_pipeline.py" "$@"\n').encode()
     files['scripts/run_gguf_conversion.sh'] = (prefix + 'exec "$python_path" "$package_dir/gguf_pipeline.py" "$@"\n').encode()
     return package(out / (latest['name'] + '_' + meta['commit'][:12]) / 'training.zip',
@@ -253,6 +262,28 @@ def register_local_model(latest, artifact_root):
     return {'status': 'registered', 'model_name': latest['name'], 'gguf_sha256': digest(gguf)}
 
 
+def select_model(meta, artifact_root, candidate_path=None):
+    """명시한 후보, 직전 게시 성공 모델, 커밋의 초기 모델 순서로 선택한다."""
+    if candidate_path:
+        path = Path(candidate_path).expanduser().resolve()
+        registry = json.loads(path.read_text())
+        if registry.get('distribution_commit') != meta['commit']:
+            raise ValueError('Runner 후보 모델 레지스트리의 배포 커밋이 다릅니다.')
+        source = str(path)
+    else:
+        path = artifact_root / 'finetuning/.runner/model_registry.json'
+        if path.exists():
+            registry = json.loads(path.read_text())
+            source = str(path)
+        else:
+            registry = json.loads(git(ROOT, 'show', meta['commit'] + ':finetuning/model_registry.json'))
+            source = meta['commit'] + ':finetuning/model_registry.json'
+    latest = registry.get('latest')
+    if not isinstance(latest, dict) or not isinstance(latest.get('name'), str) or not latest['name'].strip():
+        raise ValueError('모델 레지스트리에 최신 모델 이름이 없습니다.')
+    return latest, source
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--commit', default=os.environ.get('BITBUCKET_COMMIT', 'HEAD'))
@@ -268,17 +299,14 @@ def main(argv=None):
         if args.register_local_model and not (args.include_model and args.upload):
             raise ValueError('--register-local-model에는 --include-model과 --upload가 필요합니다.')
         meta, _ = build_bundle(ROOT, args.commit)
+        artifact_root = Path(args.artifact_root).expanduser().resolve()
         latest = None
+        registry_source = None
         if args.include_model:
-            if args.model_registry:
-                registry = json.loads(Path(args.model_registry).read_text())
-                if registry.get('distribution_commit') != meta['commit']:
-                    raise ValueError('Runner 후보 모델 레지스트리의 배포 커밋이 다릅니다.')
-                latest = registry['latest']
-            else:
-                latest = json.loads(git(ROOT, 'show', meta['commit'] + ':finetuning/model_registry.json'))['latest']
+            latest, registry_source = select_model(meta, artifact_root, args.model_registry)
         if args.dry_run:
             print(json.dumps({'snapshot': meta['name'], 'model': latest['name'] if latest else None,
+                              'model_registry_source': registry_source,
                               'folders': {k: v for k, v in FOLDERS.items() if k == 'qa' or latest},
                               'knowledge_id_source': '동일 커밋 rag_sync_output/.../sync_state.json'}, ensure_ascii=False, indent=2))
             return 0
@@ -295,9 +323,11 @@ def main(argv=None):
         out.mkdir(parents=True, exist_ok=True)
         packages = {'qa': knowledge_package(out, meta, qa_source, qa_docs, 'QA_runner_K')}
         if latest:
-            packages['model'] = model_package(out, meta, latest, Path(args.artifact_root).expanduser().resolve())
-            packages['training'] = training_package(out, meta, latest, Path(args.artifact_root).expanduser().resolve())
+            packages['model'] = model_package(out, meta, latest, artifact_root)
+            packages['training'] = training_package(out, meta, latest, artifact_root)
         report = {'commit': meta['commit'], 'app_version': meta['version'], 'status': 'packaged', 'packages': {}}
+        if latest:
+            report.update(model_name=latest['name'], model_registry_source=registry_source)
         for kind, path in packages.items():
             report['packages'][kind] = {'path': str(path), 'sha256': digest(path), 'bytes': path.stat().st_size}
         (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
@@ -310,7 +340,7 @@ def main(argv=None):
             report['status'] = 'uploaded'
             (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
         if args.register_local_model:
-            report['ollama'] = register_local_model(latest, Path(args.artifact_root).expanduser().resolve())
+            report['ollama'] = register_local_model(latest, artifact_root)
             report['status'] = 'uploaded_and_registered'
             (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
         print('배포 패키지 처리 완료: ' + str(out / 'report.json'))

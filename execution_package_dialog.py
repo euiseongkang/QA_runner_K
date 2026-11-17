@@ -18,7 +18,7 @@ class ExecutionPackageDialog:
         self.records, self.images = {}, []
         header = ttk.Frame(self.window, padding=8)
         header.pack(fill='x')
-        ttk.Label(header, text='최초 원문 → TC별 최신 PASS를 내보냅니다. 제외할 최신 PASS는 미승인으로 변경하세요.').pack(anchor='w')
+        ttk.Label(header, text='최초 원문 → 사람이 검토·승인한 최신 PASS를 내보냅니다. 요구사항 오류 교정은 변경 전후를 확인해 기록하세요.').pack(anchor='w')
         ttk.Label(header, text=f'저장 위치: {root}', wraplength=1000).pack(anchor='w')
         controls = ttk.Frame(self.window, padding=8)
         controls.pack(fill='x')
@@ -65,6 +65,9 @@ class ExecutionPackageDialog:
         tabs.add(self.evidence, text='실행 결과·동작·사유')
         self.original = ScrolledText(tabs, height=12, wrap='word')
         tabs.add(self.original, text='실행 당시 TC 원문')
+        self.initial = ScrolledText(tabs, height=12, wrap='word')
+        tabs.add(self.initial, text='최초 원문 · 요구사항 교정 비교')
+        self.initial_tc = None
         editor = ttk.Frame(tabs, padding=6)
         tabs.add(editor, text='검토 메모용 정답 편집')
         self.fields = {}
@@ -88,6 +91,11 @@ class ExecutionPackageDialog:
         self.approved = tk.BooleanVar(value=True)
         ttk.Checkbutton(footer, text='학습 승인', variable=self.approved).pack(side='left')
         ttk.Button(footer, text='정답 및 사유 저장', command=self.save).pack(side='left', padx=8)
+        correction_controls = ttk.Frame(self.window, padding=(8, 0, 8, 8))
+        correction_controls.pack(fill='x')
+        self.confirm_corrections = tk.BooleanVar(value=False)
+        ttk.Checkbutton(correction_controls, variable=self.confirm_corrections,
+            text='최초 원문의 잘못된 수치·대상·조건을 현재 실행 문구로 교정한 것이 맞습니다 (개별 저장·사유 필수)').pack(anchor='w')
         self.status = ttk.Label(self.window, padding=8)
         self.status.pack(fill='x')
         self.refresh()
@@ -113,6 +121,8 @@ class ExecutionPackageDialog:
                     f"train {counts['train']} · valid {counts['valid']} · test {counts['test']}\n"
                     f"이전 실행 제외 {report['duplicates']} · 최신 PASS 미승인 {report['unapproved']}\n"
                     f"PASS 없는 TC {report['no_pass']} · 기존 실행 원문 사용 {report['legacy_originals']}\n"
+                    f"사람 검토 필요 {report['review_required']} · 품질 재검토 {len(report['quality_rejected'])}\n"
+                    f"확인된 요구사항 교정 {report['confirmed_corrections']} · 학습 준비 {'완료' if report['training_ready'] else '독립 평가 자료 필요'}\n"
                     f"정답 형식 오류 {len(report['invalid'])} · 읽기 실패 {len(report['read_errors'])}\n\n{path}\n\n"
                     + '\n'.join(report['notes']))
             self.status.configure(text=f'학습 데이터 저장 완료: {path}')
@@ -137,8 +147,10 @@ class ExecutionPackageDialog:
                 '기본 승인' if review.get('approval_source') == 'automatic' else '검토' if review.get('human_reviewed') else '미검토'))
             self.records[item] = record
         self.reason.set('')
-        for text in (self.evidence, self.original, *self.fields.values()):
-            self.set_text(text, '', readonly=text in (self.evidence, self.original))
+        self.initial_tc = None
+        self.confirm_corrections.set(False)
+        for text in (self.evidence, self.original, self.initial, *self.fields.values()):
+            self.set_text(text, '', readonly=text in (self.evidence, self.original, self.initial))
         self.images = []
         for label in self.shots.values():
             label.configure(image='', text='패키지를 선택하세요.')
@@ -162,6 +174,23 @@ class ExecutionPackageDialog:
         self.reason.set(review.get('review_reason') or '')
         self.approved.set(bool(review.get('approved_for_training')))
         corrected = review.get('corrected_tc') or tc
+        self.initial_tc = None
+        self.confirm_corrections.set(False)
+        quality_report = None
+        try:
+            from finetuning_export import original_for_record
+            from training_quality import assess_pair
+            self.initial_tc, provenance = original_for_record(self.root, record)
+            quality_report = assess_pair(self.initial_tc, record)
+            comparison = [f"최초 원문 출처: {provenance['kind']}",
+                          '원문이 잘못된 FAIL 초안이면 올바른 PASS 실행 문구로 교정할 수 있습니다.',
+                          '수치·조건 변경을 승인하려면 변경 전후를 검토하고 아래 체크 및 사유를 저장하세요.']
+            for key, title in (('precondition', '사전조건'), ('steps', '테스트 절차'), ('expected', '예상 결과')):
+                comparison.extend(('', title + ' · 최초 원문', str(self.initial_tc.get(key) or ''),
+                                   title + ' · 현재 실행 문구', str(tc.get(key) or '')))
+            self.set_text(self.initial, '\n'.join(comparison), True)
+        except (ValueError, OSError) as error:
+            self.set_text(self.initial, str(error), True)
         for key, widget in self.fields.items():
             self.set_text(widget, corrected.get(key) or '')
         self.set_text(self.original, '\n\n'.join(f'{title}\n{tc.get(key, "")}' for key, title in
@@ -172,6 +201,13 @@ class ExecutionPackageDialog:
         details += [f"{r['index']}. {r['status']} · {r['action'].get('description', r['action'].get('type', ''))}"
                     + (f" · {r['error']}" if r.get('error') else '') for r in trace]
         details += ['', '기록 오류', *(execution.get('errors') or ['없음'])]
+        if quality_report is not None:
+            details += ['', '학습 정답 품질 확인', *(quality_report['errors'] or ['내용 검사 통과'])]
+            if quality_report['warnings']:
+                details += ['', '검토 참고', *quality_report['warnings']]
+        if review.get('requirement_corrections'):
+            details += ['', '확인된 요구사항 교정']
+            details += [f"{item['field']}: {item['reason']}" for item in review['requirement_corrections']]
         self.set_text(self.evidence, '\n'.join(details), True)
         self.images = []
         for name, label in self.shots.items():
@@ -214,8 +250,22 @@ class ExecutionPackageDialog:
             messagebox.showinfo('학습 정답', '편집할 패키지 한 건을 선택하세요.', parent=self.window)
             return
         try:
+            corrections = None
+            if self.confirm_corrections.get():
+                if not self.initial_tc or not self.reason.get().strip():
+                    raise ValueError('최초 원문을 확인하고 요구사항 교정 사유를 입력하세요.')
+                record = self.records[selected[0]]
+                corrections = [{'field': key, 'before': str(self.initial_tc.get(key) or ''),
+                                'after': str(record['tc'].get(key) or ''), 'reason': self.reason.get().strip()}
+                               for key in ('precondition', 'steps', 'expected')
+                               if str(self.initial_tc.get(key) or '').strip()
+                               and str(record['tc'].get(key) or '').strip()
+                               and self.initial_tc.get(key) != record['tc'].get(key)]
+                if not corrections:
+                    raise ValueError('최초 원문과 실행 문구가 같아 별도 요구사항 교정이 없습니다.')
             execution_package.update_review(self.root, self.records[selected[0]]['path'], self.approved.get(),
-                self.reason.get().strip(), {key: widget.get('1.0', 'end-1c') for key, widget in self.fields.items()})
+                self.reason.get().strip(), {key: widget.get('1.0', 'end-1c') for key, widget in self.fields.items()},
+                requirement_corrections=corrections)
         except (ValueError, OSError) as error:
             messagebox.showerror('학습 정답 저장', str(error), parent=self.window)
             return
