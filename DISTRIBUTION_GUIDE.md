@@ -58,7 +58,9 @@ git push origin model-v35-20261014-01
 
 파일명은 `QA_runner_K_<커밋12자리>_v<앱버전>_KNOWLEDGE_QA_runner_K.zip`이다. ZIP에 추출 원문, manifest, 파일별 SHA-256, 설치 스크립트를 넣는다. API Key와 서비스 계정 JSON은 포함하지 않는다.
 
-게시 스크립트는 기본값으로 지식 전용 `distribution_package.py --upload`를 실행한다. 태그 단계만 `--model`을 명시하여 `runner_model_pipeline.py`를 실행한다. Runner 코드도 일반 브랜치·수동 파이프라인에서 태그 없이 직접 호출되는 학습을 차단한다. 생성한 후보 레지스트리를 배포 스크립트에 전달하고 `--include-model --upload --register-local-model`을 지정한다. 모든 업로드의 크기·체크섬 검사가 성공한 뒤 후보 이름으로 `ollama create`와 `ollama show`를 실행한다. 동일 이름이 이미 있으면 해당 모델을 갱신한다.
+게시 스크립트는 기본값으로 지식 전용 `distribution_package.py --upload`를 실행한다. 태그 단계만 `--model`을 명시하여 `runner_model_pipeline.py`를 실행한다. 태그 검증은 Runner에서 한 번 수행한다. 수동 실행에서 `BITBUCKET_TAG`가 누락되면 요청 커밋과 실제 체크아웃이 같은지 확인하고, 원격 저장소에서 그 커밋을 가리키는 유효한 모델 태그가 정확히 하나일 때만 복원한다. 태그가 없거나 여러 개이거나 원격 확인에 실패하면 중단한다. 허용 계정 검사는 복원 전에 적용하며 일반 main/지식 게시에서는 학습을 시작하지 않는다. 생성한 후보 레지스트리를 배포 스크립트에 전달하고 `--include-model --upload --register-local-model`을 지정한다. 모든 업로드의 크기·체크섬 검사가 성공한 뒤 후보 이름으로 `ollama create`와 `ollama show`를 실행한다. 동일 이름이 이미 있으면 해당 모델을 갱신한다.
+
+실행 목록에서 같은 커밋의 성공한 태그 실행과 실패한 수동 실행을 구분해야 한다. 커밋의 빨간 빌드 표시는 다른 실행의 성공을 취소하지 않는다. 모델 완료 여부는 태그가 표시된 실행의 마지막 `Runner 학습·Drive 게시·Ollama 등록 완료` 로그와 지속 레지스트리의 `published` 상태로 확인한다. `QA_DRIVE_PUBLISH_ENABLED=0`이면 모델 모드는 성공으로 건너뛰지 않고 실패로 표시한다.
 
 모델 태그 실행에서만 Runner는 `<QA_MODEL_ARTIFACT_ROOT>/finetuning/qa_tc_dataset_*` 중 가장 최근 완료된 내보내기를 읽는다. JSONL은 Git에서 제외되어 있으므로 **내보내기와 Runner가 같은 Mac의 같은 프로젝트 경로를 사용해야 한다**. 다른 Mac에서 내보낸 데이터는 이 경로로 전달해야 한다. main에 소스를 푸시하거나 내보내기만 수행해도 학습은 실행되지 않는다. 사용한 태그와 데이터 해시는 실행 기록에 보존한다.
 

@@ -63,21 +63,64 @@ def check_training_environment(python):
                     '"학습 가상환경에 mlx_lm이 없습니다. QA_TRAINING_PYTHON을 확인하세요.")'], check=True)
 
 
-def check_model_trigger():
+MODEL_TAG_PATTERN = r'model-v[0-9]+(?:\.[0-9]+){0,2}-[0-9]{8}-[0-9]{2}'
+
+
+def recover_model_tag(commit, root=None):
+    """태그 없는 수동 실행은 현재 커밋에 실제 존재하는 단일 태그만 복원한다."""
+    root = Path(root or ROOT)
+    def query(*arguments):
+        try:
+            result = subprocess.run(['git', '-C', str(root), *arguments], capture_output=True,
+                                    text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise ValueError('모델 태그 조회 시간이 초과됐습니다. 저장소 연결을 확인한 뒤 다시 실행하세요.') from None
+        if result.returncode:
+            # Git 오류에는 인증 주소가 포함될 수 있어 원문을 출력하지 않는다.
+            raise ValueError('모델 태그를 확인하지 못했습니다. 저장소 접근과 태그 실행 대상을 확인하세요.')
+        return result.stdout.strip()
+    sha = query('rev-parse', '--verify', commit + '^{commit}')
+    if sha != query('rev-parse', '--verify', 'HEAD^{commit}'):
+        raise ValueError('모델 요청 커밋과 체크아웃이 다릅니다. 해당 커밋의 태그로 실행하세요.')
+    # 원격 목록을 기준으로 확인해 얕은 체크아웃의 누락된 태그와 삭제된
+    # 로컬 태그에 의존하지 않는다. annotated 태그는 peeled commit을 쓴다.
+    advertised = query('ls-remote', '--tags', 'origin', 'refs/tags/model-v*')
+    tags = {}
+    for line in advertised.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        revision, ref = fields
+        peeled = ref.endswith('^{}')
+        name = ref.removeprefix('refs/tags/').removesuffix('^{}')
+        if re.fullmatch(MODEL_TAG_PATTERN, name):
+            if peeled or name not in tags:
+                tags[name] = revision
+    matches = sorted(name for name, revision in tags.items() if revision == sha)
+    if len(matches) != 1:
+        raise ValueError('현재 커밋의 모델 태그가 없거나 여러 개입니다. 실행 대상을 정확한 모델 태그로 지정하세요.')
+    return matches[0]
+
+
+def check_model_trigger(commit=None):
     tag = os.environ.get('BITBUCKET_TAG', '')
     in_pipeline = bool(os.environ.get('BITBUCKET_BUILD_NUMBER') or os.environ.get('BITBUCKET_PIPELINE_UUID'))
     if in_pipeline or tag:
-        if not re.fullmatch(r'model-v[0-9]+(?:\.[0-9]+){0,2}-[0-9]{8}-[0-9]{2}', tag):
-            raise ValueError('모델 학습은 model-v35-20261014-01 형식의 태그에서만 실행합니다.')
         allowed = os.environ.get('QA_MODEL_BUILD_ALLOWED_ACTOR_UUID', '').strip().strip('{}')
         actor = os.environ.get('BITBUCKET_STEP_TRIGGERER_UUID', '').strip().strip('{}')
         if allowed and actor != allowed:
             raise ValueError('허용된 계정이 실행한 모델 학습 요청이 아닙니다.')
+        if not tag:
+            tag = recover_model_tag(commit or os.environ.get('BITBUCKET_COMMIT', 'HEAD'))
+            os.environ['BITBUCKET_TAG'] = tag
+            print('태그 실행 정보 복원: ' + tag + ' (현재 커밋의 원격 태그 확인 완료)', flush=True)
+        if not re.fullmatch(MODEL_TAG_PATTERN, tag):
+            raise ValueError('모델 학습은 model-v40-20261118-01 형식의 태그에서만 실행합니다.')
     return tag
 
 
 def pipeline(args):
-    tag = check_model_trigger()
+    tag = check_model_trigger(getattr(args, 'commit', None))
     artifact_root = Path(args.artifact_root).expanduser().resolve()
     meta, _ = build_bundle(ROOT, args.commit)
     dataset = select_dataset(artifact_root)
